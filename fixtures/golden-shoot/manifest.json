@@ -1,0 +1,10 @@
+{
+  "fixture_version": 1,
+  "project_name": "Golden Wedding",
+  "description": "Synthetic, deterministic CaptureGraph fixture. No real wedding media is included.",
+  "expected": {
+    "media_assets": 5,
+    "file_instances": 6,
+    "storage_volumes": 2
+  }
+}

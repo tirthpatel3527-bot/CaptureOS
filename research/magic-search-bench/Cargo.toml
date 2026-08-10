@@ -1,0 +1,12 @@
+[package]
+name = "magic-search-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+magic-search = { path = "../../crates/magic-search" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "capture-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+capture-graph = { path = "../capture-graph" }
+capture-intelligence = { path = "../capture-intelligence" }
+chrono.workspace = true
+ingest = { path = "../ingest" }
+media-model = { path = "../media-model" }
+media-index = { path = "../media-index" }
+media-visual = { path = "../media-visual" }
+magic-search = { path = "../magic-search" }
+persistence = { path = "../persistence" }
+serde.workspace = true
+serde_json.workspace = true
+storage = { path = "../storage" }
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

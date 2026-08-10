@@ -1,0 +1,22 @@
+[package]
+name = "magic-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Explicitly limited to deterministic test fixtures. Production code must use a validated
+# local SigLIP pack and never enables this feature.
+test-support = []
+
+[dependencies]
+blake3.workspace = true
+capture-intelligence = { path = "../capture-intelligence" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tract-onnx = "=0.21.17"
+unicode-normalization.workspace = true

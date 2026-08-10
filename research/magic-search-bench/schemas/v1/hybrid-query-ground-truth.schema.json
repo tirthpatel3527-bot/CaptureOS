@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CaptureOS hybrid search ground truth",
+  "type": "object",
+  "required": ["formatVersion", "type", "dataset", "queries"],
+  "properties": {
+    "formatVersion": { "const": 1 },
+    "type": { "const": "HybridQueryGroundTruth" },
+    "dataset": { "$ref": "#/$defs/dataset" },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["queryId", "expectedMediaAssetIds", "predicates"],
+        "properties": {
+          "queryId": { "type": "string", "minLength": 1 },
+          "queryText": { "type": "string" },
+          "expectedMediaAssetIds": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "predicates": {
+            "type": "object",
+            "properties": {
+              "faceCount": { "type": "integer", "minimum": 0 },
+              "ratingAtLeast": { "type": "integer", "minimum": 0, "maximum": 5 },
+              "decision": { "enum": ["keep", "reject", "review"] },
+              "sharpness": { "enum": ["sharp", "blurry", "technical_issue"] },
+              "cameraModel": { "type": "string" }
+            },
+            "additionalProperties": false
+          },
+          "notes": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "notes": { "type": "string" }
+  },
+  "$defs": {
+    "dataset": {
+      "type": "object",
+      "required": ["id", "version", "license", "containsCustomerMedia"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "license": { "type": "string", "minLength": 1 },
+        "containsCustomerMedia": { "const": false }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

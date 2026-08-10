@@ -1,0 +1,16 @@
+{
+  "formatVersion": 1,
+  "type": "BenchmarkDatasetManifest",
+  "datasets": [
+    {
+      "id": "generated-scaffold-only",
+      "version": "v1",
+      "source": "MagicSearchBench deterministic in-memory vectors",
+      "license": "generated data only; no third-party media",
+      "containsCustomerMedia": false,
+      "containsIdentityLabels": false,
+      "checksum": null,
+      "derivation": "No source photographs or model outputs are committed."
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+# Research boundary
+
+Local-model experiments, evaluation procedures, and only lawfully usable datasets belong here. Milestone 4 adds [CaptureIntelligenceBench](capture-intelligence-bench/README.md): generated deterministic fixtures, versioned ground-truth schemas, and a baseline runner. Milestone 6 adds [MagicSearchBench](magic-search-bench/README.md): generated vector-scale measurements plus versioned text/image and hybrid-search ground-truth schemas. The repository includes no customer media, trained model binary, or private wedding image.
+
+Research output must preserve the local-first and privacy principles in [AGENTS.md](../AGENTS.md), record provider/model/version provenance and license evidence, report uncertainty honestly, and graduate into product code only through the adapter contracts. It must not make model downloads, cloud calls, person-identification datasets, biometric identity labels, private client photographs, or demographic classification an implicit part of development.
+
+MagicSearchBench’s generated baseline measures vector/index behavior, not image understanding. Meaningful Recall@K, MRR, nDCG, semantic/hybrid comparison, and model latency claims require a versioned, public or generated test dataset with documented source, license, checksum, derivation, and ground truth. A manually installed model pack remains a local development input until its exact provenance and runtime reference-vector checks are recorded; no model binary belongs in this repository by default.

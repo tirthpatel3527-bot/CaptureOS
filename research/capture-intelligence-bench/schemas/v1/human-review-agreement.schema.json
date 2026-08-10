@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CaptureOS human review agreement ground truth",
+  "type": "object",
+  "required": ["formatVersion", "records"],
+  "properties": {
+    "formatVersion": { "const": 1 },
+    "fixtureVersion": { "type": "string" },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["projectRef", "similaritySetRef", "aiRepresentativeRef", "humanRepresentativeRef", "decisionContext"],
+        "properties": {
+          "projectRef": { "type": "string" },
+          "similaritySetRef": { "type": "string" },
+          "aiRepresentativeRef": { "type": "string" },
+          "humanRepresentativeRef": { "type": "string" },
+          "aiTopThreeRefs": { "type": "array", "items": { "type": "string" }, "maxItems": 3 },
+          "decisionContext": { "enum": ["group_representative", "keep", "rating", "reject"] },
+          "reviewDurationMs": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": true
+}

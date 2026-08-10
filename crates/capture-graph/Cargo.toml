@@ -1,0 +1,11 @@
+[package]
+name = "capture-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+media-model = { path = "../media-model" }
+serde.workspace = true
+thiserror.workspace = true

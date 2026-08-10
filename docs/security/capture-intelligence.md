@@ -1,0 +1,64 @@
+# Capture Intelligence privacy and security
+
+Capture Intelligence I is local-only, non-destructive technical analysis. It is designed so an unavailable provider can say "unavailable" without requiring cloud fallback or fictional output.
+
+## Privacy guarantees
+
+- Customer originals, cached previews, metadata, face boxes, compact descriptors, recommendations, and human decisions stay on the local device. M4 makes no inference API, telemetry, analytics, model-download, hosted GPU, or remote facial-service request.
+- Analysis receives a CaptureOS-owned cached preview after canonical cache-root validation. `AnalysisInputResolver` may read a catalog-marked available source solely to generate that contained artifact; it does not alter, rename, write beside, embed metadata in, or create a sidecar next to customer originals.
+- Face work is detection/landmark technical evidence only: normalized bounding boxes, detection confidence, visibility/pose when supported, face-region sharpness, and conservative eye state. It is not recognition.
+- CaptureOS does not create person names, persistent biometric identity embeddings, person clusters, cross-project matches, demographic/sensitive-attribute inferences, or face-crop archives in M4.
+- A missing or failed face provider records `NOT_APPLICABLE`, `FAILED`, `UNCERTAIN`, or `NOT_ANALYZABLE` as relevant. It never substitutes a random count, confidence, or eye-state value.
+- AI recommendations never delete, hide permanently, trash, move, or mutate media. Human Keep/Review/Reject decisions are append-only and preserve the original recommendation and provenance.
+
+## Trust boundaries
+
+All values crossing into intelligence are untrusted: cache relative paths, image bytes and dimensions, preview metadata, input fingerprints, model metadata, provider stdout, face geometry, timestamps, camera strings, and existing database contents.
+
+1. The desktop/core boundary gives an analyzer only a registered cache artifact, not a general local-file URL. The resolver's read-only source step is before this boundary and cannot pass a source path through it.
+2. The cache resolver canonicalizes the artifact below the CaptureOS preview-cache root. Paths outside that root, traversals, missing files, and escaped symlinks are rejected.
+3. Decoders impose format/dimension limits and return a terminal status instead of escalating a malformed input into a queue failure.
+4. Platform providers use fixed executable paths and structured arguments. The macOS decode adapter invokes `/usr/bin/sips` only for a validated managed-cache preview and parses an ephemeral BMP locally; the Vision rectangle adapter uses a direct Objective-C FFI bridge with a readable managed-cache URL, autorelease pool, bounded retry, and normalized-box/confidence validation before persistence. Its local UltraFace fallback accepts only the compiled-in model bytes and decoded managed preview pixels.
+5. SQLite data stays relational and local. Compact visual descriptors use BLOB storage, not large JSON float arrays or original bytes. `AnalysisArtifact` records status/error/provenance instead of losing failure context.
+6. Future local model files must remain below a controlled model root, have an expected checksum where available, be explicitly installed, and never supply executable hooks/scripts. See the [model registry](../architecture/local-model-registry.md).
+
+## Data retained by M4
+
+| Data | Local retention purpose | Explicitly absent |
+| --- | --- | --- |
+| Analysis artifact | Reproducibility, status/error, provider/settings/input provenance | Customer image pixels and a remote inference request |
+| Fingerprint / compact descriptor | Bounded related-frame candidate generation | A semantic identity profile or cloud vector database |
+| Similarity group/member record | Rebuildable project-local grouping | Millions of pairwise graph edges by default |
+| Technical evidence | Explainable sharpness, blur, and exposure components | An artistic-quality assertion |
+| Face evidence | Per-asset box/technical/eye state where provider supports it | Person identity, demographics, cross-project biometric link |
+| Human decision | Photographer control and future correction research boundary | Replacement or deletion of the AI history |
+| Semantic embedding / index | Local current-project visual retrieval and rebuildable index artifact | Original pixels, a cloud vector database, person identity, automatic export |
+| Local search history | Recent project-scoped queries and optional saved query definitions | Telemetry, cloud synchronization, cross-project query leakage |
+
+## Platform capability disclosure
+
+On macOS, CaptureOS first uses the user’s installed Apple Vision rectangle capability locally. It neither downloads an Apple model nor calls an Apple network service, and it does not claim Apple Vision is open source or redistributable. If Vision cannot produce a safe result, CaptureOS runs the bundled MIT-licensed UltraFace RFB-320 detector locally through a pure-Rust runtime. The fallback is limited to anonymous face rectangles and confidence; it performs no landmark, eye-state, or identity claim. Both attempts remain component-local and have separately versioned face-artifact provenance; a fallback success is `READY` while the earlier Vision error is developer-only evidence.
+
+## Incident and failure behavior
+
+Analysis failures are scoped to an asset/provider. A corrupt preview, unsupported format, unavailable original, or provider error cannot mark other media failed or leave the durable job indefinitely running. A shutdown-recovery pass records interrupted work as interrupted so a photographer can resume it. Existing `READY` artifacts remain available while originals are offline as long as their cache input remains valid.
+
+## Milestone 5 review data
+
+- Review sessions, current decisions, immutable decision history/events, notes, stars, ratings, flags, group representatives, and preference examples remain in the same local SQLite catalog.
+- Preference examples store only relative asset IDs and technical/recommendation snapshots. They do not include original image bytes, face crops, original filesystem paths, identity labels, or a network upload target.
+- Face View crops a managed preview only for display. It creates no stored crop and never changes an original or sidecar.
+- A culling report is an explicit user-selected new CSV/JSON destination. Export uses create-new semantics and will not overwrite an existing file; it reports catalog metadata only.
+- AI/Human Agreement is a local descriptive count. It is not called accuracy and does not trigger personalized training, telemetry, or cloud communication.
+
+## Milestone 6 Magic Search data
+
+- Magic Search sends no image, managed preview, text query, embedding, face count, filesystem path, model metadata, search history, or result explanation to a remote service. It has no remote embedding API, hosted vector database, telemetry, analytics, model downloader, or hosted GPU path.
+- Semantic inference receives only a canonicalized CaptureOS-managed analysis preview. It does not receive an arbitrary original path; the resolver may read an available original only to create/reuse that contained preview without mutating the source or creating a sidecar.
+- Semantic embeddings are potentially sensitive local derived data. They are stored per MediaAsset with model/input/preprocessing provenance, are never automatically exported, and may be cleared/rebuilt through local controls without affecting source media, catalog records, Capture Intelligence evidence, Similar Sets, or human decisions.
+- A project-scoped vector index is derived from durable embedding records. Model/index paths are canonicalized below controlled roots, static ONNX/tokenizer files are checksum-checked where configured, and arbitrary Python, pickle, model-provided executable, hook, or traversal path is rejected.
+- Search history is local and project-scoped. Clearing it removes only the requested history entries; it does not alter media, culling state, or analytical evidence.
+- Semantic similarity is not object detection, object localization, person recognition, a biometric profile, demographic inference, a creative/emotional judgment, or a statement that an image definitely contains a query concept. User-facing explanations name only actual vector/metadata/technical signals.
+- Milestone 6 remains photo-only and current-project only. It contains no identity recognition, face clustering, cross-project person search, video/audio semantic search, cloud synchronization, or automatic culling.
+
+This policy is additional to the repository-wide posture in [Phase 0 security](phase-0.md) and the non-negotiable rules in [AGENTS.md](../../AGENTS.md).

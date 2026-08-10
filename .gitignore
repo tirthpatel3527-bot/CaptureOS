@@ -1,0 +1,37 @@
+# JavaScript
+node_modules/
+dist/
+.vite/
+coverage/
+
+# Rust / Tauri
+target/
+apps/desktop/src-tauri/target/
+
+# Local data and secrets
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+
+# Generated media and user data
+thumbnails/
+proxies/
+media/
+*.mov
+*.mp4
+*.arw
+*.cr3
+*.nef
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

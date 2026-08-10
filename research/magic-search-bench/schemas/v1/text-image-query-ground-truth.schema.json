@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CaptureOS text/image retrieval ground truth",
+  "type": "object",
+  "required": ["formatVersion", "type", "dataset", "queries"],
+  "properties": {
+    "formatVersion": { "const": 1 },
+    "type": { "const": "TextImageQueryGroundTruth" },
+    "dataset": {
+      "type": "object",
+      "required": ["id", "version", "license", "containsCustomerMedia"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "license": { "type": "string", "minLength": 1 },
+        "containsCustomerMedia": { "const": false }
+      },
+      "additionalProperties": true
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["queryId", "queryText", "relevantMediaAssetIds"],
+        "properties": {
+          "queryId": { "type": "string", "minLength": 1 },
+          "queryText": { "type": "string", "minLength": 1 },
+          "relevantMediaAssetIds": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "relevanceGrades": {
+            "type": "object",
+            "additionalProperties": { "type": "number", "minimum": 0 }
+          },
+          "notes": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "notes": { "type": "string" }
+  },
+  "additionalProperties": false
+}

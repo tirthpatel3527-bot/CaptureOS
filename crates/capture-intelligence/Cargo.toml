@@ -1,0 +1,23 @@
+[package]
+name = "capture-intelligence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+chrono.workspace = true
+media-model = { path = "../media-model" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+# Pin the reviewed pure-Rust runtime used with the checksum-pinned static UltraFace asset.
+tract-onnx = "=0.21.17"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[build-dependencies]
+cc = "1"

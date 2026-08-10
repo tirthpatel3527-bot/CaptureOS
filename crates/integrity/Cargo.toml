@@ -1,0 +1,9 @@
+[package]
+name = "integrity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+media-model = { path = "../media-model" }
+thiserror.workspace = true

@@ -1,0 +1,12 @@
+{
+  "formatVersion": 1,
+  "type": "HybridQueryGroundTruth",
+  "dataset": {
+    "id": "generated-scaffold-only",
+    "version": "v1",
+    "license": "generated data only; no third-party media",
+    "containsCustomerMedia": false
+  },
+  "queries": [],
+  "notes": "Schema scaffold only. Add only evaluated deterministic predicates and licensed references."
+}

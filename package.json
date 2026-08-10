@@ -1,0 +1,22 @@
+{
+  "name": "captureos",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first operating system foundation for professional camera media.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm --workspace @captureos/desktop run dev",
+    "build": "npm --workspace @captureos/desktop run build",
+    "lint": "npm --workspaces --if-present run lint",
+    "typecheck": "npm --workspaces --if-present run typecheck",
+    "test": "npm --workspaces --if-present run test",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3"
+  }
+}

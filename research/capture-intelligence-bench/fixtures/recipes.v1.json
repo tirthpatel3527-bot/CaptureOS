@@ -1,0 +1,9 @@
+{
+  "formatVersion": 1,
+  "recipes": [
+    { "id": "checkerboard", "purpose": "sharpness and resize-stable perceptual fingerprint" },
+    { "id": "directional-blur", "purpose": "controlled probable-motion-blur ordering" },
+    { "id": "dark-bright", "purpose": "shadow/highlight clipping evidence" },
+    { "id": "descriptor-catalog", "purpose": "bounded candidate generation at 1001 jobs" }
+  ]
+}

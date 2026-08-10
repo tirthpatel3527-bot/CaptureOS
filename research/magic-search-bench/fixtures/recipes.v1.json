@@ -1,0 +1,15 @@
+{
+  "formatVersion": 1,
+  "recipes": [
+    {
+      "id": "normalized-vector-corpus",
+      "purpose": "deterministic exact-index scale and self-retrieval mechanics at 1k, 10k, and 50k records",
+      "containsMedia": false
+    },
+    {
+      "id": "deterministic-hybrid-metadata",
+      "purpose": "exercise face-count, rating, and kept-state predicate composition without asserting semantic relevance",
+      "containsMedia": false
+    }
+  ]
+}
