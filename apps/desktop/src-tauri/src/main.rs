@@ -1,18 +1,32 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use capture_core::{
-    analyze_capture_intelligence, apply_culling_decision, clear_visual_cache,
-    complete_culling_group, create_local_project, export_culling_report,
-    export_studio_brain_preference_examples, finish_culling_review, index_local_folder,
-    ingest_history, ingest_report, list_local_projects, load_capture_intelligence_summary,
-    load_culling_progress, load_culling_workspace, load_media_asset_detail, load_project_home,
-    load_project_library, load_similarity_group, load_visual_media_page,
-    load_visual_preparation_summary, preflight_ingest, prepare_visual_media,
+    analyze_capture_intelligence, apply_culling_decision, clear_magic_search_history,
+    clear_visual_cache, complete_culling_group,
+    create_coverage_checklist_item as create_coverage_checklist_item_core, create_local_project,
+    export_culling_report, export_studio_brain_preference_examples, find_similar,
+    finish_culling_review, index_local_folder, index_semantic_embeddings, ingest_history,
+    ingest_report, list_local_projects, load_capture_intelligence_summary, load_culling_progress,
+    load_culling_workspace, load_magic_search_history, load_media_asset_detail,
+    load_moment_checklists, load_moment_detail, load_moment_timeline, load_moment_timeline_status,
+    load_project_home, load_project_library, load_semantic_index_status, load_similarity_group,
+    load_visual_media_page, load_visual_preparation_summary,
+    merge_adjacent_moments as merge_adjacent_moments_core, preflight_ingest, prepare_visual_media,
     recover_interrupted_capture_intelligence, recover_interrupted_ingests,
-    recover_interrupted_visual_preparations, restart_ingest, retry_failed_visual_media,
-    save_human_intelligence_decision, set_culling_group_representative, start_ingest,
-    update_culling_position, CaptureIntelligenceProgress, IngestPreflightView, JobView,
-    MediaPreparationProgress, ProjectHome, ProjectLibraryItem, ProjectView,
+    recover_interrupted_moment_analysis, recover_interrupted_semantic_indexing,
+    recover_interrupted_visual_preparations, refresh_capture_metadata,
+    rename_moment as rename_moment_core, restart_ingest, retry_failed_visual_media,
+    save_human_intelligence_decision, search_magic, search_moments,
+    set_culling_group_representative,
+    set_moment_human_representative as set_moment_human_representative_core,
+    split_moment as split_moment_core, start_ingest, start_moment_analysis as run_moment_analysis,
+    update_coverage_confirmation as update_coverage_confirmation_core, update_culling_position,
+    CaptureIntelligenceProgress, CreateCoverageChecklistItemInput, FindSimilarRequest,
+    IngestPreflightView, JobView, MagicSearchHistoryEntry, MagicSearchRequest, MagicSearchResponse,
+    MediaPreparationProgress, MetadataRefreshProgress, MomentAnalysisProgress, MomentChecklistView,
+    MomentDetailView, MomentSearchRequest, MomentSearchResponse, MomentTimelineView, ProjectHome,
+    ProjectLibraryItem, ProjectView, SemanticIndexProgress, SemanticStorageRoots,
+    SiglipProviderCache, UpdateCoverageConfirmationInput,
 };
 use ingest::IngestRequest;
 use media_model::{
@@ -44,9 +58,16 @@ struct AppState {
     repository: Arc<Mutex<SqliteRepository>>,
     catalog_path: PathBuf,
     preview_cache_root: PathBuf,
+    semantic_provider_cache: Arc<SiglipProviderCache>,
+    semantic_index_root: PathBuf,
     active_visual_projects: Arc<Mutex<HashSet<String>>>,
+    active_metadata_refresh_projects: Arc<Mutex<HashSet<String>>>,
     active_intelligence_projects: Arc<Mutex<HashSet<String>>>,
     intelligence_pause_controls: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    active_semantic_projects: Arc<Mutex<HashSet<String>>>,
+    semantic_pause_controls: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    active_moment_projects: Arc<Mutex<HashSet<String>>>,
+    moment_pause_controls: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +81,7 @@ struct VisualQueryInput {
     lens_model: Option<String>,
     captured_from: Option<String>,
     captured_to: Option<String>,
+    moment_id: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
 }
@@ -78,6 +100,7 @@ struct CullingQueryInput {
     mode: Option<String>,
     filter: Option<String>,
     group_id: Option<String>,
+    moment_id: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
 }
@@ -218,6 +241,52 @@ fn visual_preparation_summary_command(
     load_visual_preparation_summary(&*repository, &project_id).map_err(|error| error.to_string())
 }
 
+/// Explicitly refreshes only local source metadata on a worker connection. This is never called
+/// while opening a project: previews, semantic embeddings, Similar Sets, Capture Intelligence,
+/// and photographer decisions remain outside this operation's scope.
+#[tauri::command(rename_all = "camelCase")]
+async fn refresh_metadata_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<MetadataRefreshProgress, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let project_key = project_id.to_string();
+    let active_projects = Arc::clone(&state.active_metadata_refresh_projects);
+    {
+        let mut active = active_projects
+            .lock()
+            .map_err(|_| "metadata refresh lock was poisoned".to_owned())?;
+        if !active.insert(project_key.clone()) {
+            return Err("Metadata refresh is already running for this project".into());
+        }
+    }
+    let catalog_path = state.catalog_path.clone();
+    let event_project_key = project_key.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            let repository =
+                SqliteRepository::open(catalog_path).map_err(|error| error.to_string())?;
+            refresh_capture_metadata(&repository, &project_id, |progress| {
+                let _ = app.emit(
+                    "metadata-refresh-progress",
+                    ProjectScopedEvent {
+                        project_id: event_project_key.clone(),
+                        progress,
+                    },
+                );
+            })
+            .map_err(|error| error.to_string())
+        })();
+        if let Ok(mut active) = active_projects.lock() {
+            active.remove(&project_key);
+        }
+        result
+    })
+    .await
+    .map_err(|error| format!("metadata refresh task did not complete: {error}"))?
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn capture_intelligence_summary_command(
     state: State<'_, AppState>,
@@ -311,6 +380,495 @@ fn pause_capture_intelligence_command(
     Ok(())
 }
 
+/// Returns the local-only semantic model and index status for one project. This command never
+/// downloads a model, scans original media, or exposes a model/embedding filesystem path.
+#[tauri::command(rename_all = "camelCase")]
+fn semantic_index_status_command(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<SemanticIndexProgress, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    load_semantic_index_status(
+        &*repository,
+        &project_id,
+        &state.semantic_provider_cache,
+        &state.semantic_index_root,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Indexes CaptureOS-managed analysis previews with an explicitly installed local model pack.
+/// A separate SQLite connection keeps browsing responsive while the index job is running.
+#[tauri::command(rename_all = "camelCase")]
+async fn start_semantic_index_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+    resource_mode: String,
+) -> Result<SemanticIndexProgress, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let mode = analysis_resource_mode(&resource_mode)?;
+    let project_key = project_id.to_string();
+    let active_projects = Arc::clone(&state.active_semantic_projects);
+    {
+        let mut active = active_projects
+            .lock()
+            .map_err(|_| "semantic index lock was poisoned".to_owned())?;
+        if !active.insert(project_key.clone()) {
+            return Err("Magic Search indexing is already running for this project".into());
+        }
+    }
+
+    let pause_control = Arc::new(AtomicBool::new(false));
+    if let Err(error) = state
+        .semantic_pause_controls
+        .lock()
+        .map_err(|_| "semantic index controls were unavailable".to_owned())
+        .map(|mut controls| controls.insert(project_key.clone(), Arc::clone(&pause_control)))
+    {
+        if let Ok(mut active) = active_projects.lock() {
+            active.remove(&project_key);
+        }
+        return Err(error);
+    }
+
+    let controls = Arc::clone(&state.semantic_pause_controls);
+    let catalog_path = state.catalog_path.clone();
+    let preview_cache_root = state.preview_cache_root.clone();
+    let semantic_provider_cache = Arc::clone(&state.semantic_provider_cache);
+    let semantic_index_root = state.semantic_index_root.clone();
+    let event_project_key = project_key.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            let repository =
+                SqliteRepository::open(catalog_path).map_err(|error| error.to_string())?;
+            index_semantic_embeddings(
+                &repository,
+                &project_id,
+                SemanticStorageRoots {
+                    preview_cache_root: &preview_cache_root,
+                    index_root: &semantic_index_root,
+                },
+                &semantic_provider_cache,
+                mode,
+                || pause_control.load(Ordering::SeqCst),
+                |progress| {
+                    let _ = app.emit(
+                        "semantic-index-progress",
+                        ProjectScopedEvent {
+                            project_id: event_project_key.clone(),
+                            progress,
+                        },
+                    );
+                },
+            )
+            .map_err(|error| error.to_string())
+        })();
+        if let Ok(mut active) = active_projects.lock() {
+            active.remove(&project_key);
+        }
+        if let Ok(mut controls) = controls.lock() {
+            controls.remove(&project_key);
+        }
+        result
+    })
+    .await
+    .map_err(|error| format!("Magic Search indexing task did not complete: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn pause_semantic_index_command(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let controls = state
+        .semantic_pause_controls
+        .lock()
+        .map_err(|_| "semantic index controls were unavailable".to_owned())?;
+    let Some(control) = controls.get(&project_id.to_string()) else {
+        return Err("Magic Search indexing is not running for this project".into());
+    };
+    control.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Returns a compact persisted status only. It intentionally never queues, awaits, or loads a
+/// local model, so opening a project cannot be blocked by Moment Brain.
+#[tauri::command(rename_all = "camelCase")]
+fn moment_timeline_status(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<MomentAnalysisProgress>, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    load_moment_timeline_status(&*repository, &project_id).map_err(|error| error.to_string())
+}
+
+/// Queues a local structural analysis and returns immediately. The worker owns a separate SQLite
+/// connection and emits project-scoped progress; it never runs as part of project startup.
+#[tauri::command(rename_all = "camelCase")]
+fn start_moment_analysis(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+    rebuild: bool,
+    resource_mode: Option<String>,
+) -> Result<MomentAnalysisProgress, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let mode = analysis_resource_mode(resource_mode.as_deref().unwrap_or(""))?;
+    let mode_label = mode.as_str().to_owned();
+    let project_key = project_id.to_string();
+    let active_projects = Arc::clone(&state.active_moment_projects);
+    {
+        let mut active = active_projects
+            .lock()
+            .map_err(|_| "Moment analysis lock was poisoned".to_owned())?;
+        if !active.insert(project_key.clone()) {
+            return Err("Moment analysis is already running for this project".into());
+        }
+    }
+    let pause_control = Arc::new(AtomicBool::new(false));
+    if let Err(error) = state
+        .moment_pause_controls
+        .lock()
+        .map_err(|_| "Moment analysis controls were unavailable".to_owned())
+        .map(|mut controls| controls.insert(project_key.clone(), Arc::clone(&pause_control)))
+    {
+        if let Ok(mut active) = active_projects.lock() {
+            active.remove(&project_key);
+        }
+        return Err(error);
+    }
+    let controls = Arc::clone(&state.moment_pause_controls);
+    let catalog_path = state.catalog_path.clone();
+    let semantic_provider_cache = Arc::clone(&state.semantic_provider_cache);
+    let event_project_key = project_key.clone();
+    let _worker = tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            let repository =
+                SqliteRepository::open(catalog_path).map_err(|error| error.to_string())?;
+            run_moment_analysis(
+                &repository,
+                &project_id,
+                &semantic_provider_cache,
+                mode,
+                rebuild,
+                || pause_control.load(Ordering::SeqCst),
+                |progress| {
+                    let _ = app.emit(
+                        "moment-analysis-progress",
+                        ProjectScopedEvent {
+                            project_id: event_project_key.clone(),
+                            progress,
+                        },
+                    );
+                },
+            )
+            .map_err(|error| error.to_string())
+        })();
+        if let Ok(mut active) = active_projects.lock() {
+            active.remove(&project_key);
+        }
+        if let Ok(mut controls) = controls.lock() {
+            controls.remove(&project_key);
+        }
+        result
+    });
+    Ok(MomentAnalysisProgress {
+        state: "queued".into(),
+        active: true,
+        paused: false,
+        stage: "moment_analysis".into(),
+        resource_mode: mode_label,
+        completed: 0,
+        total: 0,
+        error_count: 0,
+        timeline_ready: false,
+        moment_count: 0,
+        ungrouped_asset_count: 0,
+        last_error: None,
+        message: Some(
+            "Moment analysis is queued locally and will not block project browsing.".into(),
+        ),
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn moment_timeline(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<MomentTimelineView, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    load_moment_timeline(
+        &*repository,
+        &project_id,
+        limit.unwrap_or(60).clamp(1, 120),
+        offset.unwrap_or(0),
+        &state.preview_cache_root,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn moment_detail(
+    state: State<'_, AppState>,
+    project_id: String,
+    moment_id: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Option<MomentDetailView>, String> {
+    // Member media use the existing separately paginated `visual_media_page` command. Accept
+    // the shared detail request shape without loading a member list into this summary call.
+    let _ = (limit, offset);
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    load_moment_detail(
+        &*repository,
+        &project_id,
+        &moment_id,
+        &state.preview_cache_root,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn rename_moment(
+    state: State<'_, AppState>,
+    project_id: String,
+    moment_id: String,
+    label: String,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    rename_moment_core(&*repository, &project_id, &moment_id, &label)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn set_moment_human_representative(
+    state: State<'_, AppState>,
+    project_id: String,
+    moment_id: String,
+    asset_id: String,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let asset_id = MediaAssetId::try_from(asset_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    set_moment_human_representative_core(&*repository, &project_id, &moment_id, &asset_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn merge_adjacent_moments(
+    state: State<'_, AppState>,
+    project_id: String,
+    left_moment_id: String,
+    right_moment_id: String,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    merge_adjacent_moments_core(&*repository, &project_id, &left_moment_id, &right_moment_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn split_moment(
+    state: State<'_, AppState>,
+    project_id: String,
+    moment_id: String,
+    after_asset_id: String,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let asset_id =
+        MediaAssetId::try_from(after_asset_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    split_moment_core(&*repository, &project_id, &moment_id, &asset_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn moment_checklists(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<MomentChecklistView>, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    load_moment_checklists(&*repository, &project_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn create_coverage_checklist_item(
+    state: State<'_, AppState>,
+    project_id: String,
+    input: CreateCoverageChecklistItemInput,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    create_coverage_checklist_item_core(&*repository, &project_id, &input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn update_coverage_confirmation(
+    state: State<'_, AppState>,
+    project_id: String,
+    input: UpdateCoverageConfirmationInput,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    update_coverage_confirmation_core(&*repository, &project_id, &input)
+        .map_err(|error| error.to_string())
+}
+
+/// Searches only durable current-project Moment centroids using the explicitly installed local
+/// text provider. The response intentionally omits vectors and numeric scores; an unavailable
+/// or incompatible local model returns no fabricated Moment-card match.
+#[tauri::command(rename_all = "camelCase")]
+fn moment_search(
+    state: State<'_, AppState>,
+    project_id: String,
+    request: MomentSearchRequest,
+) -> Result<MomentSearchResponse, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    search_moments(
+        &*repository,
+        &project_id,
+        &request,
+        &state.semantic_provider_cache,
+        &state.preview_cache_root,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Runs a project-scoped local query. The application service enforces that semantic text is
+/// unavailable rather than fabricated if an approved local model or derived index is absent.
+#[tauri::command(rename_all = "camelCase")]
+fn magic_search_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    request: MagicSearchRequest,
+) -> Result<MagicSearchResponse, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    search_magic(
+        &*repository,
+        &project_id,
+        &request,
+        &state.semantic_provider_cache,
+        &state.semantic_index_root,
+        &state.preview_cache_root,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Finds related frames by local embedding proximity only. It does not create or mutate Similar
+/// Sets, culling decisions, ratings, notes, or source media.
+#[tauri::command(rename_all = "camelCase")]
+fn find_similar_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    asset_id: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<MagicSearchResponse, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let asset_id = MediaAssetId::try_from(asset_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    find_similar(
+        &*repository,
+        &project_id,
+        FindSimilarRequest {
+            asset_id: &asset_id,
+            limit: limit.unwrap_or(60).clamp(1, 120),
+            offset: offset.unwrap_or(0),
+        },
+        SemanticStorageRoots {
+            preview_cache_root: &state.preview_cache_root,
+            index_root: &state.semantic_index_root,
+        },
+        &state.semantic_provider_cache,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn magic_search_history_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    limit: Option<u32>,
+) -> Result<Vec<MagicSearchHistoryEntry>, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    load_magic_search_history(&*repository, &project_id, limit.unwrap_or(8).clamp(1, 50))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn clear_magic_search_history_command(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    clear_magic_search_history(&*repository, &project_id)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn similarity_group_command(
     state: State<'_, AppState>,
@@ -371,19 +929,24 @@ fn culling_workspace_command(
     query: CullingQueryInput,
 ) -> Result<CullingWorkspaceView, String> {
     let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
-    let query = CullingQuery {
-        mode: query.mode.unwrap_or_else(|| "all_photos".into()),
-        filter: query.filter.unwrap_or_else(|| "all".into()),
-        group_id: query.group_id,
-        limit: query.limit.unwrap_or(60).clamp(1, 120),
-        offset: query.offset.unwrap_or(0),
-    };
+    let query = culling_query(query);
     let repository = state
         .repository
         .lock()
         .map_err(|_| "catalog lock was poisoned".to_owned())?;
     load_culling_workspace(&*repository, &project_id, &query, &state.preview_cache_root)
         .map_err(|error| error.to_string())
+}
+
+fn culling_query(input: CullingQueryInput) -> CullingQuery {
+    CullingQuery {
+        mode: input.mode.unwrap_or_else(|| "all_photos".into()),
+        filter: input.filter.unwrap_or_else(|| "all".into()),
+        group_id: input.group_id,
+        moment_id: clean_optional(input.moment_id),
+        limit: input.limit.unwrap_or(60).clamp(1, 120),
+        offset: input.offset.unwrap_or(0),
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -875,6 +1438,7 @@ fn visual_query(input: VisualQueryInput) -> VisualMediaQuery {
         lens_model: clean_optional(input.lens_model),
         captured_from: clean_optional(input.captured_from),
         captured_to: clean_optional(input.captured_to),
+        moment_id: clean_optional(input.moment_id),
         limit: input.limit.unwrap_or(120).clamp(1, 250),
         offset: input.offset.unwrap_or(0),
     }
@@ -996,16 +1560,31 @@ fn main() {
             recover_interrupted_ingests(&repository)?;
             recover_interrupted_visual_preparations(&repository)?;
             recover_interrupted_capture_intelligence(&repository)?;
+            recover_interrupted_semantic_indexing(&repository)?;
+            recover_interrupted_moment_analysis(&repository)?;
             let data_directory = app_data_directory(app.handle())?;
             let preview_cache_root = data_directory.join("preview-cache");
+            // These roots contain only CaptureOS-managed derived data and operator-installed
+            // static model packs. Nothing here is a source-media location or cloud cache.
+            let semantic_model_root = data_directory.join("semantic-models");
+            let semantic_index_root = data_directory.join("semantic-index");
             fs::create_dir_all(&preview_cache_root)?;
+            fs::create_dir_all(&semantic_model_root)?;
+            fs::create_dir_all(&semantic_index_root)?;
             app.manage(AppState {
                 repository: Arc::new(Mutex::new(repository)),
                 catalog_path: data_directory.join("captureos.sqlite3"),
                 preview_cache_root,
+                semantic_provider_cache: Arc::new(SiglipProviderCache::new(&semantic_model_root)),
+                semantic_index_root,
                 active_visual_projects: Arc::new(Mutex::new(HashSet::new())),
+                active_metadata_refresh_projects: Arc::new(Mutex::new(HashSet::new())),
                 active_intelligence_projects: Arc::new(Mutex::new(HashSet::new())),
                 intelligence_pause_controls: Arc::new(Mutex::new(HashMap::new())),
+                active_semantic_projects: Arc::new(Mutex::new(HashSet::new())),
+                semantic_pause_controls: Arc::new(Mutex::new(HashMap::new())),
+                active_moment_projects: Arc::new(Mutex::new(HashSet::new())),
+                moment_pause_controls: Arc::new(Mutex::new(HashMap::new())),
             });
             Ok(())
         })
@@ -1017,11 +1596,31 @@ fn main() {
             visual_media_page,
             media_asset_detail_command,
             visual_preparation_summary_command,
+            refresh_metadata_command,
             capture_intelligence_summary_command,
             prepare_media_command,
             retry_failed_previews_command,
             start_capture_intelligence_command,
             pause_capture_intelligence_command,
+            semantic_index_status_command,
+            start_semantic_index_command,
+            pause_semantic_index_command,
+            moment_timeline_status,
+            start_moment_analysis,
+            moment_timeline,
+            moment_detail,
+            rename_moment,
+            set_moment_human_representative,
+            merge_adjacent_moments,
+            split_moment,
+            moment_checklists,
+            create_coverage_checklist_item,
+            update_coverage_confirmation,
+            moment_search,
+            magic_search_command,
+            find_similar_command,
+            magic_search_history_command,
+            clear_magic_search_history_command,
             similarity_group_command,
             save_human_intelligence_decision_command,
             culling_workspace_command,
@@ -1051,6 +1650,38 @@ mod tests {
     use super::*;
     use persistence::PreviewArtifactRecord;
     use tempfile::tempdir;
+
+    #[test]
+    fn moment_scopes_are_preserved_only_as_bounded_backend_query_fields() {
+        let visual = visual_query(VisualQueryInput {
+            filter: Some("photos".into()),
+            sort: Some("captureTime".into()),
+            descending: None,
+            search: None,
+            camera_model: None,
+            lens_model: None,
+            captured_from: None,
+            captured_to: None,
+            moment_id: Some("  moment-1  ".into()),
+            limit: Some(24),
+            offset: Some(3),
+        });
+        assert_eq!(visual.moment_id.as_deref(), Some("moment-1"));
+        assert_eq!(visual.limit, 24);
+        assert_eq!(visual.offset, 3);
+
+        let culling = culling_query(CullingQueryInput {
+            mode: None,
+            filter: None,
+            group_id: None,
+            moment_id: Some(" moment-1 ".into()),
+            limit: Some(500),
+            offset: None,
+        });
+        assert_eq!(culling.moment_id.as_deref(), Some("moment-1"));
+        assert_eq!(culling.limit, 120);
+        assert_eq!(culling.offset, 0);
+    }
 
     #[test]
     fn preview_bridge_serves_a_registered_ready_artifact_and_rejects_unknown_ids() {
@@ -1105,9 +1736,18 @@ mod tests {
             repository: Arc::new(Mutex::new(repository)),
             catalog_path: directory.path().join("captureos.sqlite3"),
             preview_cache_root: cache_root,
+            semantic_provider_cache: Arc::new(SiglipProviderCache::new(
+                directory.path().join("semantic-models"),
+            )),
+            semantic_index_root: directory.path().join("semantic-index"),
             active_visual_projects: Arc::new(Mutex::new(HashSet::new())),
+            active_metadata_refresh_projects: Arc::new(Mutex::new(HashSet::new())),
             active_intelligence_projects: Arc::new(Mutex::new(HashSet::new())),
             intelligence_pause_controls: Arc::new(Mutex::new(HashMap::new())),
+            active_semantic_projects: Arc::new(Mutex::new(HashSet::new())),
+            semantic_pause_controls: Arc::new(Mutex::new(HashMap::new())),
+            active_moment_projects: Arc::new(Mutex::new(HashSet::new())),
+            moment_pause_controls: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let request = http::Request::builder()

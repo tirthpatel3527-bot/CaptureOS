@@ -18,5 +18,5 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+tokenizers = { version = "0.20.4", default-features = false, features = ["onig"] }
 tract-onnx = "=0.21.17"
-unicode-normalization.workspace = true

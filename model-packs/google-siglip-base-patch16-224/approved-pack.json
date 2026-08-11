@@ -1,0 +1,53 @@
+{
+  "formatVersion": 1,
+  "packId": "captureos.semantic.siglip-base-p16-224.v1",
+  "modelId": "google-siglip-base-patch16-224",
+  "modelFamily": "siglip",
+  "runtime": "tract-onnx",
+  "modelVersion": "captureos.semantic.siglip-base-p16-224.v1+7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
+  "sourceUrl": "https://huggingface.co/google/siglip-base-patch16-224",
+  "sourceRevision": "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
+  "sourceWeightsSha256": "2c63cb7d1f2e95ba501893cbb8faeb4ea9a3af295498d35097126228659c2af8",
+  "license": "Apache-2.0",
+  "licenseUrl": "https://huggingface.co/google/siglip-base-patch16-224",
+  "preprocessingVersion": "siglip-rgb224-pillow-bicubic-scale05.v1",
+  "supportedCapabilities": ["image_text_embedding"],
+  "manifestSha256": "975bc62db57834a397fa687e69b24c070c078b282778bc888f1f0a9ed9eb1bae",
+  "files": {
+    "imageModel": {
+      "path": "image-encoder.onnx",
+      "bytes": 371718169,
+      "sha256": "ee67818e4f1c62bf765442ed6d511a8b080d59b0872e401fcc5d9d2fb6306ef2"
+    },
+    "textModel": {
+      "path": "text-encoder.onnx",
+      "bytes": 441247152,
+      "sha256": "3d36877d59f3da9879f24c688febd42627f7da8b252ca77e7c3ba7c0b0bb03c2"
+    },
+    "tokenizer": {
+      "path": "tokenizer.json",
+      "bytes": 2399357,
+      "sha256": "c6e405cb7c670d56636a9402c81023a55bc6c3c53d89cf02b92f5c5005bfe920"
+    },
+    "licenseFile": {
+      "path": "Apache-2.0.txt",
+      "bytes": 10140,
+      "sha256": "bb28c48e3e078166e91cfc2b6db7ffebb8a0973b9e23b3df060561292d8d69ec"
+    },
+    "noticeFile": {
+      "path": "NOTICE.txt",
+      "bytes": 626,
+      "sha256": "8594f0c66e1a1e72a47c46cd65ce8969045926fd566cb8fe7a0a5ec0b7712c98"
+    },
+    "conversionProvenanceFile": {
+      "path": "conversion-provenance.json",
+      "bytes": 552,
+      "sha256": "617ccfbb8a3b17aa88fb51899466a751a73eda38ec1cb389c3ac953c9694bb66"
+    },
+    "referenceRgb24": {
+      "path": "reference.rgb24",
+      "bytes": 175911,
+      "sha256": "9a2ef30a40740598108109f4fbca048bfd6eae2041bab61144999e299dccdf10"
+    }
+  }
+}

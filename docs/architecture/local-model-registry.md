@@ -48,17 +48,36 @@ Large experimental model binaries do not belong in Git. A small fixed release as
 | `captureos-deterministic-image` / `m4.det.v1` | Perceptual descriptors and technical evidence | CaptureOS Rust source tree; repository MIT license. No external model binary or network dependency. | 0 external model bytes; bounded local CPU analysis. | Built in; model-free |
 | `captureos-technical-recommendation` / `m4.rules.v1` | Evidence-based technical labels | CaptureOS Rust source tree; repository MIT license. No external model. | 0 external model bytes; local CPU only. | Built in; model-free |
 | `captureos-local-face-detection` / `m4.face-detection-chain.v3` | Anonymous face rectangles, with face-region sharpness measured separately | Apple Vision rectangle request on macOS first; static fallback is [UltraFace RFB-320](https://github.com/linzaer/ultra-light-fast-generic-face-detector-1mb), MIT, Copyright 2019 linzai. No cloud or download path. | `ultraface-rfb-320.onnx`, 1,270,727 bytes, SHA-256 `34cd7e60aeff28744c657de7a3dc64e872d506741de66987f3426f2b79f88017`; pure-Rust `tract-onnx` CPU inference. | Built in; ADR 037 |
-| `google-siglip-base-patch16-224` / `tract-onnx` / explicit user-installed model revision | Shared image/text embeddings for Magic Search | Candidate pack source: [`google/siglip-base-patch16-224`](https://huggingface.co/google/siglip-base-patch16-224). Its upstream model card labels the source code and weights Apache-2.0; CaptureOS does **not** bundle, download, or redistribute it. The upstream `model.safetensors` reference artifact is 813 MB, SHA-256 `2c63cb7d1f2e95ba501893cbb8faeb4ea9a3af295498d35097126228659c2af8`; an installed ONNX conversion has separate immutable source/revision and per-file checksums. | Static ONNX image encoder + text encoder + tokenizer only; 224px RGB input and 768-dimensional projection. CPU inference uses `tract-onnx` 0.21.17 (dual MIT/Apache-2.0). Apple Silicon runs native Rust CPU code; future Windows support remains contingent on the admitted pack and runtime operation coverage. | Manual/developer installation only; `NOT_INSTALLED` or `PENDING_REFERENCE_VALIDATION` until all admission checks pass; ADRs 043–045 |
+| `google-siglip-base-patch16-224` / `tract-onnx` / `captureos.semantic.siglip-base-p16-224.v1` | Shared image/text embeddings for Magic Search | Controlled source: [`google/siglip-base-patch16-224`](https://huggingface.co/google/siglip-base-patch16-224) at pinned revision `7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed`. Its upstream metadata labels the repository artifact Apache-2.0; CaptureOS does **not** bundle or declare the conversion commercially approved. The compiled descriptor pins source and final artifact checksums. | Static ONNX image encoder + text encoder + tokenizer only; 224px RGB input and 768-dimensional projection. The reviewed v6 local pack is 815,600,873 bytes. CPU inference uses `tract-onnx` 0.21.17 (dual MIT/Apache-2.0). Apple Silicon runs native Rust CPU code; future Windows support remains contingent on on-target admission. | No binary ships in this repository; unavailable until explicit local admission succeeds; ADRs 043–045 |
 
 The Apple Vision attempt is intentionally not an exception to the registry license gate: because CaptureOS does not distribute it, it is not a redistributable model record. The UltraFace fallback passed the gate as a fixed, reviewed application asset; its scope is rectangles only. A future landmark model must separately meet the full gate.
 
 ## Magic Search pack admission
 
-The current Magic Search provider contract names SigLIP only as a reviewed **candidate family**, not as a bundled or already-supported binary. A photographer or developer may explicitly place a static ONNX pack below the controlled CaptureOS model root, then register its exact immutable upstream revision, source URLs, image/text encoder checksums, tokenizer checksum, source-weight provenance, license reference, disk size, and preprocessing version. CaptureOS never downloads the approximately 813 MB upstream source weight or a converted ONNX pack simply because a project opens.
+Magic Search admits exactly one compiled, reviewable SigLIP pack descriptor, not arbitrary folders or
+third-party ONNX conversions. An operator explicitly runs the documented development installer;
+it verifies the pinned source, converts only safetensors to static ONNX in a temporary controlled
+staging directory, verifies its output, and atomically publishes the fixed pack directory. The
+desktop app never downloads the approximately 813 MB upstream source weight or a converted ONNX
+pack simply because a project opens.
 
-For the candidate `google/siglip-base-patch16-224` pack, the expected contract is a 768-dimensional shared projection, oriented RGB 224×224 input, channel values scaled by `/255` and normalized with mean/std `0.5`, plus the model-compatible tokenizer after lowercasing with a maximum sequence length of 64. The image and text vectors are L2-normalized only after successful inference. These values are provider configuration, not an assertion that every third-party conversion is compatible.
+For `google/siglip-base-patch16-224`, the controlled contract is a 768-dimensional shared
+projection, oriented RGB 224×224 input, Pillow-compatible bicubic resize, channel values scaled
+by `/255` and normalized with mean/std `0.5`, and the static official tokenizer JSON with its
+64-token EOS-only contract. The image and text vectors are L2-normalized only after successful
+inference. These values are descriptor-pinned provider configuration, not an assertion that every
+third-party conversion is compatible.
 
-Before the registry marks such a pack `AVAILABLE`, CaptureOS must validate canonical containment below the model root, reject symlink/path escape and executable hooks, verify configured checksums, and compare image and text outputs to versioned reference vectors generated from the same immutable upstream revision. A mismatch, unsupported ONNX operation, tokenizer mismatch, missing file, or unreviewed license keeps the provider unavailable. The local `tract-onnx` runtime is open source under [MIT or Apache-2.0](https://github.com/sonos/tract), but its license does not establish rights for model weights or conversion artifacts.
+Before the registry marks the controlled pack `AVAILABLE`, CaptureOS validates canonical
+containment below the model root, rejects symlink/path escape, unexpected files/directories, and
+unknown manifest fields, verifies the compiled manifest digest and configured checksums/sizes,
+runs tokenizer regression checks, checksum-verifies a fixed RGB24 reference raster, and compares
+image/text outputs to vectors generated from the pinned source revision. A mismatch, unsupported
+ONNX operation, tokenizer mismatch, missing file, or unreviewed license keeps the provider
+unavailable. The local `tract-onnx` runtime is open source under
+[MIT or Apache-2.0](https://github.com/sonos/tract), but its license does not establish rights
+for model weights or conversion artifacts. The installation/removal commands are documented in
+[Controlled local SigLIP pack installation](semantic-model-install.md).
 
 The upstream model card’s Apache-2.0 label is source provenance, not legal advice or a blanket approval of all conversion artifacts, datasets, or downstream uses. Releases must re-review the exact model files and their redistribution terms before bundling anything.
 

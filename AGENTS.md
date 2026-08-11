@@ -60,3 +60,21 @@ CaptureOS is local-first software for professional camera media. Preserve these 
 - Treat embeddings and semantic-index files as potentially sensitive derived data. Store them locally, never export them automatically, and make the index rebuildable from durable embedding records; it is never the sole source of project identity or human decisions.
 - Limit Milestone 6 to current-project still-photo Magic Search, deterministic/hybrid filters, and Find Similar. Do not add People Brain, Moment Brain, creative/emotional judgment, video/audio semantic search, cloud, collaboration, billing, or other later milestones.
 - Stop at the requested milestone. Do not begin Milestone 7 without explicit approval.
+
+## Milestone 7 Moment Brain and Shoot Timeline Intelligence I rules
+
+- Moment grouping is project-local structural organization from local evidence, not truth about an event, relationship, scene, intent, or what a photographer should have captured.
+- Keep semantic retrieval, Similar Sets, and structural Moment grouping distinct. A Moment analysis must never create, rewrite, merge, or delete Similar Set membership, and Find Similar remains asset-to-asset retrieval.
+- Never upload originals, managed previews, timeline metadata, labels, embeddings, face evidence, checklists, query text, or filesystem paths. Moment Brain must remain local, offline-capable, and free of paid/cloud API requirements.
+- A local embedding score is not an object detector, caption, identity, event classifier, or proof that a concept is present. Suggested labels must be conservative, evidence-grounded, and may abstain as `Untitled Moment`.
+- Never infer or label a bride, groom, person identity, family relationship, emotion, ceremony stage, wedding event, creative intent, or a required/missing shot. User-authored checklist/project terminology may be matched only as a user-supplied candidate, never invented.
+- Persist AI suggested labels, their model/method/version/evidence, and human labels separately. A human rename controls presentation and never overwrites historical AI evidence.
+- Suggested representatives are advisory and must expose only the local factors actually used. Never call one photo artistically best or use Moment evidence to alter Keep/Reject/Review, ratings, notes, flags, review sessions, or source media.
+- Preserve append-only Moment events and human split, merge, rename, representative, and coverage-confirmation overrides across incremental work and rebuilds. Do not silently reset, reinterpret, or erase human organization.
+- A Coverage Map may report observed asset counts, capture-time ranges/gaps, technical distributions, anonymous face-count availability, and human checklist state. The photographer-defined checklist is authoritative for expected coverage; Moment/Search evidence may never fabricate missing coverage or mark an item complete automatically.
+- A camera-clock diagnostic is advisory only. Never rewrite EXIF, timestamps, source metadata, or catalog capture times as an automatic correction.
+- Moment analysis must use durable background work, bounded chronological processing, and project-scoped persistence. It must never block startup, project opening, grid browsing, culling, Magic Search, or existing intelligence queues.
+- Missing timestamps, incompatible embeddings, unavailable semantic model/provider, and offline originals must be represented honestly. Cached durable evidence may be used locally; an unavailable input must not halt unrelated assets.
+- Treat timeline records, centroids, labels, boundary evidence, and index artifacts as sensitive local derived data. They must be rebuildable and never be the sole source of project identity or human decisions.
+- Limit Milestone 7 to current-project still-photo Moment Brain, timeline organization, conservative labels, representatives, coverage checklist support, and advisory multicamera diagnostics. Do not add Milestone 8 work such as People Brain, personal training, event intelligence, creative/emotional judgment, video/audio understanding, cloud, collaboration, billing, write-back, deletion, or automatic culling.
+- Stop at the requested milestone. Do not begin Milestone 8 without explicit approval.

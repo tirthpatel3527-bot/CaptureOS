@@ -3,13 +3,22 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type {
   CaptureIntelligenceProgress,
+  CoverageConfirmationState,
   CullingProgress,
   CullingDecision,
   CullingDecisionView,
   CullingFilter,
   CullingMediaRow,
   CullingMode,
+  CullingWorkspaceQuery,
   CullingWorkspaceView,
+  MomentAnalysisProgress,
+  MomentChecklistView,
+  MomentDetailView,
+  MomentSearchRequest,
+  MomentSearchResponse,
+  MomentSummaryView,
+  MomentTimelineView,
   FaceAnalysisEvidence,
   IngestJobSummary,
   IngestPolicy,
@@ -24,6 +33,7 @@ import type {
   MagicSearchResult,
   MagicSearchSort,
   MediaAssetDetail,
+  MetadataRefreshProgress,
   MediaPreparationProgress,
   MediaFilter,
   ProjectHome,
@@ -53,22 +63,40 @@ const filters: { id: MediaFilter; label: string }[] = [
   { id: "unknown", label: "Unknown" },
 ];
 
-type AppRoute = { kind: "home" } | { kind: "project"; projectId: string; surface: "media" | "ingest" | "cull" };
+type ProjectSurface = "media" | "ingest" | "cull" | "timeline";
+type AppRoute = { kind: "home" } | { kind: "project"; projectId: string; surface: ProjectSurface; momentId?: string };
 type ProjectScopedEvent<T> = { projectId: string; progress: T };
 
 function routeHash(route: AppRoute) {
   if (route.kind === "home") return "#/";
-  const suffix = route.surface === "ingest" ? "/ingest" : route.surface === "cull" ? "/cull" : "";
+  const momentSuffix = route.momentId ? `/${encodeURIComponent(route.momentId)}` : "";
+  const suffix = route.surface === "ingest"
+    ? "/ingest"
+    : route.surface === "cull"
+      ? `/cull${momentSuffix}`
+      : route.surface === "timeline"
+        ? `/timeline${momentSuffix}`
+        : "";
   return `#/project/${encodeURIComponent(route.projectId)}${suffix}`;
 }
 
 function readRoute(): AppRoute {
   const segments = window.location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (segments[0] !== "project" || !segments[1]) return { kind: "home" };
+  const surface: ProjectSurface = segments[2] === "ingest"
+    ? "ingest"
+    : segments[2] === "cull"
+      ? "cull"
+      : segments[2] === "timeline"
+        ? "timeline"
+        : "media";
   return {
     kind: "project",
     projectId: decodeURIComponent(segments[1]),
-    surface: segments[2] === "ingest" ? "ingest" : segments[2] === "cull" ? "cull" : "media",
+    surface,
+    ...(surface === "cull" || surface === "timeline"
+      ? { momentId: segments[3] ? decodeURIComponent(segments[3]) : undefined }
+      : {}),
   };
 }
 
@@ -292,10 +320,11 @@ export function App() {
       {error ? <p className="error" role="alert">{error}</p> : null}
       {showCreateProject ? <ProjectCreation onCancel={() => setShowCreateProject(false)} name={newProjectName} onName={setNewProjectName} onSubmit={createProject} /> : null}
       {route.kind === "home" ? <ProjectLibrary projects={projects} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onCreate={() => setShowCreateProject(true)} /> : null}
-      {project && route.kind === "project" ? <ProjectHeader project={project} projects={projects} surface={route.surface} isIndexing={isIndexing} isIngesting={isIngesting} onHome={() => navigate({ kind: "home" })} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} /> : null}
-      {project && route.kind === "project" && route.surface === "media" && activeHome ? <ProjectWorkspace key={project.id} home={activeHome} cullingProgress={cullingProgress} job={liveJob} filter={filter} onFilter={changeFilter} hasMoreMedia={hasMoreMedia} isLoadingMore={isLoadingMore} onLoadMore={loadMoreMedia} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} /> : null}
+      {project && route.kind === "project" ? <ProjectHeader project={project} projects={projects} surface={route.surface} isIndexing={isIndexing} isIngesting={isIngesting} onHome={() => navigate({ kind: "home" })} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} /> : null}
+      {project && route.kind === "project" && route.surface === "media" && activeHome ? <ProjectWorkspace key={project.id} home={activeHome} cullingProgress={cullingProgress} job={liveJob} filter={filter} onFilter={changeFilter} hasMoreMedia={hasMoreMedia} isLoadingMore={isLoadingMore} onLoadMore={loadMoreMedia} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onMoments={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} /> : null}
       {project && route.kind === "project" && route.surface === "ingest" ? <IngestWorkspace key={project.id} project={project} history={ingestHistory} report={ingestReport} isIngesting={isIngesting} onReport={setIngestReport} onHistory={setIngestHistory} onIngesting={setIsIngesting} onError={setError} /> : null}
-      {project && route.kind === "project" && route.surface === "cull" ? <CullingWorkspace key={project.id} project={project} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} onError={setError} /> : null}
+      {project && route.kind === "project" && route.surface === "cull" ? <CullingWorkspace key={`${project.id}:${route.momentId ?? "all"}`} project={project} momentId={route.momentId} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: route.momentId ? "timeline" : "media", ...(route.momentId ? { momentId: route.momentId } : {}) })} onError={setError} /> : null}
+      {project && route.kind === "project" && route.surface === "timeline" ? <MomentTimelineWorkspace key={`${project.id}:${route.momentId ?? "timeline"}`} project={project} initialMomentId={route.momentId} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} onShowTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onOpenMoment={(momentId) => navigate({ kind: "project", projectId: project.id, surface: "timeline", momentId })} onCullMoment={(momentId) => navigate({ kind: "project", projectId: project.id, surface: "cull", momentId })} onError={setError} /> : null}
     </main>
   );
 }
@@ -308,9 +337,15 @@ function ProjectLibrary({ projects, onOpen, onCreate }: { projects: ProjectLibra
   return <section className="project-library"><div className="library-hero"><div><p className="eyebrow">CAPTUREOS</p><h1>Your shoots</h1><p className="lede">A local library for every production. Choose a project, or start a clean one.</p></div><button className="primary library-create" onClick={onCreate}>New Project</button></div><div className="library-heading"><h2>Recent projects</h2><small>{projects.length === 1 ? "1 project" : `${projects.length} projects`}</small></div>{projects.length ? <div className="project-cards">{projects.map((item) => <button className="project-card" key={item.id} onClick={() => onOpen(item.id)} aria-label={`Open ${item.name}`}><span className="project-cover" aria-hidden="true">COS</span><strong>{item.name}</strong><span className="project-card-meta"><span>Media <b>{item.mediaAssetCount}</b></span><span>{item.storageVolumeCount ? `${item.storageVolumeCount} storage volume${item.storageVolumeCount === 1 ? "" : "s"}` : "No storage indexed"}</span><span>Protection {protectionLabel(item.protectionState)}</span></span><small>Last activity {formatProjectDate(item.lastActivityAt)}</small></button>)}</div> : <StatusCard><div className="project-empty"><p className="eyebrow">YOUR SHOOT STARTS HERE</p><h2>There are no projects yet.</h2><p className="muted">Index existing media or ingest camera cards after you create your first project.</p><button className="primary" onClick={onCreate}>New Project</button></div></StatusCard>}</section>;
 }
 
-function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, onHome, onOpen, onIndex, onIngest, onCull }: { project: ProjectView; projects: ProjectLibraryItem[]; surface: "media" | "ingest" | "cull"; isIndexing: boolean; isIngesting: boolean; onHome: () => void; onOpen: (projectId: string) => void; onIndex: () => void; onIngest: () => void; onCull: () => void }) {
-  const lede = surface === "ingest" ? "Safe ingest remains attached to this project." : surface === "cull" ? "A local, non-destructive workspace for your human review decisions." : "Index and analyze local media in this selected project.";
-  return <section className="project-header"><div><button className="back-link" onClick={onHome}>← All Projects</button><p className="eyebrow">PROJECT WORKSPACE</p><h1>{project.name}</h1><p className="lede">{lede}</p></div><div className="project-actions"><select aria-label="Switch project" value={project.id} onChange={(event) => onOpen(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className={surface === "cull" ? "primary" : "secondary"} onClick={onCull}>Smart Cull</button><button className={surface === "ingest" ? "primary" : "secondary"} disabled={isIngesting} onClick={onIngest}>Ingest Shoot</button><button className={surface === "media" ? "primary" : "secondary"} disabled={isIndexing} onClick={onIndex}>{isIndexing ? "Indexing…" : "Index Folder"}</button></div></section>;
+function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, onHome, onOpen, onIndex, onIngest, onCull, onTimeline }: { project: ProjectView; projects: ProjectLibraryItem[]; surface: ProjectSurface; isIndexing: boolean; isIngesting: boolean; onHome: () => void; onOpen: (projectId: string) => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onTimeline: () => void }) {
+  const lede = surface === "ingest"
+    ? "Safe ingest remains attached to this project."
+    : surface === "cull"
+      ? "A local, non-destructive workspace for your human review decisions."
+      : surface === "timeline"
+        ? "A local structural timeline. Suggested labels are evidence-grounded; your edits remain authoritative."
+        : "Index and analyze local media in this selected project.";
+  return <section className="project-header"><div><button className="back-link" onClick={onHome}>← All Projects</button><p className="eyebrow">PROJECT WORKSPACE</p><h1>{project.name}</h1><p className="lede">{lede}</p></div><div className="project-actions"><select aria-label="Switch project" value={project.id} onChange={(event) => onOpen(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className={surface === "timeline" ? "primary" : "secondary"} onClick={onTimeline}>Moments</button><button className={surface === "cull" ? "primary" : "secondary"} onClick={onCull}>Smart Cull</button><button className={surface === "ingest" ? "primary" : "secondary"} disabled={isIngesting} onClick={onIngest}>Ingest Shoot</button><button className={surface === "media" ? "primary" : "secondary"} disabled={isIndexing} onClick={onIndex}>{isIndexing ? "Indexing…" : "Index Folder"}</button></div></section>;
 }
 
 function formatProjectDate(value: string) {
@@ -324,7 +359,7 @@ function protectionLabel(value: string) {
   return "not recorded";
 }
 
-function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMoreMedia, isLoadingMore, onLoadMore, onIndex, onIngest, onCull }: { home: ProjectHome; cullingProgress: CullingProgress | null; job: JobView | null; filter: MediaFilter; onFilter: (filter: MediaFilter) => void; hasMoreMedia: boolean; isLoadingMore: boolean; onLoadMore: () => void; onIndex: () => void; onIngest: () => void; onCull: () => void }) {
+function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMoreMedia, isLoadingMore, onLoadMore, onIndex, onIngest, onCull, onMoments }: { home: ProjectHome; cullingProgress: CullingProgress | null; job: JobView | null; filter: MediaFilter; onFilter: (filter: MediaFilter) => void; hasMoreMedia: boolean; isLoadingMore: boolean; onLoadMore: () => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onMoments: () => void }) {
   const [visual, setVisual] = useState<VisualMediaPage | null>(null);
   const [visualFilter, setVisualFilter] = useState<VisualMediaFilter>("all");
   const [visualSort, setVisualSort] = useState<VisualMediaSort>("captureTime");
@@ -335,6 +370,9 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
   const [density, setDensity] = useState<"small" | "medium" | "large">(() => (localStorage.getItem("captureos-grid-density") as "small" | "medium" | "large" | null) ?? "medium");
   const [view, setView] = useState<"grid" | "list">("grid");
   const [preparation, setPreparation] = useState<MediaPreparationProgress | null>(null);
+  const [metadataRefreshProgress, setMetadataRefreshProgress] = useState<MetadataRefreshProgress | null>(null);
+  const [isRefreshingMetadata, setIsRefreshingMetadata] = useState(false);
+  const [metadataRefreshError, setMetadataRefreshError] = useState<string | null>(null);
   const [intelligenceProgress, setIntelligenceProgress] = useState<CaptureIntelligenceProgress | null>(null);
   const [analysisResourceMode, setAnalysisResourceMode] = useState<"eco" | "balanced" | "fast">("balanced");
   const [isStartingAnalysis, setIsStartingAnalysis] = useState(false);
@@ -358,10 +396,13 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
   const [magicSearchDescending, setMagicSearchDescending] = useState(true);
   const [magicSearchResponse, setMagicSearchResponse] = useState<MagicSearchResponse | null>(null);
   const [magicSearchMode, setMagicSearchMode] = useState<"query" | "similar">("query");
+  // The reference asset is retained only while paginating Find Similar. It is never sent with a
+  // text search, which prevents a later page from accidentally switching search modes.
+  const [similarReferenceAssetId, setSimilarReferenceAssetId] = useState<string | null>(null);
   const [magicSearchHistory, setMagicSearchHistory] = useState<MagicSearchHistoryEntry[]>([]);
   const [isSearchingMagic, setIsSearchingMagic] = useState(false);
   const [magicSearchError, setMagicSearchError] = useState<string | null>(null);
-  const magicSearchInputRef = useRef<HTMLInputElement>(null);
+  const magicSearchInputRef = useRef<HTMLInputElement>(null!);
 
   const query = useCallback((offset = 0): VisualMediaQuery => ({ filter: visualFilter, sort: visualSort, descending, search: search.trim() || undefined, cameraModel: cameraModel.trim() || undefined, lensModel: lensModel.trim() || undefined, limit: visualPageSize, offset }), [visualFilter, visualSort, descending, search, cameraModel, lensModel]);
   const loadVisual = useCallback(async (offset = 0, append = false, prepare = true, restoreSummary = true) => {
@@ -408,6 +449,19 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
       if (payload.projectId !== home.project.id) return;
       setPreparation(payload.progress);
       if (payload.progress.state === "completed") void loadVisual(0, false, false);
+    }).then((stop) => { unlisten = stop; });
+    return () => unlisten?.();
+  }, [home.project.id, loadVisual]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<ProjectScopedEvent<MetadataRefreshProgress>>("metadata-refresh-progress", ({ payload }) => {
+      if (payload.projectId !== home.project.id) return;
+      setMetadataRefreshProgress(payload.progress);
+      setIsRefreshingMetadata(metadataRefreshIsActive(payload.progress));
+      if (payload.progress.state === "completed") {
+        void loadVisual(0, false, false);
+      }
     }).then((stop) => { unlisten = stop; });
     return () => unlisten?.();
   }, [home.project.id, loadVisual]);
@@ -471,6 +525,20 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
   async function retryFailedPreviews() {
     await invoke<MediaPreparationProgress>("retry_failed_previews_command", { projectId: home.project.id });
     await loadVisual(0, false, false);
+  }
+
+  async function refreshCaptureMetadata() {
+    if (isRefreshingMetadata || metadataRefreshIsActive(metadataRefreshProgress)) return;
+    try {
+      setMetadataRefreshError(null);
+      setIsRefreshingMetadata(true);
+      const progress = await invoke<MetadataRefreshProgress>("refresh_metadata_command", { projectId: home.project.id });
+      setMetadataRefreshProgress(progress);
+    } catch (reason) {
+      setMetadataRefreshError(toMessage(reason));
+    } finally {
+      setIsRefreshingMetadata(false);
+    }
   }
 
   async function startCaptureIntelligence() {
@@ -559,6 +627,7 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
       const response = await invoke<MagicSearchResponse>("magic_search_command", { projectId: home.project.id, request });
       setMagicSearchQuery(queryText);
       setMagicSearchMode("query");
+      setSimilarReferenceAssetId(null);
       setMagicSearchResponse((current) => options.append && current
         ? { ...response, results: [...current.results, ...response.results] }
         : response);
@@ -570,7 +639,7 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
     }
   }
 
-  async function findSimilar(assetId: string) {
+  async function findSimilar(assetId: string, options: { offset?: number; append?: boolean } = {}) {
     try {
       setMagicSearchError(null);
       setIsSearchingMagic(true);
@@ -578,9 +647,13 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
         projectId: home.project.id,
         assetId,
         limit: magicSearchPageSize,
+        offset: options.offset ?? 0,
       });
       setMagicSearchMode("similar");
-      setMagicSearchResponse(response);
+      setSimilarReferenceAssetId(assetId);
+      setMagicSearchResponse((current) => options.append && current
+        ? { ...response, results: [...current.results, ...response.results] }
+        : response);
     } catch (reason) {
       setMagicSearchError(toMessage(reason));
     } finally {
@@ -602,6 +675,7 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
     setMagicSearchQuery("");
     setMagicSearchResponse(null);
     setMagicSearchMode("query");
+    setSimilarReferenceAssetId(null);
     setMagicSearchError(null);
     magicSearchInputRef.current?.focus();
   }
@@ -670,6 +744,16 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
         onStart={() => void startCaptureIntelligence()}
         onPause={() => void pauseCaptureIntelligence()}
       />
+      <section className="culling-entry" aria-label="Capture-time metadata refresh">
+        <div>
+          <p className="section-label">Capture-time metadata</p>
+          <h2>Refresh camera capture times</h2>
+          <p className="muted">Runs only when you choose it. CaptureOS reads embedded metadata from available local copies, preserves unknown camera time zones as wall-clock time, and does not modify originals, previews, semantic data, or human decisions. Rebuild Moments afterward to use refreshed chronology.</p>
+        </div>
+        <button className="secondary" disabled={isRefreshingMetadata || metadataRefreshIsActive(metadataRefreshProgress)} onClick={() => void refreshCaptureMetadata()}>{isRefreshingMetadata || metadataRefreshIsActive(metadataRefreshProgress) ? "Refreshing metadata…" : "Refresh metadata"}</button>
+      </section>
+      {metadataRefreshProgress ? <p className="preparation" role="status" aria-live="polite">{metadataRefreshProgress.state === "running" || metadataRefreshProgress.state === "queued" ? <>Refreshing local capture metadata · {metadataRefreshProgress.itemsCompleted.toLocaleString()} / {metadataRefreshProgress.itemsTotal.toLocaleString()} logical media checked</> : metadataRefreshProgress.state === "completed" ? <>Capture-time metadata refresh complete · {metadataRefreshProgress.itemsCompleted.toLocaleString()} / {metadataRefreshProgress.itemsTotal.toLocaleString()} checked · {metadataRefreshProgress.resolvedCaptureTimeCount.toLocaleString()} resolved · {metadataRefreshProgress.highConfidenceCaptureTimeCount.toLocaleString()} high-confidence · {metadataRefreshProgress.copyConflictCount.toLocaleString()} copy conflicts. Rebuild Moments to use refreshed chronology.</> : <>Capture-time metadata refresh {displayLabel(metadataRefreshProgress.state)} · {metadataRefreshProgress.errorCount.toLocaleString()} issues{metadataRefreshProgress.message ? ` · ${metadataRefreshProgress.message}` : ""}</>}</p> : null}
+      {metadataRefreshError ? <p className="error intelligence-error" role="alert">{metadataRefreshError}</p> : null}
       <MagicSearchControls
         isOpen={magicSearchOpen}
         onToggle={() => setMagicSearchOpen((value) => !value)}
@@ -698,6 +782,7 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
         onClearHistory={() => void clearMagicSearchHistory()}
         error={magicSearchError}
       />
+      <section className="culling-entry" aria-label="Moments timeline entry"><div><p className="section-label">Moment Brain</p><h2>Moments timeline</h2><p className="muted">{home.summary.momentCount ? `${home.summary.momentCount.toLocaleString()} local Moment${home.summary.momentCount === 1 ? "" : "s"} detected. ` : "No Moment analysis yet. "}Review a local structural timeline built from capture evidence. It never starts analysis while this project opens, never changes Similar Sets, and keeps your labels and split/merge choices authoritative.</p></div><button className="secondary" onClick={onMoments}>Open Moments</button></section>
       <section className="culling-entry" aria-label="Culling workspace entry"><div><p className="section-label">Human review</p><h2>Smart Culling Workspace</h2><p className="muted">{cullingProgress ? `${cullingProgress.reviewed.toLocaleString()} / ${cullingProgress.total.toLocaleString()} reviewed · Keep ${cullingProgress.keep.toLocaleString()} · Review ${cullingProgress.review.toLocaleString()} · Reject ${cullingProgress.reject.toLocaleString()}. ` : ""}AI technical evidence can help you begin, but Keep, Reject, Review, stars, ratings, notes, and representatives remain your local decisions.</p></div><button className="primary" onClick={onCull}>{cullingProgress?.reviewed ? "Resume Culling" : "Cull Photos"}</button></section>
       {intelligenceError ? <p className="error intelligence-error" role="alert">{intelligenceError}</p> : null}
 
@@ -733,7 +818,18 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
         onOpen={openMedia}
         onFindSimilar={(assetId) => void findSimilar(assetId)}
         isSearching={isSearchingMagic}
-        onLoadMore={() => void runMagicSearch({ offset: magicSearchResponse.results.length, append: true })}
+        onLoadMore={() => {
+          const offset = magicSearchResponse.results.length;
+          if (magicSearchMode === "similar") {
+            if (!similarReferenceAssetId) {
+              setMagicSearchError("Find Similar needs its original local photo before loading another page.");
+              return;
+            }
+            void findSimilar(similarReferenceAssetId, { offset, append: true });
+            return;
+          }
+          void runMagicSearch({ offset, append: true });
+        }}
         onOpenViewer={selected ? () => setViewerOpen(true) : undefined}
         onOpenSimilarityGroup={openSimilarityGroup}
         isLoadingSimilarityGroup={isLoadingSimilarityGroup}
@@ -755,6 +851,365 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
   );
 }
 
+const momentTimelinePageSize = 60;
+const momentDetailPageSize = 120;
+
+function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTimeline, onOpenMoment, onCullMoment, onError }: {
+  project: ProjectView;
+  initialMomentId?: string;
+  onReturn: () => void;
+  onShowTimeline: () => void;
+  onOpenMoment: (momentId: string) => void;
+  onCullMoment: (momentId: string) => void;
+  onError: (message: string | null) => void;
+}) {
+  const [progress, setProgress] = useState<MomentAnalysisProgress | null>(null);
+  const [timeline, setTimeline] = useState<MomentTimelineView | null>(null);
+  const [detail, setDetail] = useState<MomentDetailView | null>(null);
+  const [momentMedia, setMomentMedia] = useState<VisualMediaPage | null>(null);
+  const [checklists, setChecklists] = useState<MomentChecklistView[]>([]);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResponse, setSearchResponse] = useState<MagicSearchResponse | null>(null);
+  const [momentSearchQuery, setMomentSearchQuery] = useState("");
+  const [momentSearchResponse, setMomentSearchResponse] = useState<MomentSearchResponse | null>(null);
+  const [isMomentSearching, setIsMomentSearching] = useState(false);
+  const [checklistCandidateSearch, setChecklistCandidateSearch] = useState<{ phrase: string; response: MagicSearchResponse } | null>(null);
+  const [isChecklistSearching, setIsChecklistSearching] = useState(false);
+  const [momentResourceMode, setMomentResourceMode] = useState<SemanticResourceMode>("balanced");
+  const [humanLabel, setHumanLabel] = useState("");
+  const [newChecklistPhrase, setNewChecklistPhrase] = useState("");
+
+  const loadStatus = useCallback(async () => {
+    const next = await invoke<MomentAnalysisProgress | null>("moment_timeline_status", { projectId: project.id });
+    setProgress((current) => current?.active ? current : next);
+  }, [project.id]);
+
+  const loadTimeline = useCallback(async () => {
+    const next = await invoke<MomentTimelineView>("moment_timeline", {
+      projectId: project.id,
+      limit: momentTimelinePageSize,
+      offset: 0,
+    });
+    setTimeline(next);
+    setProgress((current) => current?.active ? current : next.progress);
+  }, [project.id]);
+
+  const loadChecklists = useCallback(async () => {
+    const next = await invoke<MomentChecklistView[]>("moment_checklists", { projectId: project.id });
+    setChecklists(next);
+  }, [project.id]);
+
+  const loadDetail = useCallback(async () => {
+    if (!initialMomentId) {
+      setDetail(null);
+      setMomentMedia(null);
+      setSearchResponse(null);
+      return;
+    }
+    const [next, media] = await Promise.all([
+      invoke<MomentDetailView | null>("moment_detail", {
+        projectId: project.id,
+        momentId: initialMomentId,
+        limit: momentDetailPageSize,
+        offset: 0,
+      }),
+      invoke<VisualMediaPage>("visual_media_page", {
+        projectId: project.id,
+        query: {
+          filter: "photos",
+          sort: "captureTime",
+          descending: false,
+          momentId: initialMomentId,
+          limit: momentDetailPageSize,
+          offset: 0,
+        },
+      }),
+    ]);
+    setDetail(next);
+    setMomentMedia(media);
+    setSearchResponse(null);
+  }, [initialMomentId, project.id]);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([loadStatus(), loadTimeline(), loadChecklists(), loadDetail()]);
+  }, [loadChecklists, loadDetail, loadStatus, loadTimeline]);
+
+  useEffect(() => { void refresh().catch(toError(onError)); }, [onError, refresh]);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<ProjectScopedEvent<MomentAnalysisProgress>>("moment-analysis-progress", ({ payload }) => {
+      if (payload.projectId !== project.id) return;
+      setProgress(payload.progress);
+      if (payload.progress.state === "completed" || payload.progress.state === "paused" || payload.progress.state === "failed") {
+        void Promise.all([loadTimeline(), loadChecklists(), loadDetail()]).catch(toError(onError));
+      }
+    }).then((stop) => { unlisten = stop; });
+    return () => unlisten?.();
+  }, [loadChecklists, loadDetail, loadTimeline, onError, project.id]);
+  useEffect(() => { setHumanLabel(detail?.moment.label.humanLabel ?? ""); }, [detail?.moment.id, detail?.moment.label.humanLabel]);
+  useEffect(() => {
+    if (isSemanticResourceMode(progress?.resourceMode)) setMomentResourceMode(progress.resourceMode);
+  }, [progress?.resourceMode]);
+
+  async function startAnalysis(rebuild: boolean) {
+    if (isStarting || progress?.active) return;
+    try {
+      onError(null);
+      setIsStarting(true);
+      const next = await invoke<MomentAnalysisProgress>("start_moment_analysis", { projectId: project.id, rebuild, resourceMode: momentResourceMode });
+      if (isSemanticResourceMode(next.resourceMode)) setMomentResourceMode(next.resourceMode);
+      setProgress(next);
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsStarting(false);
+    }
+  }
+
+  async function renameMoment() {
+    if (!detail || !humanLabel.trim() || isSaving) return;
+    try {
+      onError(null);
+      setIsSaving(true);
+      await invoke("rename_moment", { projectId: project.id, momentId: detail.moment.id, label: humanLabel.trim() });
+      await refresh();
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function chooseRepresentative(assetId: string) {
+    if (!detail || isSaving) return;
+    try {
+      onError(null);
+      setIsSaving(true);
+      await invoke("set_moment_human_representative", { projectId: project.id, momentId: detail.moment.id, assetId });
+      await refresh();
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function mergeMoments(leftMomentId: string, rightMomentId: string) {
+    if (isSaving || !window.confirm("Merge these adjacent Moments? Your structural override will be retained when local analysis is rebuilt.")) return;
+    try {
+      onError(null);
+      setIsSaving(true);
+      await invoke("merge_adjacent_moments", { projectId: project.id, leftMomentId, rightMomentId });
+      onShowTimeline();
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function splitMoment(afterAssetId: string) {
+    if (!detail || isSaving || !window.confirm("Split this Moment after the selected photo? Your structural override will remain protected on future analysis.")) return;
+    try {
+      onError(null);
+      setIsSaving(true);
+      await invoke("split_moment", { projectId: project.id, momentId: detail.moment.id, afterAssetId });
+      onShowTimeline();
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function addChecklistPhrase(event: FormEvent) {
+    event.preventDefault();
+    if (!newChecklistPhrase.trim() || isSaving) return;
+    try {
+      onError(null);
+      setIsSaving(true);
+      await invoke("create_coverage_checklist_item", { projectId: project.id, input: { phrase: newChecklistPhrase.trim() } });
+      setNewChecklistPhrase("");
+      await loadChecklists();
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function updateCoverage(checklistItemId: string, state: CoverageConfirmationState) {
+    if (!detail || isSaving) return;
+    try {
+      onError(null);
+      setIsSaving(true);
+      await invoke("update_coverage_confirmation", {
+        projectId: project.id,
+        input: { checklistItemId, state, momentId: detail.moment.id },
+      });
+      await loadChecklists();
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function searchWithinMoment(event: FormEvent) {
+    event.preventDefault();
+    if (!detail || !searchQuery.trim() || isSearching) return;
+    try {
+      onError(null);
+      setIsSearching(true);
+      const request: MagicSearchRequest = {
+        query: searchQuery.trim(),
+        sort: "relevance",
+        descending: true,
+        limit: 24,
+        offset: 0,
+        momentId: detail.moment.id,
+      };
+      setSearchResponse(await invoke<MagicSearchResponse>("magic_search_command", { projectId: project.id, request }));
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsSearching(false);
+    }
+  }
+
+  async function searchAcrossMoments(event: FormEvent) {
+    event.preventDefault();
+    if (!momentSearchQuery.trim() || isMomentSearching) return;
+    try {
+      onError(null);
+      setIsMomentSearching(true);
+      const request: MomentSearchRequest = { query: momentSearchQuery.trim(), limit: 24 };
+      setMomentSearchResponse(await invoke<MomentSearchResponse>("moment_search", { projectId: project.id, request }));
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsMomentSearching(false);
+    }
+  }
+
+  async function findChecklistCandidates(phrase: string) {
+    if (!phrase.trim() || isChecklistSearching) return;
+    try {
+      onError(null);
+      setIsChecklistSearching(true);
+      const request: MagicSearchRequest = {
+        query: phrase.trim(),
+        sort: "relevance",
+        descending: true,
+        limit: 24,
+        offset: 0,
+      };
+      const response = await invoke<MagicSearchResponse>("magic_search_command", { projectId: project.id, request });
+      setChecklistCandidateSearch({ phrase: phrase.trim(), response });
+    } catch (reason) {
+      toError(onError)(reason);
+    } finally {
+      setIsChecklistSearching(false);
+    }
+  }
+
+  const moments = timeline?.moments ?? [];
+  const selectedMoment = detail?.moment ?? (initialMomentId ? moments.find((moment) => moment.id === initialMomentId) ?? null : null);
+  const checklistItems = checklists.flatMap((checklist) => checklist.items.map((item) => ({ ...item, checklistName: checklist.name })));
+  const primaryActionLabel = progress?.timelineReady ? "Update timeline" : "Analyze timeline";
+
+  return <div className="workspace moment-timeline-workspace">
+    <section className="project-first-step" aria-label="Moments timeline">
+      <p className="eyebrow">MOMENT BRAIN</p>
+      <h2>{selectedMoment ? selectedMoment.label.displayLabel : "Moments timeline"}</h2>
+      <p className="muted">A local structural timeline based on capture evidence. It does not identify people, assert event stages, change Similar Sets, or make culling decisions.</p>
+      <div>
+        <button className="secondary" onClick={onReturn}>Return to Project</button>
+        {selectedMoment ? <button className="secondary" onClick={onShowTimeline}>All Moments</button> : null}
+        <span className="resource-mode" role="group" aria-label="Moment analysis resource mode">
+          {([ ["eco", "ECO"], ["balanced", "BALANCED"], ["fast", "FAST"] ] as [SemanticResourceMode, string][]).map(([mode, label]) => <button key={mode} type="button" className={momentResourceMode === mode ? "active" : ""} aria-pressed={momentResourceMode === mode} disabled={isStarting || progress?.active} onClick={() => setMomentResourceMode(mode)}>{label}</button>)}
+        </span>
+        <button className="primary" disabled={isStarting || progress?.active} onClick={() => void startAnalysis(false)}>{isStarting ? "Starting…" : progress?.active ? "Analyzing locally…" : primaryActionLabel}</button>
+        {progress?.timelineReady ? <button className="secondary" disabled={isStarting || progress?.active} onClick={() => void startAnalysis(true)}>Rebuild AI timeline</button> : null}
+      </div>
+    </section>
+
+    <section className="status-card" aria-label="Moment analysis status">
+      <div className="panel-heading"><div><p className="section-label">Local analysis status</p><h2>{momentAnalysisStatusLabel(progress)}</h2><p className="muted">Analysis runs in the background only after you request it. Opening this project never starts or blocks it.</p></div><span className={`badge ${progress?.active ? "running" : progress?.timelineReady ? "completed" : "idle"}`}>{progress?.stage ?? "not started"}</span></div>
+      {progress ? <div className="intelligence-progress" role="status" aria-live="polite"><span>{progress.message ?? (progress.timelineReady ? `${progress.momentCount.toLocaleString()} local Moments are ready.` : "No completed local Moment timeline is stored.")}</span>{progress.active ? <small>{progress.completed.toLocaleString()} / {progress.total.toLocaleString()} processed · {progress.errorCount.toLocaleString()} issues · {displayLabel(progress.resourceMode)}</small> : <small>{progress.momentCount.toLocaleString()} Moments · {progress.ungroupedAssetCount.toLocaleString()} photos with insufficient timeline evidence · {displayLabel(progress.resourceMode)}</small>}{progress.lastError ? <small>{progress.lastError}</small> : null}</div> : <p className="muted">Checking local Moment analysis status…</p>}
+    </section>
+
+    {!selectedMoment ? <>
+      <section className="status-card" aria-label="Coverage checklist">
+        <div className="panel-heading"><div><p className="section-label">Coverage checklist</p><h2>Photographer-provided expectations</h2><p className="muted">Checklist phrases remain local. They can supply optional label candidates; only you confirm coverage.</p></div></div>
+        <form className="visual-toolbar" onSubmit={addChecklistPhrase}><label className="search"><span className="sr-only">Add coverage checklist phrase</span><input value={newChecklistPhrase} onChange={(event) => setNewChecklistPhrase(event.target.value)} placeholder="Add a local checklist phrase" /></label><button className="secondary" type="submit" disabled={isSaving || !newChecklistPhrase.trim()}>Add checklist item</button></form>
+        {checklistItems.length ? <ul className="culling-reasons">{checklistItems.map((item) => <li key={item.id}><strong>{item.phrase}</strong> · {coverageStateLabel(item.state)}{item.checklistName ? ` · ${item.checklistName}` : ""}<div><button className="secondary" type="button" disabled={isChecklistSearching} onClick={() => void findChecklistCandidates(item.phrase)}>{isChecklistSearching ? "Finding candidates…" : "Find candidates"}</button></div></li>)}</ul> : <p className="muted">No checklist items yet. Add only the expectations you want to review; Moment Brain never invents missing coverage.</p>}
+        {checklistCandidateSearch ? <section className="magic-search-results" aria-label="Checklist candidate results"><p className="section-label">Candidate lookup</p><h3>Local candidates for “{checklistCandidateSearch.phrase}”</h3><p className="muted">This is retrieval only. It does not assert coverage or change the checklist; confirm coverage yourself from a Moment.</p><MomentSearchResults response={checklistCandidateSearch.response} emptyMessage="No local candidate photos were returned for this checklist phrase." /></section> : null}
+      </section>
+      <section className="status-card" aria-label="Search Moments">
+        <div className="panel-heading"><div><p className="section-label">Moment search</p><h2>Search local Moments</h2><p className="muted">Cards are ranked only from compatible local Moment centroids. This is retrieval, not proof of an object, person, relationship, or event.</p></div></div>
+        <form className="visual-toolbar" onSubmit={searchAcrossMoments}><label className="search"><span className="sr-only">Search local Moments</span><input value={momentSearchQuery} onChange={(event) => setMomentSearchQuery(event.target.value)} placeholder="Describe a visual Moment" /></label><button className="secondary" type="submit" disabled={isMomentSearching || !momentSearchQuery.trim()}>{isMomentSearching ? "Searching…" : "Search Moments"}</button></form>
+        {momentSearchResponse ? <MomentCardSearchResults response={momentSearchResponse} onOpen={onOpenMoment} /> : null}
+      </section>
+      <section aria-label="Timeline moments"><div className="panel-heading"><div><p className="section-label">Timeline</p><h2>{moments.length ? `${timeline?.totalMoments.toLocaleString()} local Moments` : "No timeline ready"}</h2><p className="muted">Each card is a structural sequence, not a claim about a person, relationship, event, or creative quality.</p></div></div>{moments.length ? <div className="media-grid medium" aria-label="Moment cards">{moments.map((moment, index) => <MomentCard key={moment.id} moment={moment} previous={index ? moments[index - 1] : null} onOpen={onOpenMoment} onMerge={(leftMomentId, rightMomentId) => void mergeMoments(leftMomentId, rightMomentId)} disabled={isSaving} />)}</div> : <div className="empty">{progress?.active ? "Building the local structural timeline in the background…" : "Choose Analyze timeline when you are ready. This does not change media, decisions, or Similar Sets."}</div>}</section>
+      {timeline?.ungroupedAssetCount ? <p className="preparation">{timeline.ungroupedAssetCount.toLocaleString()} photo{timeline.ungroupedAssetCount === 1 ? " has" : "s have"} insufficient capture-time or local evidence for a Moment. They remain in the project and can be reviewed normally.</p> : null}
+      {timeline?.timelineGaps.length ? <section className="status-card" aria-label="Observed timeline gaps"><div className="panel-heading"><div><p className="section-label">Observed timeline gaps</p><h3>No recorded capture activity</h3><p className="muted">These are factual intervals in the local capture timeline, not coverage conclusions.</p></div></div><ul className="culling-reasons">{timeline.timelineGaps.map((gap) => <li key={`${gap.startedAt}:${gap.endedAt}`}><strong>{formatDate(gap.startedAt)} – {formatDate(gap.endedAt)}</strong><small>{formatDuration(gap.durationSeconds * 1000)} · {gap.explanation}</small></li>)}</ul></section> : null}
+      {timeline?.clockDiagnostics.length ? <details className="advanced"><summary>Camera time diagnostics</summary><p className="muted">These are advisory observations only. CaptureOS does not rewrite capture timestamps.</p>{timeline.clockDiagnostics.map((diagnostic) => <p key={`${diagnostic.cameraLabel}:${diagnostic.summary}`}><strong>{diagnostic.cameraLabel}</strong> · {diagnostic.summary}</p>)}</details> : null}
+    </> : <section className="status-card" aria-label="Moment detail">
+      <div className="panel-heading"><div><p className="section-label">Moment detail</p><h2>{selectedMoment.label.displayLabel}</h2><p className="muted">{formatMomentTimeRange(selectedMoment.capturedFrom, selectedMoment.capturedTo, selectedMoment.captureTimeState)} · {selectedMoment.assetCount.toLocaleString()} local photos</p></div><button className="primary" onClick={() => onCullMoment(selectedMoment.id)}>Cull this Moment</button></div>
+      {selectedMoment.label.humanLabel ? <p className="human-override">Human label: {selectedMoment.label.humanLabel}. The original local suggestion is preserved in Developer Details.</p> : null}
+      <form className="visual-toolbar" onSubmit={(event) => { event.preventDefault(); void renameMoment(); }}><label className="search"><span className="sr-only">Human Moment label</span><input value={humanLabel} onChange={(event) => setHumanLabel(event.target.value)} placeholder="Name this Moment" /></label><button className="secondary" type="submit" disabled={isSaving || !humanLabel.trim()}>Save human label</button></form>
+      {detail ? <>
+        {momentMedia?.items.length ? <section className="media-grid medium" aria-label="Moment photos">{momentMedia.items.map((item, index) => <article key={item.assetId}><MediaCard item={item} view="grid" density="medium" onOpen={() => undefined} /><div className="card-caption"><strong>{detail.moment.representative?.assetId === item.assetId && detail.moment.representative.source === "human" ? "Human representative" : detail.moment.representative?.assetId === item.assetId ? "Suggested starting point" : item.filename}</strong><div><button className="secondary" disabled={isSaving} onClick={() => void chooseRepresentative(item.assetId)}>Choose representative</button>{index < momentMedia.items.length - 1 ? <button className="secondary" disabled={isSaving} onClick={() => void splitMoment(item.assetId)}>Split after this photo</button> : null}</div></div></article>)}</section> : <p className="muted">No bounded local photo page is available for this Moment.</p>}
+        {momentMedia?.hasMore ? <p className="preparation">This Moment contains more photos than the current bounded page. Open Smart Cull or the visual grid to continue review without loading the entire catalog here.</p> : null}
+        <section className="status-card" aria-label="Magic Search within this Moment"><div className="panel-heading"><div><p className="section-label">Magic Search</p><h3>Search this Moment locally</h3><p className="muted">This request is scoped to the current Moment. Similar Sets remain separate.</p></div></div><form className="visual-toolbar" onSubmit={searchWithinMoment}><label className="search"><span className="sr-only">Magic Search this Moment</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Describe a photo in this Moment" /></label><button className="secondary" type="submit" disabled={isSearching || !searchQuery.trim()}>{isSearching ? "Searching…" : "Search this Moment"}</button></form>{searchResponse ? <MomentSearchResults response={searchResponse} /> : null}</section>
+        <section className="status-card" aria-label="Moment coverage checklist"><div className="panel-heading"><div><p className="section-label">Coverage confirmation</p><h3>Human confirmation only</h3><p className="muted">A result or label is not proof of coverage. Confirm, review, or mark not covered yourself.</p></div></div>{checklistItems.length ? <ul className="culling-reasons">{checklistItems.map((item) => <li key={item.id}><strong>{item.phrase}</strong> · {coverageStateLabel(item.state)}<div><button className="secondary" disabled={isSaving} onClick={() => void updateCoverage(item.id, "confirmed_covered")}>Confirm covered here</button><button className="secondary" disabled={isSaving} onClick={() => void updateCoverage(item.id, "needs_review")}>Needs review</button><button className="secondary" disabled={isSaving} onClick={() => void updateCoverage(item.id, "not_covered")}>Not covered</button></div></li>)}</ul> : <p className="muted">Add checklist phrases from the timeline overview before confirming coverage.</p>}</section>
+        <details className="advanced"><summary>Developer Details</summary><p><strong>Displayed label:</strong> {detail.moment.label.displayLabel}</p><p><strong>AI suggested label:</strong> {detail.moment.label.aiSuggestedLabel ?? "No supported suggestion — Untitled Moment."}</p><p><strong>Label source:</strong> {displayLabel(detail.moment.label.source)}</p><p><strong>Suggestion support:</strong> {displayLabel(detail.moment.label.strength)}</p>{detail.moment.label.evidence.length ? <ul>{detail.moment.label.evidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul> : <p>No label evidence is available.</p>}{detail.boundaryEvidence.map((boundary, index) => <div key={`${boundary.summary}:${index}`}><strong>{displayLabel(boundary.strength)} boundary evidence</strong><p>{boundary.summary}</p>{boundary.signals.length ? <ul>{boundary.signals.map((signal) => <li key={signal}>{signal}</li>)}</ul> : null}</div>)}<p>Structural analysis uses local metadata and compatible local embeddings only. It does not identify people or claim an event occurred.</p></details>
+      </> : <div className="empty">Loading local Moment details…</div>}
+    </section>}
+  </div>;
+}
+
+function MomentCard({ moment, previous, onOpen, onMerge, disabled }: { moment: MomentSummaryView; previous: MomentSummaryView | null; onOpen: (momentId: string) => void; onMerge: (leftMomentId: string, rightMomentId: string) => void; disabled: boolean }) {
+  const representative = moment.representative;
+  return <article className="media-card moment-card">
+    <button onClick={() => onOpen(moment.id)} aria-label={`Open Moment ${moment.label.displayLabel}`}><span className="media-thumbnail">{representative ? <PreviewImage url={representative.thumbnailPreviewUrl} alt="" fallback={<span className="media-placeholder">◫</span>} /> : <span className="media-placeholder">◫</span>}</span><span className="media-card-title"><strong>{moment.label.displayLabel}</strong><small>{formatMomentTimeRange(moment.capturedFrom, moment.capturedTo, moment.captureTimeState)}</small></span></button>
+    <div className="card-caption">
+      <strong>{moment.assetCount.toLocaleString()} local photos</strong>
+      {moment.label.humanLabel ? <small>Human label</small> : moment.label.aiSuggestedLabel ? <small>Local suggested label</small> : <small>Untitled until evidence supports a label</small>}
+      {representative ? <small>{representative.source === "human" ? "Human representative" : "Suggested starting point"} · {representative.filename}</small> : null}
+      <small>{moment.similarSetCount.toLocaleString()} Similar Set{moment.similarSetCount === 1 ? "" : "s"} · {moment.starredCount.toLocaleString()} starred</small>
+      <small>{moment.keepCount.toLocaleString()} Keep · {moment.rejectCount.toLocaleString()} Reject · {moment.reviewCount.toLocaleString()} Review · {moment.unreviewedCount.toLocaleString()} unreviewed · {moment.technicalIssueCount.toLocaleString()} technical issue{moment.technicalIssueCount === 1 ? "" : "s"}</small>
+      {moment.boundaryBefore ? <small>{displayLabel(moment.boundaryBefore.strength)} boundary · {moment.boundaryBefore.summary}</small> : null}
+      {moment.hasHumanStructureOverride ? <small>Human split/merge override protected</small> : null}
+      <div><button className="secondary" onClick={() => onOpen(moment.id)}>Open Moment</button>{previous ? <button className="secondary" disabled={disabled} onClick={() => onMerge(previous.id, moment.id)}>Merge with previous</button> : null}</div>
+    </div>
+  </article>;
+}
+
+function MomentCardSearchResults({ response, onOpen }: { response: MomentSearchResponse; onOpen: (momentId: string) => void }) {
+  const availability = response.identitySearchBlocked
+    ? "Identity search is unavailable. CaptureOS does not identify or match people."
+    : response.semanticApplied
+      ? "Moment cards are ranked from compatible local centroids. This is a retrieval signal, not proof of a concept or event."
+      : response.semanticUnavailableReason ?? "Moment-card semantic retrieval is unavailable.";
+  return <div className="magic-search-results" aria-live="polite">
+    <p className="muted">{response.message ?? availability}</p>
+    {response.results.length ? <div className="media-grid medium" aria-label="Moment search cards">{response.results.map((moment) => <MomentCard key={moment.id} moment={moment} previous={null} onOpen={onOpen} onMerge={() => undefined} disabled />)}</div> : <p className="muted">{availability}</p>}
+    {response.hasMore ? <p className="preparation">The local Moment-card result list is bounded. Refine the visual description to narrow it further.</p> : null}
+  </div>;
+}
+
+function MomentSearchResults({ response, emptyMessage = "No local photos in this Moment matched that request." }: { response: MagicSearchResponse; emptyMessage?: string }) {
+  const availability = response.semanticApplied
+    ? "Ranked from local embedding similarity. This is a retrieval signal, not proof of an object, identity, or event."
+    : response.semanticUnavailableReason ?? "Showing local deterministic matching within this Moment.";
+  return <div className="magic-search-results"><p className="muted">{response.message ?? availability}</p>{response.results.length ? <ul className="culling-reasons">{response.results.map((result) => <li key={result.item.assetId}><strong>{result.item.filename}</strong> · {result.scoreLabel ? `${result.scoreLabel} local match` : "Local filter match"}<small>{result.explanation}</small>{result.matchedEvidence.length ? <small>{result.matchedEvidence.join(" · ")}</small> : null}</li>)}</ul> : <p className="muted">{emptyMessage}</p>}</div>;
+}
+
 type CullingPatch = { decision?: CullingDecision; clearDecision?: boolean; rating?: number; starred?: boolean; note?: string; flags?: string[] };
 type CullingHistoryEntry = { assetId: string; before: CullingDecisionView; after: CullingDecisionView };
 
@@ -763,7 +1218,7 @@ const cullingFilters: { id: CullingFilter; label: string }[] = [
   { id: "strong_candidates", label: "Strong candidates" }, { id: "technical_issues", label: "Technical issues" }, { id: "possible_duplicates", label: "Possible duplicates" }, { id: "similar_groups", label: "Similar groups" }, { id: "faces", label: "Faces" }, { id: "blur_review", label: "Blur review" },
 ];
 
-function CullingWorkspace({ project, onReturn, onError }: { project: ProjectView; onReturn: () => void; onError: (message: string | null) => void }) {
+function CullingWorkspace({ project, momentId, onReturn, onError }: { project: ProjectView; momentId?: string; onReturn: () => void; onError: (message: string | null) => void }) {
   const [workspace, setWorkspace] = useState<CullingWorkspaceView | null>(null);
   const [mode, setMode] = useState<CullingMode>("all_photos");
   const [filter, setFilter] = useState<CullingFilter>("all");
@@ -779,14 +1234,22 @@ function CullingWorkspace({ project, onReturn, onError }: { project: ProjectView
   const [finished, setFinished] = useState(false);
 
   const load = useCallback(async () => {
-    const next = await invoke<CullingWorkspaceView>("culling_workspace_command", { projectId: project.id, query: { mode, filter, groupId, limit: 80, offset: 0 } });
+    const query: CullingWorkspaceQuery = {
+      mode,
+      filter,
+      ...(groupId ? { groupId } : {}),
+      ...(momentId ? { momentId } : {}),
+      limit: 80,
+      offset: 0,
+    };
+    const next = await invoke<CullingWorkspaceView>("culling_workspace_command", { projectId: project.id, query });
     setWorkspace(next);
     setCurrentIndex((previous) => {
       const resumed = next.session.lastAssetId ? next.items.findIndex((item) => item.media.assetId === next.session.lastAssetId) : -1;
       return Math.max(0, Math.min(resumed >= 0 ? resumed : previous, Math.max(0, next.items.length - 1)));
     });
     if (mode === "similar_sets" && !groupId && next.groups[0]) setGroupId(next.groups[0].id);
-  }, [filter, groupId, mode, project.id]);
+  }, [filter, groupId, mode, momentId, project.id]);
 
   useEffect(() => { void load().catch(toError(onError)); }, [load, onError]);
   useEffect(() => { localStorage.setItem("captureos-culling-auto-advance", String(autoAdvance)); }, [autoAdvance]);
@@ -799,9 +1262,9 @@ function CullingWorkspace({ project, onReturn, onError }: { project: ProjectView
     if (!workspace) return;
     void invoke("update_culling_position_command", {
       projectId: project.id,
-      input: { sessionId: workspace.session.id, assetId: asset?.media.assetId, groupId: asset?.similarityGroupId, mode, filterContext: filter },
+      input: { sessionId: workspace.session.id, assetId: asset?.media.assetId, groupId: asset?.similarityGroupId, mode, filterContext: momentId ? `moment:${momentId}:${filter}` : filter },
     }).catch(toError(onError));
-  }, [filter, mode, onError, project.id, workspace]);
+  }, [filter, mode, momentId, onError, project.id, workspace]);
 
   function chooseIndex(nextIndex: number) {
     if (!workspace?.items.length) return;
@@ -977,7 +1440,7 @@ function CullingWorkspace({ project, onReturn, onError }: { project: ProjectView
   if (!workspace) return <div className="empty">Opening the local Culling Workspace…</div>;
 
   return <div className="culling-workspace">
-    <header className="culling-topbar"><div><p className="eyebrow">SMART CULL</p><h2>{project.name}</h2><p className="muted">{workspace.progress.reviewed.toLocaleString()} / {workspace.progress.total.toLocaleString()} reviewed · Human decisions are authoritative.</p></div><div className="culling-actions"><label>Mode <select value={mode} onChange={(event) => { setMode(event.target.value as CullingMode); setGroupId(undefined); setCurrentIndex(0); }}><option value="all_photos">All Photos</option><option value="similar_sets">Similar Sets</option><option value="ai_review_queue">AI Review Queue</option></select></label><button className="secondary" disabled={!undo.length || saving} onClick={() => void undoDecision()}>Undo</button><button className="secondary" disabled={!redo.length || saving} onClick={() => void redoDecision()}>Redo</button><button className="primary" disabled={isFinishing} onClick={() => void finish()}>{isFinishing ? "Finishing…" : "Finish Review"}</button></div></header>
+    <header className="culling-topbar"><div><p className="eyebrow">SMART CULL</p><h2>{project.name}</h2><p className="muted">{momentId ? "Moment-scoped human review · " : ""}{workspace.progress.reviewed.toLocaleString()} / {workspace.progress.total.toLocaleString()} reviewed · Human decisions are authoritative.</p></div><div className="culling-actions"><label>Mode <select value={mode} onChange={(event) => { setMode(event.target.value as CullingMode); setGroupId(undefined); setCurrentIndex(0); }}><option value="all_photos">All Photos</option><option value="similar_sets">Similar Sets</option><option value="ai_review_queue">AI Review Queue</option></select></label><button className="secondary" disabled={!undo.length || saving} onClick={() => void undoDecision()}>Undo</button><button className="secondary" disabled={!redo.length || saving} onClick={() => void redoDecision()}>Redo</button><button className="primary" disabled={isFinishing} onClick={() => void finish()}>{isFinishing ? "Finishing…" : "Finish Review"}</button></div></header>
     <section className="culling-progress" aria-label="Culling progress"><Metric label="Reviewed" value={`${workspace.progress.reviewed} / ${workspace.progress.total}`} /><Metric label="Keep" value={workspace.progress.keep} /><Metric label="Reject" value={workspace.progress.reject} /><Metric label="Review" value={workspace.progress.review} /><Metric label="Unreviewed" value={workspace.progress.unreviewed} /><Metric label="Starred" value={workspace.progress.starred} /><Metric label="Sets reviewed" value={`${workspace.progress.setsReviewed} / ${workspace.progress.setsTotal}`} /></section>
     <p className="agreement" aria-label="AI and human agreement">AI/Human Agreement · strong candidate → kept {workspace.progress.strongCandidateKept} · technical issue → kept {workspace.progress.technicalIssueKept} · strong candidate → rejected {workspace.progress.strongCandidateRejected}. These are local workflow observations, not accuracy.</p>
     <nav className="culling-filters" aria-label="Culling filters">{cullingFilters.map((item) => <button key={item.id} className={filter === item.id ? "active" : ""} onClick={() => { setFilter(item.id); setCurrentIndex(0); }}>{item.label}</button>)}<label className="auto-advance"><input type="checkbox" checked={autoAdvance} onChange={(event) => setAutoAdvance(event.target.checked)} /> Auto Advance</label></nav>
@@ -1093,7 +1556,7 @@ function MagicSearchControls({
 }: {
   isOpen: boolean;
   onToggle: () => void;
-  inputRef: RefObject<HTMLInputElement | null>;
+  inputRef: RefObject<HTMLInputElement>;
   query: string;
   onQuery: (value: string) => void;
   sort: MagicSearchSort;
@@ -1120,6 +1583,11 @@ function MagicSearchControls({
 }) {
   const modelInstalled = status?.model.installed === true;
   const modelMessage = status?.model.message;
+  const modelNotInstalled = status?.model.installed === false
+    && (!modelMessage || modelMessage.startsWith("Semantic model not installed"));
+  const unavailableHeading = status === null
+    ? "Checking local semantic model"
+    : modelNotInstalled ? "Semantic model not installed" : "Semantic model unavailable";
   const indexActive = status?.active === true;
   const canStartIndex = modelInstalled && !indexActive && !isStartingIndex;
   const modelIdentity = status?.model.identity;
@@ -1129,7 +1597,7 @@ function MagicSearchControls({
       ? status.indexReady
         ? `${status.indexEmbeddingCount.toLocaleString()} local image embeddings indexed`
         : "Local model is installed; index eligible still-photo previews to enable semantic matching."
-      : modelMessage ?? "Semantic search is unavailable because no approved local model pack is installed.";
+      : modelMessage ?? "Semantic model not installed. Metadata and technical filters remain available.";
 
   return <section className="status-card" aria-label="Magic Search">
     <div className="panel-heading">
@@ -1164,12 +1632,18 @@ function MagicSearchControls({
         {indexActive ? <button className="secondary" type="button" disabled={isPausingIndex} onClick={onPauseIndex}>{isPausingIndex ? "Pausing…" : "Pause indexing"}</button> : <button className="secondary" type="button" disabled={!canStartIndex} title={modelInstalled ? undefined : "An approved local semantic model pack is required."} onClick={onStartIndex}>{isStartingIndex ? "Starting…" : status?.indexReady ? "Index new photos" : "Index local photos"}</button>}
       </div>
       <div className="intelligence-progress" role="status" aria-live="polite">
-        <strong>{modelInstalled ? status?.indexReady ? "Semantic index ready" : indexActive ? "Indexing locally" : "Semantic index not ready" : "Semantic model unavailable"}</strong>
+        <strong>{modelInstalled ? status?.indexReady ? "Semantic index ready" : indexActive ? "Indexing locally" : "Semantic index not ready" : unavailableHeading}</strong>
         <span>{statusText}</span>
+        {!modelInstalled && modelMessage ? <small>{modelMessage}</small> : null}
         {status?.active ? <small>{status.completed.toLocaleString()} / {status.total.toLocaleString()} · {status.stage}</small> : null}
         {!status?.active && status ? <small>{status.counts.ready.toLocaleString()} ready · {status.counts.unsupported.toLocaleString()} unsupported · {status.counts.corrupt.toLocaleString()} corrupt · {status.counts.needsOriginal.toLocaleString()} needs original · {status.counts.failed.toLocaleString()} failed</small> : null}
       </div>
-      {modelIdentity ? <details className="advanced"><summary>Local model details</summary><small>{modelIdentity.provider} · {modelIdentity.modelId} {modelIdentity.modelVersion}</small><small>{modelIdentity.embeddingDimension ? `${modelIdentity.embeddingDimension}-dimension image/text embedding space` : "Embedding dimension recorded locally"}</small>{modelIdentity.licenseUrl ? <small>License {modelIdentity.licenseUrl}</small> : null}</details> : null}
+      {modelNotInstalled ? <aside className="preparation" aria-label="Local semantic model installation">
+        <strong>Optional local model pack</strong>
+        <span>Google SigLIP Base Patch16-224 source · Apache-2.0 model-repository metadata · about 813 MB download / 816 MB installed.</span>
+        <small>Install it explicitly with the documented local pack workflow. CaptureOS never downloads a semantic model automatically.</small>
+      </aside> : null}
+      {modelIdentity ? <details className="advanced"><summary>Local model details</summary><small>{modelIdentity.provider} · {modelIdentity.modelId} {modelIdentity.modelVersion}</small><small>{modelIdentity.embeddingDimension ? `${modelIdentity.embeddingDimension}-dimension image/text embedding space` : "Embedding dimension recorded locally"}</small>{modelIdentity.installedBytes !== null ? <small>{formatSize(modelIdentity.installedBytes)} checksum-validated local pack</small> : null}{modelIdentity.licenseUrl ? <small>License {modelIdentity.licenseUrl}</small> : null}</details> : null}
       {history.length ? <details className="advanced"><summary>Local search history ({history.length})</summary><div className="visual-filters">{history.map((entry) => <button key={entry.id} type="button" onClick={() => onHistory(entry.query)}>{entry.query}</button>)}<button className="secondary" type="button" onClick={onClearHistory}>Clear history</button></div></details> : null}
       {mode === "similar" && response ? <p className="preparation">Find Similar uses the separate local semantic nearest-neighbor index. It does not create or alter Similar Sets.</p> : null}
       {error ? <p className="error intelligence-error" role="alert">{error}</p> : null}
@@ -1195,8 +1669,12 @@ function MagicSearchResults({ response, mode, density, view, showInspector, sele
   isSavingDecision: boolean;
 }) {
   const searchLabel = mode === "similar" ? "Find Similar" : "Magic Search";
-  const evidenceLabel = response.semanticApplied ? "Semantic evidence" : "Local filter evidence";
-  const availabilityMessage = response.semanticApplied
+  const resultBadge = response.identitySearchBlocked
+    ? "Identity unavailable"
+    : response.semanticApplied ? "Semantic matches" : "Filters only";
+  const availabilityMessage = response.identitySearchBlocked
+    ? "Identity search is unavailable. CaptureOS does not identify or match people."
+    : response.semanticApplied
     ? "Ranked from local image/text embedding similarity. A match is not an object, identity, or localized detection claim."
     : response.semanticAvailable
       ? "Showing deterministic local filter matches; this query did not request semantic ranking."
@@ -1209,7 +1687,7 @@ function MagicSearchResults({ response, mode, density, view, showInspector, sele
         <h2>{response.results.length ? `${response.results.length.toLocaleString()} local result${response.results.length === 1 ? "" : "s"}` : "No local matches"}</h2>
         <p className="muted">{response.message ?? availabilityMessage}</p>
       </div>
-      <span className={`badge ${response.semanticApplied ? "completed" : ""}`}>{response.semanticApplied ? "Semantic matches" : "Filters only"}</span>
+      <span className={`badge ${response.semanticApplied ? "completed" : ""}`}>{resultBadge}</span>
     </div>
     {response.parsedFilters.chips.length ? <div className="visual-filters" aria-label="Applied Magic Search filters">{response.parsedFilters.chips.map((chip) => <span className="status" key={chip}>{chip}</span>)}</div> : null}
     {response.results.length ? <div className={`visual-layout ${showInspector ? "with-inspector" : ""}`}>
@@ -1233,11 +1711,15 @@ function MagicSearchResultCard({ result, semanticApplied, onOpen, onFindSimilar,
   density: "small" | "medium" | "large";
 }) {
   const score = semanticApplied && result.scoreLabel ? `${result.scoreLabel} semantic match` : "Local filter match";
+  const semanticScore = semanticApplied && typeof result.semanticScore === "number" && Number.isFinite(result.semanticScore)
+    ? result.semanticScore.toFixed(3)
+    : null;
   return <article>
     <MediaCard item={result.item} view={view} density={density} onOpen={onOpen} />
     <div className="card-caption">
       <strong>{score}</strong>
       <small>{result.explanation}</small>
+      {semanticScore ? <small>Local similarity {semanticScore} · ranking signal only, not confidence or proof of an object, person, or identity.</small> : null}
       {result.matchedEvidence.length ? <small>{result.matchedEvidence.join(" · ")}</small> : null}
       <button className="secondary" type="button" disabled={!findSimilarAvailable || isSearching} title={findSimilarAvailable ? "Search local semantic neighbors" : "Find Similar requires an available local semantic model."} onClick={() => onFindSimilar(result.item.assetId)}>{findSimilarAvailable ? "Find Similar" : "Find Similar unavailable"}</button>
     </div>
@@ -1394,7 +1876,53 @@ function Inspector({ detail, onOpen, onOpenSimilarityGroup, isLoadingSimilarityG
   if (!detail) return <aside className="inspector empty-inspector"><p className="section-label">Inspector</p><h2>Select media</h2><p className="muted">Technical metadata, storage, Capture Intelligence evidence, and every physical copy appear here.</p></aside>;
   const { item, metadata, copies } = detail;
   const preview = item.mediumPreviewUrl ?? item.thumbnailPreviewUrl;
-  return <aside className="inspector" aria-label="Media metadata inspector"><div className="panel-heading"><div><p className="section-label">Inspector</p><h2>{item.filename}</h2></div>{onOpen ? <button className="secondary" onClick={onOpen}>Open viewer</button> : null}</div><div className="inspector-preview"><PreviewImage url={preview} alt="" fallback={<span className="media-placeholder">{mediaSymbol(item)}</span>} /></div><CaptureIntelligenceEvidence detail={detail} onOpenSimilarityGroup={onOpenSimilarityGroup} isLoadingSimilarityGroup={isLoadingSimilarityGroup} onSaveHumanDecision={onSaveHumanDecision} isSavingDecision={isSavingDecision} /><dl className="metadata-grid"><Detail label="Original" value={item.isAvailable ? "Available" : "Offline original"} /><Detail label="Storage" value={item.storageVolume} />{metadata?.cameraModel ? <Detail label="Camera" value={metadata.cameraModel} /> : null}{metadata?.lensModel ? <Detail label="Lens" value={metadata.lensModel} /> : null}{metadata?.focalLengthMm ? <Detail label="Focal length" value={`${metadata.focalLengthMm} mm`} /> : null}{metadata?.aperture ? <Detail label="Aperture" value={`f/${metadata.aperture}`} /> : null}{metadata?.shutterSpeed ? <Detail label="Shutter" value={metadata.shutterSpeed} /> : null}{metadata?.iso ? <Detail label="ISO" value={metadata.iso} /> : null}{metadata?.width && metadata?.height ? <Detail label="Dimensions" value={`${metadata.width} × ${metadata.height}`} /> : null}{metadata?.durationMs ? <Detail label="Duration" value={formatDuration(metadata.durationMs)} /> : null}{metadata?.codec ? <Detail label="Codec" value={metadata.codec} /> : null}{metadata?.sampleRate ? <Detail label="Audio" value={`${metadata.sampleRate} Hz · ${metadata.channels ?? "?"} ch`} /> : null}{metadata?.capturedAtLocal ? <Detail label="Captured" value={formatDate(metadata.capturedAtLocal)} /> : null}{metadata?.gpsPresent ? <Detail label="Location" value="Location metadata available" /> : null}</dl><section className="copy-list"><p className="section-label">Copies</p>{copies.map((copy) => <div key={copy.fileInstanceId}><strong>{copy.storageVolume}</strong><small>{copy.isAvailable ? "Available" : "Offline"} · {copy.selectedRoot ?? "No index root"}</small><small>{copy.relativePath}</small></div>)}</section><details className="advanced"><summary>Advanced / Developer Details</summary><small>Asset {item.assetId}</small><small>Preferred file instance {item.fileInstanceId}</small><small>Metadata source {metadata?.extractor ?? "not prepared"} {metadata?.extractorVersion ?? ""}</small><small>Fingerprint {metadata?.sourceFingerprint ?? "not prepared"}</small>{detail.intelligence ? <><small>Intelligence provider {detail.intelligence.provider} {detail.intelligence.providerVersion}</small><small>Analysis settings {detail.intelligence.settingsVersion}</small><small>Analysis input {detail.intelligence.inputFingerprint}</small><small>Face detection chain {detail.intelligence.faceProvider} {detail.intelligence.faceProviderVersion} · {analysisStatusLabel(detail.intelligence.faceAnalysisStatus)}</small><small>Resolved face provider {detail.intelligence.faceResolvedProvider} {detail.intelligence.faceResolvedProviderVersion}</small><small>Face landmarks · {analysisStatusLabel(detail.intelligence.faceLandmarkStatus)}</small>{detail.intelligence.faceAnalysisError ? <small>Face detection detail {detail.intelligence.faceAnalysisError}</small> : null}{detail.intelligence.faceProviderAttemptError ? <small>Earlier face provider attempt {detail.intelligence.faceProviderAttemptError}</small> : null}{detail.intelligence.faceLandmarkError ? <small>Face landmarks detail {detail.intelligence.faceLandmarkError}</small> : null}</> : null}</details></aside>;
+  const captureTimeCopyConflict = hasCaptureTimeCopyConflict(metadata?.rawMetadata);
+
+  return <aside className="inspector" aria-label="Media metadata inspector">
+    <div className="panel-heading"><div><p className="section-label">Inspector</p><h2>{item.filename}</h2></div>{onOpen ? <button className="secondary" onClick={onOpen}>Open viewer</button> : null}</div>
+    <div className="inspector-preview"><PreviewImage url={preview} alt="" fallback={<span className="media-placeholder">{mediaSymbol(item)}</span>} /></div>
+    <CaptureIntelligenceEvidence detail={detail} onOpenSimilarityGroup={onOpenSimilarityGroup} isLoadingSimilarityGroup={isLoadingSimilarityGroup} onSaveHumanDecision={onSaveHumanDecision} isSavingDecision={isSavingDecision} />
+    <dl className="metadata-grid">
+      <Detail label="Original" value={item.isAvailable ? "Available" : "Offline original"} />
+      <Detail label="Storage" value={item.storageVolume} />
+      {metadata?.cameraModel ? <Detail label="Camera" value={metadata.cameraModel} /> : null}
+      {metadata?.lensModel ? <Detail label="Lens" value={metadata.lensModel} /> : null}
+      {metadata?.focalLengthMm ? <Detail label="Focal length" value={`${metadata.focalLengthMm} mm`} /> : null}
+      {metadata?.aperture ? <Detail label="Aperture" value={`f/${metadata.aperture}`} /> : null}
+      {metadata?.shutterSpeed ? <Detail label="Shutter" value={metadata.shutterSpeed} /> : null}
+      {metadata?.iso ? <Detail label="ISO" value={metadata.iso} /> : null}
+      {metadata?.width && metadata?.height ? <Detail label="Dimensions" value={`${metadata.width} × ${metadata.height}`} /> : null}
+      {metadata?.durationMs ? <Detail label="Duration" value={formatDuration(metadata.durationMs)} /> : null}
+      {metadata?.codec ? <Detail label="Codec" value={metadata.codec} /> : null}
+      {metadata?.sampleRate ? <Detail label="Audio" value={`${metadata.sampleRate} Hz · ${metadata.channels ?? "?"} ch`} /> : null}
+      {metadata?.capturedAtLocal ? <Detail label="Captured" value={formatDate(metadata.capturedAtLocal)} /> : null}
+      {metadata?.gpsPresent ? <Detail label="Location" value="Location metadata available" /> : null}
+    </dl>
+    <section className="copy-list"><p className="section-label">Copies</p>{copies.map((copy) => <div key={copy.fileInstanceId}><strong>{copy.storageVolume}</strong><small>{copy.isAvailable ? "Available" : "Offline"} · {copy.selectedRoot ?? "No index root"}</small><small>{copy.relativePath}</small></div>)}</section>
+    <details className="advanced">
+      <summary>Advanced / Developer Details</summary>
+      <small>Asset {item.assetId}</small>
+      <small>Preferred file instance {item.fileInstanceId}</small>
+      <small>Metadata source {metadata?.extractor ?? "not prepared"} {metadata?.extractorVersion ?? ""}</small>
+      <small>Fingerprint {metadata?.sourceFingerprint ?? "not prepared"}</small>
+      {metadata?.capturedAtLocal ? <>
+        <small>Capture time source {captureTimeSourceDetail(metadata.captureTimeSource)} · {metadata.captureTimeConfidence ? `${displayLabel(metadata.captureTimeConfidence)} confidence` : "confidence unavailable"}</small>
+        <small>Capture timezone {metadata.captureTimezone === "unknown" ? "Unknown — camera wall time preserved" : metadata.captureTimezone ?? "Unavailable"}</small>
+      </> : <small>Capture time provenance unavailable</small>}
+      {captureTimeCopyConflict ? <small>Capture-time copy diagnostic: available copies reported conflicting embedded capture times; a deterministic local resolution was retained.</small> : null}
+      {detail.intelligence ? <>
+        <small>Intelligence provider {detail.intelligence.provider} {detail.intelligence.providerVersion}</small>
+        <small>Analysis settings {detail.intelligence.settingsVersion}</small>
+        <small>Analysis input {detail.intelligence.inputFingerprint}</small>
+        <small>Face detection chain {detail.intelligence.faceProvider} {detail.intelligence.faceProviderVersion} · {analysisStatusLabel(detail.intelligence.faceAnalysisStatus)}</small>
+        <small>Resolved face provider {detail.intelligence.faceResolvedProvider} {detail.intelligence.faceResolvedProviderVersion}</small>
+        <small>Face landmarks · {analysisStatusLabel(detail.intelligence.faceLandmarkStatus)}</small>
+        {detail.intelligence.faceAnalysisError ? <small>Face detection detail {detail.intelligence.faceAnalysisError}</small> : null}
+        {detail.intelligence.faceProviderAttemptError ? <small>Earlier face provider attempt {detail.intelligence.faceProviderAttemptError}</small> : null}
+        {detail.intelligence.faceLandmarkError ? <small>Face landmarks detail {detail.intelligence.faceLandmarkError}</small> : null}
+      </> : null}
+    </details>
+  </aside>;
 }
 
 function CaptureIntelligenceEvidence({ detail, onOpenSimilarityGroup, isLoadingSimilarityGroup, onSaveHumanDecision, isSavingDecision }: { detail: MediaAssetDetail; onOpenSimilarityGroup?: (assetId: string) => void; isLoadingSimilarityGroup?: boolean; onSaveHumanDecision?: (assetId: string, decision: "keep" | "review" | "reject") => void; isSavingDecision?: boolean }) {
@@ -1476,9 +2004,49 @@ function mediaSymbol(item: Pick<VisualMediaRow, "mediaType">) { if (item.mediaTy
 function formatDuration(milliseconds: number) { const seconds = Math.round(milliseconds / 1000); return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`; }
 function formatPercent(value: number | null | undefined) { return value === null || value === undefined || !Number.isFinite(value) ? "Unavailable" : `${value.toFixed(1)}%`; }
 function formatConfidence(value: number | null | undefined) { return value === null || value === undefined || !Number.isFinite(value) ? "Unavailable" : `${Math.round(value * 100)}%`; }
+function formatMomentTimeRange(from: string | null, to: string | null, state: string) {
+  if (state === "unavailable" || (!from && !to)) return "Capture time unavailable";
+  if (!from) return `Capture time through ${formatDate(to!)}`;
+  if (!to || to === from) return `Captured ${formatDate(from)}`;
+  return `${formatDate(from)} – ${formatDate(to)}`;
+}
+function momentAnalysisStatusLabel(progress: MomentAnalysisProgress | null) {
+  if (!progress) return "Checking local status";
+  if (progress.active || progress.state === "running") return "Analyzing locally";
+  if (progress.state === "queued") return "Analysis queued";
+  if (progress.state === "paused") return "Analysis paused";
+  if (progress.state === "failed") return "Analysis needs review";
+  if (progress.state === "interrupted") return "Analysis interrupted";
+  if (progress.timelineReady) return "Local timeline ready";
+  return "Not analyzed";
+}
+function coverageStateLabel(state: string) {
+  if (state === "confirmed_covered") return "Confirmed covered";
+  if (state === "needs_review") return "Needs review";
+  if (state === "not_covered") return "Not covered";
+  return "Unreviewed";
+}
 function shortDetail(value: string | null | undefined) { const compact = value?.replaceAll(/\s+/g, " ").trim(); return compact && compact.length > 110 ? `${compact.slice(0, 107)}…` : compact; }
 function safeFaceBox(face: FaceAnalysisEvidence) { const width = Math.min(Math.max(Number.isFinite(face.width) ? face.width : 0.01, 0.01), 1); const height = Math.min(Math.max(Number.isFinite(face.height) ? face.height : 0.01, 0.01), 1); return { width, height, x: Math.min(Math.max(Number.isFinite(face.x) ? face.x : 0, 0), 1 - width), y: Math.min(Math.max(Number.isFinite(face.y) ? face.y : 0, 0), 1 - height) }; }
 function isAnalysisResourceMode(value: unknown): value is "eco" | "balanced" | "fast" { return value === "eco" || value === "balanced" || value === "fast"; }
+function isSemanticResourceMode(value: unknown): value is SemanticResourceMode { return isAnalysisResourceMode(value); }
+function metadataRefreshIsActive(progress: MetadataRefreshProgress | null) { return progress?.state === "queued" || progress?.state === "running"; }
+function captureTimeSourceDetail(source: string | null | undefined) {
+  if (source === "exif_datetime_original") return "EXIF DateTimeOriginal";
+  if (source === "exif_datetime_digitized") return "EXIF DateTimeDigitized";
+  if (source === "exif_create_date") return "EXIF CreateDate";
+  if (source === "platform_content_creation_date") return "Platform content creation date";
+  if (source === "platform_sips_creation_date") return "Platform image creation date";
+  if (source === "filesystem_modified_time") return "Filesystem modified time";
+  if (source === "filesystem_created_time") return "Filesystem created time";
+  return source ? displayLabel(source) : "unavailable";
+}
+function hasCaptureTimeCopyConflict(rawMetadata: Record<string, unknown> | undefined) {
+  const resolution = rawMetadata?.captureTimeResolution;
+  if (!isRecord(resolution) || !Array.isArray(resolution.diagnostics)) return false;
+  return resolution.diagnostics.some((diagnostic) => isRecord(diagnostic) && diagnostic.kind === "embedded_capture_time_conflict");
+}
+function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function displayLabel(value: string) { return value.split("_").filter(Boolean).map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`).join(" "); }
 function intelligenceStateLabel(value: string) { if (value === "running") return "Analyzing locally"; if (value === "paused") return "Analysis paused"; if (value === "completed") return "Analysis complete"; if (value === "interrupted") return "Analysis interrupted"; if (value === "failed") return "Analysis needs review"; if (value === "queued") return "Analysis queued"; return displayLabel(value); }
 function analysisStatusLabel(value: string | null | undefined) { if (value === "needs_original") return "Needs original"; if (value === "unsupported") return "Analysis unsupported"; if (value === "corrupt") return "Corrupt media"; if (value === "not_applicable") return "Not applicable"; if (value === "stale") return "Analysis stale"; if (value === "failed") return "Analysis failed"; if (value === "pending") return "Analysis pending"; return value ? displayLabel(value) : "Analysis unavailable"; }
@@ -1490,7 +2058,32 @@ function similarityGroupLabel(value: string) { if (value === "exact_duplicate_se
 function Metric({ label, value }: { label: string; value: string | number }) { return <div><span>{label}</span><strong>{typeof value === "number" ? value.toLocaleString() : value}</strong></div>; }
 function Detail({ label, value }: { label: string; value: string | number }) { return <div><dt>{label}</dt><dd>{value}</dd></div>; }
 function formatSize(value: number | null) { if (value === null) return "—"; if (value < 1024) return `${value} B`; if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`; return `${(value / 1024 ** 2).toFixed(1)} MB`; }
-function formatDate(value: string) { return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)); }
+function formatDate(value: string) {
+  const localWallClock = parseLocalWallClock(value);
+  if (localWallClock) {
+    // Zone-less camera metadata is a local wall clock, not UTC. Formatting it in a neutral UTC
+    // frame preserves its numeric fields without applying the workstation time zone.
+    const date = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeZone: "UTC" }).format(localWallClock);
+    const time = new Intl.DateTimeFormat(undefined, { timeStyle: "short", timeZone: "UTC" }).format(localWallClock);
+    return `${date} ${time}`;
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+function parseLocalWallClock(value: string) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?$/.exec(value);
+  if (!match) return null;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText = "0", fraction = ""] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const milliseconds = Number(fraction.padEnd(3, "0").slice(0, 3));
+  const date = new Date(Date.UTC(year, month - 1, day, hour, minute, second, milliseconds));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day && date.getUTCHours() === hour && date.getUTCMinutes() === minute && date.getUTCSeconds() === second ? date : null;
+}
 function shortId(value: string) { return value.slice(0, 8); }
 function toMessage(reason: unknown) { return reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "The local catalog did not respond."; }
 function toError(setError: (message: string) => void) { return (reason: unknown) => setError(toMessage(reason)); }

@@ -12,9 +12,10 @@ per copy.
 Image input prefers the existing oriented CaptureOS-managed analysis preview. The source is read
 only to produce that contained preview when no valid cache exists; inference never receives a
 general original path. Text and image preprocessing are versioned together. Vectors from different
-model, model-version, dimension, tokenizer, or preprocessing identities are never compared as if
-they were one semantic space. An incompatible or changed record becomes stale rather than being
-overwritten or silently reused.
+model, model-version, manifest digest, dimension, tokenizer, or preprocessing identities are never
+compared as if they were one semantic space. The dimension is included in both the durable
+embedding identity and the derived-index cache key. An incompatible or changed record becomes
+stale rather than being overwritten or silently reused.
 
 ## Consequences
 

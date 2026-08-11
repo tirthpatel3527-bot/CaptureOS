@@ -8,12 +8,14 @@ members = [
   "crates/media-visual",
   "crates/capture-intelligence",
   "crates/magic-search",
+  "crates/moment-brain",
   "crates/storage",
   "crates/ingest",
   "crates/integrity",
   "apps/desktop/src-tauri",
   "research/capture-intelligence-bench",
   "research/magic-search-bench",
+  "research/moment-brain-bench",
 ]
 resolver = "2"
 
@@ -27,6 +29,7 @@ authors = ["CaptureOS Contributors"]
 [workspace.dependencies]
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
+kamadak-exif = "0.6.1"
 libc = "0.2"
 proptest = "1.5"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }

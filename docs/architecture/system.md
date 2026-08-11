@@ -1,17 +1,18 @@
 # System architecture
 
-CaptureOS uses a desktop-first, local-only architecture. React uses Tauri commands and events; the Rust core owns the domain model, migrations, repositories, read-only Index Mode, verified Ingest Mode, visual preparation, Capture Intelligence, and Milestone 6 Magic Search orchestration. SQLite stores catalog information locally; it never stores original media bytes. The persistent app shell separates global Project Library navigation from the selected project workspace.
+CaptureOS uses a desktop-first, local-only architecture. React uses Tauri commands and events; the Rust core owns the domain model, migrations, repositories, read-only Index Mode, verified Ingest Mode, visual preparation, Capture Intelligence, Milestone 6 Magic Search, and Milestone 7 Moment Brain orchestration. SQLite stores catalog information locally; it never stores original media bytes. The persistent app shell separates global Project Library navigation from the selected project workspace.
 
 ```mermaid
 flowchart LR
   Shell["Global shell: Home / Project Library\nNew Project"] --> Route["Stable ProjectId route"]
-  Route --> UI["React media grid + Index / Ingest / Culling / Magic Search"]
+  Route --> UI["React media grid + Index / Ingest / Culling / Magic Search / Moments"]
   UI --> Bridge["Tauri command bridge"]
   Bridge --> Core["capture-core"]
   Core --> Ingest["ingest: pre-flight → copy → BLAKE3 verify"]
   Core --> Visual["media-visual: metadata → browsing/analysis-preview → cache artifact"]
   Core --> Intelligence["capture-intelligence: local fingerprint → technical evidence → group/recommendation"]
   Core --> Search["Magic Search: planner → local embeddings → hybrid rank"]
+  Core --> Timeline["Moment Brain: bounded local timeline → structural Moments"]
   Core --> Graph["capture-graph"]
   Core --> Model["media-model"]
   Core --> Repo["persistence repository"]
@@ -25,6 +26,10 @@ flowchart LR
   Search --> Vector["Project-scoped derived vector index"]
   Vector --> Repo
   Search --> UI
+  Intelligence --> Timeline
+  Search --> Timeline
+  Timeline --> Repo
+  Timeline --> UI
   UI --> Culling["Culling Workspace\nlocal review, compare, face crops, keyboard workflow"]
   Culling --> Review["ReviewSession + current decision\nimmutable history/events + preference examples"]
   Review --> Repo
@@ -49,6 +54,7 @@ flowchart LR
 | `media-visual`  | Local metadata adapters, cache-safe thumbnail/poster generation, WAV parsing | Original write-back, RAW development, proxies, AI |
 | `capture-intelligence` | Provider contracts; deterministic visual descriptors, technical evidence, bounded candidate grouping, local face-provider boundary, recommendations | Cloud inference, identity recognition, artistic judgment, automatic culling |
 | Magic Search | Current-project query planning, local semantic provider/vector-index boundary, hybrid ranking, explanations, local history | Chatbot, cloud inference, cross-project search, identity recognition, Similar Set mutation |
+| Moment Brain | Current-project still-photo structural timeline, bounded evidence-based segments/Moments, conservative label candidates, human override projection, factual coverage and advisory clock diagnostics | Event/identity recognition, captioning, missing-shot claims, automatic culling, timestamp write-back, cloud processing, Similar Set mutation |
 | desktop | Global Project Library routing, selected-project commands, folder selection, pre-flight, progress, status, history | Product dashboard or creative workspace |
 
 ## Culling and review boundary
@@ -59,9 +65,9 @@ Milestone 5 is a human-controlled metadata workflow, not an automatic culling en
 
 ## Magic Search boundary
 
-Milestone 6 uses a local `SearchService` with replaceable query-planner, metadata-search, image/text embedding-provider, vector-index, hybrid-ranking, and explanation boundaries. The only candidate semantic family is a manually installed static SigLIP ONNX pack admitted through the model registry; no model is bundled or auto-downloaded. When unavailable, Magic Search retains deterministic metadata/technical filters and reports the unavailable semantic capability rather than manufacturing results.
+Milestone 6 uses a local `SearchService` with replaceable query-planner, metadata-search, image/text embedding-provider, vector-index, hybrid-ranking, and explanation boundaries. The only candidate semantic family is a manually installed static SigLIP ONNX pack admitted through the model registry; no model is bundled or auto-downloaded. A pack is unavailable unless canonical containment, per-file checksums, tokenizer self-test, fixed RGB24 reference raster, and image/text reference-vector checks pass. When unavailable, Magic Search retains deterministic metadata/technical filters and reports the unavailable semantic capability rather than manufacturing results.
 
-Embeddings are MediaAsset-level derived evidence, never FileInstance duplicates or original-media bytes. The vector index is project-scoped and rebuildable from versioned durable embedding rows; it cannot create broad CaptureGraph `SIMILAR_TO` edges, alter M4 Similar Sets, or change human decisions. The Search Service has no cross-project search route and stores recent query history locally per project. See [Magic Search architecture](magic-search.md).
+Embeddings are MediaAsset-level derived evidence, never FileInstance duplicates or original-media bytes. The vector index is project-scoped and rebuildable from versioned durable embedding rows; it cannot create broad CaptureGraph `SIMILAR_TO` edges, alter M4 Similar Sets, or change human decisions. The current index is exact through 4,096 vectors and otherwise uses bounded local LSH candidate retrieval followed by local re-ranking; MagicSearchBench records its current generated-data recall limitation. The Search Service has no cross-project search route and stores recent query history locally per project. See [Magic Search architecture](magic-search.md).
 
 ## Data locality
 
@@ -72,6 +78,8 @@ Preview files are generated only inside CaptureOS application data. The database
 Capture Intelligence receives only a validated, CaptureOS-owned analysis-preview path. `AnalysisInputResolver` reuses a valid dedicated 2048px-target analysis artifact or sufficient 1600px browsing preview; when neither exists it can read a catalog-marked available `FileInstance` only to create the contained artifact. It never sends an original path to an analyzer or writes alongside a source. Its SQLite records contain evidence and compact descriptors, not original image bytes. A future local model is represented by a registry record and must be explicitly installed and license-reviewed before a provider can use it. The current baseline bundles no third-party model and makes no network request. Optional macOS Vision face/landmark support is a host-OS capability, not a CaptureOS-distributed model.
 
 Magic Search follows the same containment rule: its provider receives only a managed analysis preview and produces local image/text embeddings. Embeddings, query history, and the vector index are potentially sensitive local derived data. They are not telemetry, remote requests, or automatic exports. Existing compatible embeddings remain searchable while a source volume is offline; if a new embedding needs a missing source/preview, the asset is marked `NEEDS_ORIGINAL` without blocking other work.
+
+Moment Brain consumes only project-scoped durable catalog/timeline evidence and compatible M6 embeddings; it does not add a second media decoder or require an original to open a project. Timeline runs, memberships, local centroids, boundary evidence, conservative label candidates, coverage/checklist records, camera-clock diagnostics, and append-only human override events are sensitive local derived data. They are rebuildable, never uploaded/exported automatically, and never the sole source of a project or human decision. Project Home queries compact Moment status only; it never starts or waits for a timeline job.
 
 ## Capture Intelligence evidence flow
 
@@ -103,7 +111,7 @@ flowchart LR
 
 `AnalysisArtifact` records provider, provider/model/settings versions, input fingerprint, timestamp, confidence, status, and error. When an input or analyzer changes, older records become `STALE`; they remain provenance rather than being relabeled as current. Terminal outcomes are `READY`, `UNSUPPORTED`, `CORRUPT`, `NEEDS_ORIGINAL`, `FAILED`, and `NOT_APPLICABLE`, so one unusable asset cannot block the durable background queue. Group membership is modelled directly to avoid an unnecessary quadratic number of `SIMILAR_TO` graph edges; `CaptureGraph` reserves typed relationships for future consumers.
 
-The M4 deterministic baseline remains deliberately conservative. Milestone 6 adds only optional current-project still-photo semantic retrieval through an admitted local model pack; it does not add facial identity, demographic classification, artistic ranking, automatic deletion, video/audio semantics, or cloud analysis. Detailed strategy and operating limits are in [Capture Intelligence](capture-intelligence.md) and [Magic Search](magic-search.md).
+The M4 deterministic baseline remains deliberately conservative. Milestone 6 adds optional current-project still-photo semantic retrieval through an admitted local model pack. Milestone 7 adds structural local Moment organization from bounded persisted evidence. Neither adds facial identity, demographic classification, artistic ranking, automatic deletion, video/audio semantics, cloud analysis, or automatic culling. Detailed strategy and operating limits are in [Capture Intelligence](capture-intelligence.md), [Magic Search](magic-search.md), and [Moment Brain](moment-brain.md).
 
 ## Ingest evidence flow
 
@@ -126,7 +134,7 @@ flowchart LR
 
 Home is deliberately the startup route. The Project Library is a derived, read-only catalog projection sorted by meaningful project activity and keyed by stable `ProjectId`, so existing projects retain their media, preview cache records, ingest history, Capture Intelligence artifacts, and CaptureGuardian evidence without a data reset. Identical display names are valid.
 
-Project-specific routes load only that project’s media, roots, jobs, ingest history, Capture Intelligence state, Magic Search embedding/index metadata, and local search history. Tauri broadcasts carry the source `ProjectId`, and the renderer filters them before updating the visible workspace. Sensitive asset-level reads, semantic retrieval, and human decisions check ownership again in `capture-core`; a project cannot request an asset or embedding belonging to another project.
+Project-specific routes load only that project’s media, roots, jobs, ingest history, Capture Intelligence state, Magic Search embedding/index metadata/local search history, and compact Moment timeline status. Tauri broadcasts carry the source `ProjectId`, and the renderer filters them before updating the visible workspace. Sensitive asset-level reads, semantic retrieval, timeline retrieval, and human decisions check ownership again in `capture-core`; a project cannot request an asset, embedding, or Moment belonging to another project.
 
 ## Portability boundary
 

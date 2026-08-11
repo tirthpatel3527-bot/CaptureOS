@@ -1,0 +1,40 @@
+{
+  "packId": "captureos.semantic.siglip-base-p16-224.v1",
+  "upstream": {
+    "repository": "google/siglip-base-patch16-224",
+    "sourceUrl": "https://huggingface.co/google/siglip-base-patch16-224",
+    "revision": "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed",
+    "licenseMetadata": "Apache-2.0",
+    "licenseUrl": "https://huggingface.co/google/siglip-base-patch16-224"
+  },
+  "files": {
+    "model.safetensors": {
+      "bytes": 812672320,
+      "sha256": "2c63cb7d1f2e95ba501893cbb8faeb4ea9a3af295498d35097126228659c2af8"
+    },
+    "config.json": {
+      "bytes": 432,
+      "sha256": "cd85b3d28829722820bcb89a2cfbb4160e55fd359249a3044da724166a8d9688"
+    },
+    "preprocessor_config.json": {
+      "bytes": 368,
+      "sha256": "d11ccb80f15d358a11bdb070e92e2d889005874b7db15823d5f10d9b2533b14a"
+    },
+    "spiece.model": {
+      "bytes": 798330,
+      "sha256": "1e5036bed065526c3c212dfbe288752391797c4bb1a284aa18c9a0b23fcaf8ec"
+    },
+    "tokenizer.json": {
+      "bytes": 2399357,
+      "sha256": "c6e405cb7c670d56636a9402c81023a55bc6c3c53d89cf02b92f5c5005bfe920"
+    },
+    "tokenizer_config.json": {
+      "bytes": 711,
+      "sha256": "d6423dae508cc3a129d22ea443841c111832a1a73125b8f25ea8736951698bcb"
+    },
+    "special_tokens_map.json": {
+      "bytes": 409,
+      "sha256": "2b6a1ff67a27e0df9ac0c7d93250fc0d87431c7b366b3d5669217104f9088a26"
+    }
+  }
+}

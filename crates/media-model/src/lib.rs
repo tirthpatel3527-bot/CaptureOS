@@ -843,6 +843,10 @@ pub enum JobStage {
     SemanticEmbedding,
     /// Rebuild of the derived, replaceable local Magic Search vector index.
     SemanticIndex,
+    /// Local, evidence-based still-photo timeline segmentation. This is distinct from both
+    /// Capture Intelligence analysis and Magic Search indexing; it never implies an event,
+    /// identity, or culling decision.
+    MomentAnalysis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

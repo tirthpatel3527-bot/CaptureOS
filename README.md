@@ -136,11 +136,11 @@ It reports measurements from the current machine. It does not claim face or eye 
 
 ## Magic Search behavior
 
-Magic Search is scoped to the current project and keeps the existing visual grid, Inspector, pagination, offline labels, and MediaAsset-level cards. A text query can use an installed local image/text embedding provider in a shared vector space; simple high-confidence terms such as `2 faces`, `5 star`, `kept`, `sharp`, or `camera SLT-A58` also become deterministic predicates. The result explanation names only the signals actually used. A semantic-only result is described as a **Strong semantic match**, not as an invented object detection.
+Magic Search is scoped to the current project and keeps the existing visual grid, Inspector, pagination, offline labels, and MediaAsset-level cards. A text query can use an installed local image/text embedding provider in a shared vector space; simple high-confidence terms such as `2 faces`, `5 star`, `kept`, `sharp`, or `camera SLT-A58` also become deterministic predicates. The result explanation names only the signals actually used. A semantic-only result is described as a **local semantic match** with a non-confidence local ranking signal, never as an invented object detection.
 
 Eligible still photographs reuse a valid CaptureOS-managed analysis preview whenever possible. A semantic embedding is durable local derived evidence keyed by MediaAsset, input fingerprint, semantic model/version, and preprocessing version. One logical MediaAsset receives one current embedding even if it has several physical FileInstances. Cached READY embeddings remain searchable when originals are offline. Corrupt, unsupported, missing-original, and failed items are terminal per-asset outcomes that do not stop the project queue.
 
-The default provider contract is an opt-in, manually installed SigLIP ONNX model pack; CaptureOS does not bundle or automatically download its model weights. Until a pack completes registry, checksum, and reference-vector validation, the UI must report **Semantic Search Model — Not Installed/Unavailable** and retain deterministic metadata and technical filtering. See [Magic Search architecture](docs/architecture/magic-search.md) and [the local model registry](docs/architecture/local-model-registry.md).
+The default provider contract is an opt-in, manually installed SigLIP ONNX model pack; CaptureOS does not bundle or automatically download its model weights. Until the one compiled, checksum-pinned pack completes registry, artifact, tokenizer, ONNX, and reference-vector validation, the UI must report **Semantic model not installed** and retain deterministic metadata and technical filtering. See the [controlled local-model installation guide](docs/architecture/semantic-model-install.md), [Magic Search architecture](docs/architecture/magic-search.md), and [the local model registry](docs/architecture/local-model-registry.md).
 
 **Find Similar** uses the selected image's semantic embedding to retrieve current-project visual neighbors. It is intentionally distinct from **Similar Sets**, which remain conservative related-frame/burst groups. Neither search path modifies human decisions, ratings, notes, representatives, review sessions, source media, or CaptureGraph group membership.
 
@@ -152,9 +152,27 @@ cargo run -p magic-search-bench -- --suite baseline
 
 It reports measurements from the current machine for synthetic vector records at 1k, 10k, and 50k scale. It is not a claim of semantic quality; semantic Recall@K/MRR/nDCG require a separately licensed, versioned ground-truth dataset and an admitted local model pack.
 
-## Milestone 6 boundaries
+## Moment Brain and Shoot Timeline Intelligence I behavior
 
-This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People or Moment Brain, creative/aesthetic/emotional scoring, video/audio semantic search, automatic culling, color-critical RAW development, full proxy transcoding, NLE integration, authentication, cloud work, automatic eject, card formatting, collaboration, or billing. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
+**Moments** is a project-scoped, optional structural timeline view for still photographs. It uses local capture-time cadence, compatible existing local embeddings, camera/lens/orientation, anonymous face-count availability, Similar Set continuity, and technical evidence to organize a shoot into reviewable sequences. It is not an event detector, person/relationship recognizer, wedding-stage classifier, creative judgement, missing-shot claim, or automatic culling tool. Missing timestamps remain visibly ungrouped rather than being guessed.
+
+Moment analysis is an explicit durable background operation. Opening CaptureOS or a project only reads compact status; it never waits for a model, scan, or rebuild. An **Update** processes bounded local chronology around new records, while **Rebuild** refreshes derived structural records when incompatible/out-of-order evidence requires it. Neither action changes source media, Capture Intelligence artifacts, Similar Set membership, Magic Search history, Keep/Reject/Review state, ratings, notes, review sessions, or existing group representatives.
+
+Moment Brain uses a separate conservative label boundary. The installed M6 shared image/text embedding model is not a captioner. It ranks only a reviewed neutral vocabulary and optional photographer-authored checklist/project phrases; when candidate evidence is weak, ambiguous, conflicting, or unavailable, the UI shows **Untitled Moment**. AI suggestion/evidence and a human title are retained separately; the human title controls presentation. Examples such as **Outdoor portraits**, **Boat portraits**, and **Indoor group photos** illustrate neutral supported combinations only—they are not hard-coded wedding or AI Test labels.
+
+Coverage Map I shows observed local facts such as capture ranges/gaps, asset totals, technical/anonymous-face-count availability, decision summaries, and photographer-owned checklist state. It never claims a required shot was missed or auto-completes a checklist item. A multicamera **Possible camera time offset** is advisory only; CaptureOS does not rewrite EXIF, source metadata, or catalog timestamps.
+
+Run the generated, no-download structural benchmark with:
+
+```sh
+cargo run --release -p moment-brain-bench -- --suite baseline
+```
+
+It compares time-only, synthetic-signature-only, and combined structural mechanics at 1k, 10k, 50k, and 100k generated records. It contains no AI Test/customer photograph, model weight, model download, cloud request, identity/event label, or real semantic-quality claim. See [Moment Brain architecture](docs/architecture/moment-brain.md) and [MomentBrainBench](research/moment-brain-bench/README.md).
+
+## Milestone 7 boundaries
+
+This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, video/audio semantic search, automatic culling, source write-back, color-critical RAW development, full proxy transcoding, NLE integration, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or other Milestone 8 work. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
 
 ## Smart Culling Workspace behavior
 

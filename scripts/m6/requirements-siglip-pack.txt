@@ -1,0 +1,13 @@
+# Development-only, explicitly invoked conversion environment for M6.1.
+# CaptureOS does not install, execute, or ship this Python toolchain at runtime.
+# Update this file and regenerate the pack provenance together; never use model-repository code.
+huggingface-hub==0.24.6
+numpy==1.26.4
+onnx==1.16.2
+onnxruntime==1.19.2
+Pillow==10.4.0
+safetensors==0.4.5
+sentencepiece==0.2.0
+tokenizers==0.19.1
+torch==2.4.1
+transformers==4.44.2

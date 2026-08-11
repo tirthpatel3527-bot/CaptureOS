@@ -4,7 +4,8 @@
 //! writes alongside a source file: every generated artifact is placed under the caller's
 //! CaptureOS-managed cache root.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Timelike, Utc};
+use exif::{In, Reader as ExifReader, Tag, Value as ExifValue};
 use media_model::MediaType;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,7 +13,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
@@ -21,6 +22,9 @@ use std::{
 use thiserror::Error;
 
 pub const GENERATOR_VERSION: &str = "m3.1";
+/// Versioned independently from preview generation so a metadata-only refresh never invalidates
+/// a CaptureOS-managed preview cache or makes browsing wait for thumbnail generation.
+pub const METADATA_EXTRACTOR_VERSION: &str = "m7.1.capture-time.v1";
 /// Generator identity for a high-resolution, CaptureOS-owned input that may be created on
 /// demand for local analysis. It is deliberately separate from the browsing-preview generator
 /// so a future analysis-input revision does not invalidate the grid cache.
@@ -30,6 +34,11 @@ pub const ANALYSIS_PREVIEW_LONG_EDGE: u32 = 2048;
 /// invocation bounded so a malformed local file can never hold the preparation queue open.
 pub const PROVIDER_TIMEOUT: Duration = Duration::from_secs(20);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+/// Capture-time metadata is optional evidence. Limit the direct parser to a bounded leading
+/// window so a malformed container cannot turn a metadata-only refresh into an unbounded read.
+/// This does not reject or limit an original: it leaves the timestamp unavailable for this
+/// adapter and allows the separately-provenanced platform/filesystem fallbacks to run.
+const EMBEDDED_CAPTURE_TIME_SCAN_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum VisualError {
@@ -112,6 +121,9 @@ pub struct ExtractedMetadata {
     pub captured_at_local: Option<String>,
     pub capture_timezone: Option<String>,
     pub capture_time_source: Option<String>,
+    /// `high`, `medium`, or `low`. This is provenance confidence, not a claim that a camera's
+    /// clock was set accurately.
+    pub capture_time_confidence: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub orientation: Option<String>,
@@ -142,6 +154,36 @@ pub struct ExtractedMetadata {
     pub raw: Value,
     pub status: ArtifactStatus,
     pub failure_reason: Option<String>,
+}
+
+/// A local camera-time candidate. `local` is deliberately a wall-clock ISO-8601 value without
+/// an offset; the separately persisted timezone is either an observed numeric offset or the
+/// explicit literal `unknown`. This keeps an unknown camera clock from being silently recast as
+/// UTC while still providing stable within-project chronology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureTimeCandidate {
+    pub raw: String,
+    pub local: String,
+    pub timezone: String,
+    pub source: String,
+    pub confidence: String,
+}
+
+/// Stable ordering for capture-time provenance. It is public because the catalog-level resolver
+/// must compare observations from multiple physical copies without making filenames or file
+/// modification times masquerade as camera evidence.
+pub fn capture_time_priority(source: Option<&str>) -> u8 {
+    match source {
+        Some("exif_datetime_original") => 100,
+        Some("exif_datetime_digitized") => 90,
+        Some("exif_create_date") => 80,
+        Some("platform_content_creation_date") => 60,
+        Some("platform_sips_creation_date") => 50,
+        Some("filesystem_modified_time") => 20,
+        Some("filesystem_created_time") => 10,
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +345,10 @@ pub fn extract_metadata(source: &Path, media_type: &MediaType) -> ExtractedMetad
     if metadata.status != ArtifactStatus::Ready {
         return metadata;
     }
+    // EXIF is read directly from the locally mounted source container. The parser never decodes
+    // pixels or executes media-provided code, and a missing/malformed EXIF block merely leaves
+    // capture time unavailable so later, weaker provenance can be considered explicitly.
+    apply_embedded_capture_time(source, media_type, &mut metadata);
     if cfg!(target_os = "macos") {
         let spotlight = macos_metadata(source);
         apply_platform_metadata(&mut metadata, &spotlight);
@@ -316,6 +362,7 @@ pub fn extract_metadata(source: &Path, media_type: &MediaType) -> ExtractedMetad
         }
         merge_raw(&mut metadata.raw, "spotlight", spotlight);
     }
+    apply_filesystem_capture_time_fallback(&mut metadata);
     metadata
 }
 
@@ -867,6 +914,8 @@ fn sips_properties(source: &Path) -> BTreeMap<String, String> {
         Command::new("/usr/bin/sips")
             .args([
                 "-g",
+                "creation",
+                "-g",
                 "pixelWidth",
                 "-g",
                 "pixelHeight",
@@ -888,7 +937,7 @@ fn macos_metadata(source: &Path) -> BTreeMap<String, String> {
                 "-name",
                 "kMDItemAcquisitionModel",
                 "-name",
-                "kMDItemFSCreationDate",
+                "kMDItemContentCreationDate",
                 "-name",
                 "kMDItemPixelWidth",
                 "-name",
@@ -918,9 +967,15 @@ fn command_key_values(command: &mut Command) -> BTreeMap<String, String> {
     if !output.status.success() {
         return BTreeMap::new();
     }
-    String::from_utf8_lossy(&output.stdout)
+    parse_command_key_values(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_command_key_values(output: &str) -> BTreeMap<String, String> {
+    output
         .lines()
-        .filter_map(|line| line.split_once(':').or_else(|| line.split_once(" = ")))
+        // `mdls` uses `key = value`; values often contain clock colons. Prefer that delimiter
+        // before the loose `sips` `key: value` form so a timestamp cannot corrupt its key.
+        .filter_map(|line| line.split_once(" = ").or_else(|| line.split_once(':')))
         .map(|(key, value)| {
             (
                 key.trim().to_owned(),
@@ -931,11 +986,340 @@ fn command_key_values(command: &mut Command) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// Reads only standard embedded EXIF time tags from formats where the pure-Rust container reader
+/// can do so without invoking a decoder. TIFF-based RAW support remains a platform capability:
+/// `kamadak-exif` may need to read a complete TIFF container, so this local adapter does not turn
+/// a metadata refresh into an unbounded RAW-file read.
+fn apply_embedded_capture_time(
+    source: &Path,
+    media_type: &MediaType,
+    metadata: &mut ExtractedMetadata,
+) {
+    if !matches!(
+        media_type,
+        MediaType::Jpeg | MediaType::Heif | MediaType::Png
+    ) {
+        return;
+    }
+    let observed = match embedded_capture_time_candidates(source, media_type) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            merge_raw(
+                &mut metadata.raw,
+                "embeddedExifCaptureTime",
+                json!({ "state": "unavailable", "reason": error.to_string() }),
+            );
+            return;
+        }
+    };
+
+    for candidate in &observed {
+        apply_capture_time_candidate(metadata, Some(candidate.clone()));
+    }
+    merge_raw(
+        &mut metadata.raw,
+        "embeddedExifCaptureTime",
+        json!({
+            "state": if observed.is_empty() { "unavailable" } else { "observed" },
+            "candidates": observed,
+        }),
+    );
+}
+
+fn embedded_capture_time_candidates(
+    source: &Path,
+    media_type: &MediaType,
+) -> Result<Vec<CaptureTimeCandidate>, io::Error> {
+    if !matches!(
+        media_type,
+        MediaType::Jpeg | MediaType::Heif | MediaType::Png
+    ) {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(source)?;
+    let scan_limit = file
+        .metadata()
+        .map(|metadata| metadata.len().min(EMBEDDED_CAPTURE_TIME_SCAN_LIMIT))?;
+    let mut reader = std::io::BufReader::new(BoundedMetadataReader::new(file, scan_limit));
+    let exif = ExifReader::new()
+        .read_from_container(&mut reader)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let candidates = [
+        (
+            Tag::DateTimeOriginal,
+            Tag::SubSecTimeOriginal,
+            Tag::OffsetTimeOriginal,
+            "exif_datetime_original",
+            "high",
+        ),
+        (
+            Tag::DateTimeDigitized,
+            Tag::SubSecTimeDigitized,
+            Tag::OffsetTimeDigitized,
+            "exif_datetime_digitized",
+            "high",
+        ),
+        (
+            Tag::DateTime,
+            Tag::SubSecTime,
+            Tag::OffsetTime,
+            "exif_create_date",
+            "high",
+        ),
+    ];
+    let mut observed = Vec::new();
+    for (time_tag, subsecond_tag, offset_tag, source_name, confidence) in candidates {
+        let candidate = exif_ascii(&exif, time_tag).and_then(|value| {
+            parse_camera_datetime(
+                &value,
+                exif_ascii(&exif, subsecond_tag).as_deref(),
+                exif_ascii(&exif, offset_tag).as_deref(),
+                source_name,
+                confidence,
+            )
+        });
+        if let Some(candidate) = candidate {
+            observed.push(candidate);
+        }
+    }
+    Ok(observed)
+}
+
+/// A read-only `Read + Seek` view of the initial portion of a source file. `kamadak-exif`
+/// supports several container types and can otherwise scan or seek a whole file while looking
+/// for optional metadata; this wrapper makes that work bounded without modifying the source.
+struct BoundedMetadataReader<R> {
+    source: R,
+    position: u64,
+    limit: u64,
+}
+
+impl<R> BoundedMetadataReader<R> {
+    fn new(source: R, limit: u64) -> Self {
+        Self {
+            source,
+            position: 0,
+            limit,
+        }
+    }
+}
+
+impl<R: Read + Seek> Read for BoundedMetadataReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.position >= self.limit || buffer.is_empty() {
+            return Ok(0);
+        }
+        let remaining = (self.limit - self.position).min(buffer.len() as u64) as usize;
+        let bytes_read = self.source.read(&mut buffer[..remaining])?;
+        self.position = self.position.saturating_add(bytes_read as u64);
+        Ok(bytes_read)
+    }
+}
+
+impl<R: Read + Seek> Seek for BoundedMetadataReader<R> {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let target = match from {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(offset) => offset_from(self.position, offset),
+            // The bounded view intentionally presents its scan limit as EOF. This lets the
+            // optional parser skip unrelated media boxes without opening an unbounded scan.
+            SeekFrom::End(offset) => offset_from(self.limit, offset),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "metadata seek underflow"))?;
+        if target > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "embedded metadata scan limit reached",
+            ));
+        }
+        let position = self.source.seek(SeekFrom::Start(target))?;
+        self.position = position;
+        Ok(position)
+    }
+}
+
+fn offset_from(base: u64, offset: i64) -> Option<u64> {
+    if offset >= 0 {
+        base.checked_add(offset as u64)
+    } else {
+        base.checked_sub(offset.unsigned_abs())
+    }
+}
+
+fn exif_ascii(exif: &exif::Exif, tag: Tag) -> Option<String> {
+    let field = exif.get_field(tag, In::PRIMARY)?;
+    let ExifValue::Ascii(values) = &field.value else {
+        return None;
+    };
+    values
+        .first()
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn parse_camera_datetime(
+    raw_datetime: &str,
+    subsecond: Option<&str>,
+    offset: Option<&str>,
+    source: &str,
+    confidence: &str,
+) -> Option<CaptureTimeCandidate> {
+    let raw_datetime = raw_datetime.trim();
+    let parsed = NaiveDateTime::parse_from_str(raw_datetime, "%Y:%m:%d %H:%M:%S").ok()?;
+    // A malformed optional fraction must not discard an otherwise valid camera time. It is
+    // omitted rather than guessed; a malformed primary date still makes this candidate invalid.
+    let fraction = normalized_subsecond(subsecond);
+    let offset = normalized_offset(offset).unwrap_or_else(|| "unknown".into());
+    let local = format!(
+        "{}{}",
+        parsed.format("%Y-%m-%dT%H:%M:%S"),
+        fraction
+            .as_deref()
+            .map(|value| format!(".{value}"))
+            .unwrap_or_default()
+    );
+    let raw = [
+        Some(raw_datetime.to_owned()),
+        fraction.as_deref().map(|value| format!(".{value}")),
+        (offset != "unknown").then(|| offset.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    Some(CaptureTimeCandidate {
+        raw,
+        local,
+        timezone: offset,
+        source: source.into(),
+        confidence: confidence.into(),
+    })
+}
+
+fn normalized_subsecond(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.len() > 9 || !value.as_bytes().iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn normalized_offset(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() != 6
+        || !matches!(bytes[0], b'+' | b'-')
+        || bytes[3] != b':'
+        || !bytes[1..3].iter().all(u8::is_ascii_digit)
+        || !bytes[4..6].iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let hours = std::str::from_utf8(&bytes[1..3]).ok()?.parse::<u8>().ok()?;
+    let minutes = std::str::from_utf8(&bytes[4..6]).ok()?.parse::<u8>().ok()?;
+    (hours <= 23 && minutes <= 59).then(|| value.to_owned())
+}
+
+fn parse_platform_timestamp(
+    raw: &str,
+    source: &str,
+    confidence: &str,
+) -> Option<CaptureTimeCandidate> {
+    let raw = raw.trim();
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .or_else(|_| DateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S %z"))
+        .or_else(|_| DateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f %z"))
+        .ok()?;
+    capture_time_from_offset_datetime(raw, parsed, source, confidence)
+}
+
+fn capture_time_from_offset_datetime(
+    raw: &str,
+    value: DateTime<FixedOffset>,
+    source: &str,
+    confidence: &str,
+) -> Option<CaptureTimeCandidate> {
+    let offset_seconds = value.offset().local_minus_utc();
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let absolute = offset_seconds.unsigned_abs();
+    let timezone = format!("{sign}{:02}:{:02}", absolute / 3_600, (absolute / 60) % 60);
+    let nanos = value.nanosecond();
+    let fraction = (nanos != 0).then(|| format!(".{nanos:09}").trim_end_matches('0').to_owned());
+    Some(CaptureTimeCandidate {
+        raw: raw.into(),
+        local: format!(
+            "{}{}",
+            value.format("%Y-%m-%dT%H:%M:%S"),
+            fraction.unwrap_or_default()
+        ),
+        timezone,
+        source: source.into(),
+        confidence: confidence.into(),
+    })
+}
+
+fn apply_capture_time_candidate(
+    metadata: &mut ExtractedMetadata,
+    candidate: Option<CaptureTimeCandidate>,
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    let existing_priority = capture_time_priority(metadata.capture_time_source.as_deref());
+    let candidate_priority = capture_time_priority(Some(&candidate.source));
+    if candidate_priority < existing_priority {
+        return;
+    }
+    metadata.captured_at_raw = Some(candidate.raw);
+    metadata.captured_at_local = Some(candidate.local);
+    metadata.capture_timezone = Some(candidate.timezone);
+    metadata.capture_time_source = Some(candidate.source);
+    metadata.capture_time_confidence = Some(candidate.confidence);
+}
+
+fn apply_filesystem_capture_time_fallback(metadata: &mut ExtractedMetadata) {
+    if metadata.captured_at_local.is_some() {
+        return;
+    }
+    let candidate = metadata
+        .file_modified_at
+        .as_deref()
+        .and_then(|value| parse_platform_timestamp(value, "filesystem_modified_time", "low"))
+        .or_else(|| {
+            metadata
+                .file_created_at
+                .as_deref()
+                .and_then(|value| parse_platform_timestamp(value, "filesystem_created_time", "low"))
+        });
+    apply_capture_time_candidate(metadata, candidate);
+}
+
 fn apply_sips_metadata(metadata: &mut ExtractedMetadata, values: &BTreeMap<String, String>) {
     metadata.width = value_u32(values, "pixelWidth").or(metadata.width);
     metadata.height = value_u32(values, "pixelHeight").or(metadata.height);
     metadata.orientation = values.get("orientation").cloned();
     metadata.color_space = values.get("profile").cloned();
+    if let Some(creation) = values.get("creation") {
+        apply_capture_time_candidate(
+            metadata,
+            parse_camera_datetime(
+                creation,
+                None,
+                None,
+                "platform_sips_creation_date",
+                "medium",
+            )
+            .or_else(|| {
+                parse_platform_timestamp(creation, "platform_sips_creation_date", "medium")
+            }),
+        );
+    }
 }
 
 fn apply_platform_metadata(metadata: &mut ExtractedMetadata, values: &BTreeMap<String, String>) {
@@ -956,10 +1340,11 @@ fn apply_platform_metadata(metadata: &mut ExtractedMetadata, values: &BTreeMap<S
     metadata.gps_present = Some(
         values.contains_key("kMDItemGPSLatitude") || values.contains_key("kMDItemGPSLongitude"),
     );
-    if let Some(captured) = values.get("kMDItemFSCreationDate") {
-        metadata.captured_at_raw = Some(captured.clone());
-        metadata.captured_at_local = Some(captured.clone());
-        metadata.capture_time_source = Some("platform-file-creation-date".into());
+    if let Some(captured) = values.get("kMDItemContentCreationDate") {
+        apply_capture_time_candidate(
+            metadata,
+            parse_platform_timestamp(captured, "platform_content_creation_date", "medium"),
+        );
     }
 }
 
@@ -1144,7 +1529,7 @@ fn merge_raw(destination: &mut Value, key: &str, values: impl Serialize) {
 mod tests {
     use super::*;
     use std::{
-        io::Write,
+        io::{Cursor, Write},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -1164,6 +1549,216 @@ mod tests {
         assert_eq!(metadata.bit_depth, Some(16));
         assert_eq!(metadata.duration_ms, Some(100));
         assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn embedded_exif_original_preserves_subseconds_known_offset_and_source_bytes() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("synthetic-original.jpg");
+        let original = synthetic_exif_jpeg(SyntheticExifTimes {
+            date_time_original: Some("2025:10:14 15:42:18"),
+            subsec_original: Some("1200"),
+            offset_original: Some("-04:00"),
+            ..Default::default()
+        });
+        fs::write(&source, &original).unwrap();
+
+        let candidates = embedded_capture_time_candidates(&source, &MediaType::Jpeg).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0],
+            CaptureTimeCandidate {
+                raw: "2025:10:14 15:42:18 .1200 -04:00".into(),
+                local: "2025-10-14T15:42:18.1200".into(),
+                timezone: "-04:00".into(),
+                source: "exif_datetime_original".into(),
+                confidence: "high".into(),
+            }
+        );
+
+        let mut metadata = ExtractedMetadata::default();
+        apply_embedded_capture_time(&source, &MediaType::Jpeg, &mut metadata);
+        assert_eq!(
+            metadata.captured_at_local.as_deref(),
+            Some("2025-10-14T15:42:18.1200")
+        );
+        assert_eq!(metadata.capture_timezone.as_deref(), Some("-04:00"));
+        assert_eq!(
+            metadata.capture_time_source.as_deref(),
+            Some("exif_datetime_original")
+        );
+        assert_eq!(metadata.capture_time_confidence.as_deref(), Some("high"));
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn embedded_exif_unknown_offset_remains_local_wall_clock() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("synthetic-unknown-offset.jpg");
+        let original = synthetic_exif_jpeg(SyntheticExifTimes {
+            date_time_original: Some("2025:10:14 15:42:18"),
+            subsec_original: Some("7"),
+            ..Default::default()
+        });
+        fs::write(&source, &original).unwrap();
+
+        let mut metadata = ExtractedMetadata::default();
+        apply_embedded_capture_time(&source, &MediaType::Jpeg, &mut metadata);
+        assert_eq!(
+            metadata.captured_at_local.as_deref(),
+            Some("2025-10-14T15:42:18.7")
+        );
+        assert_eq!(metadata.capture_timezone.as_deref(), Some("unknown"));
+        assert!(!metadata
+            .captured_at_local
+            .as_deref()
+            .unwrap()
+            .ends_with('Z'));
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn embedded_exif_falls_back_from_invalid_original_to_digitized_then_create_date() {
+        let directory = tempdir().unwrap();
+
+        let digitized_source = directory.path().join("synthetic-digitized.jpg");
+        fs::write(
+            &digitized_source,
+            synthetic_exif_jpeg(SyntheticExifTimes {
+                date_time_original: Some("not a camera timestamp"),
+                date_time_digitized: Some("2024:05:06 07:08:09"),
+                offset_digitized: Some("+02:30"),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let mut digitized = ExtractedMetadata::default();
+        apply_embedded_capture_time(&digitized_source, &MediaType::Jpeg, &mut digitized);
+        assert_eq!(
+            digitized.captured_at_local.as_deref(),
+            Some("2024-05-06T07:08:09")
+        );
+        assert_eq!(digitized.capture_timezone.as_deref(), Some("+02:30"));
+        assert_eq!(
+            digitized.capture_time_source.as_deref(),
+            Some("exif_datetime_digitized")
+        );
+
+        let create_date_source = directory.path().join("synthetic-create-date.jpg");
+        fs::write(
+            &create_date_source,
+            synthetic_exif_jpeg(SyntheticExifTimes {
+                date_time: Some("2023:01:02 03:04:05"),
+                subsec: Some("123456789"),
+                offset: Some("+00:00"),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let mut create_date = ExtractedMetadata::default();
+        apply_embedded_capture_time(&create_date_source, &MediaType::Jpeg, &mut create_date);
+        assert_eq!(
+            create_date.captured_at_local.as_deref(),
+            Some("2023-01-02T03:04:05.123456789")
+        );
+        assert_eq!(create_date.capture_timezone.as_deref(), Some("+00:00"));
+        assert_eq!(
+            create_date.capture_time_source.as_deref(),
+            Some("exif_create_date")
+        );
+    }
+
+    #[test]
+    fn invalid_embedded_timestamp_abstains_without_marking_media_corrupt() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("synthetic-invalid-time.jpg");
+        let original = synthetic_exif_jpeg(SyntheticExifTimes {
+            date_time_original: Some("2025:99:99 25:61:61"),
+            subsec_original: Some("not-a-fraction"),
+            offset_original: Some("+99:99"),
+            ..Default::default()
+        });
+        fs::write(&source, &original).unwrap();
+
+        let mut metadata = ExtractedMetadata::default();
+        apply_embedded_capture_time(&source, &MediaType::Jpeg, &mut metadata);
+        assert!(metadata.captured_at_local.is_none());
+        assert!(metadata.capture_time_source.is_none());
+        assert_eq!(
+            metadata.raw["embeddedExifCaptureTime"]["state"],
+            Value::String("unavailable".into())
+        );
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+
+    #[test]
+    fn filesystem_fallbacks_are_explicit_and_low_confidence() {
+        let mut modified = ExtractedMetadata {
+            file_modified_at: Some("2025-10-14T15:42:18.120-04:00".into()),
+            file_created_at: Some("2020-01-02T03:04:05+00:00".into()),
+            ..Default::default()
+        };
+        apply_filesystem_capture_time_fallback(&mut modified);
+        assert_eq!(
+            modified.captured_at_local.as_deref(),
+            Some("2025-10-14T15:42:18.12")
+        );
+        assert_eq!(modified.capture_timezone.as_deref(), Some("-04:00"));
+        assert_eq!(
+            modified.capture_time_source.as_deref(),
+            Some("filesystem_modified_time")
+        );
+        assert_eq!(modified.capture_time_confidence.as_deref(), Some("low"));
+
+        let mut created = ExtractedMetadata {
+            file_modified_at: Some("not-a-timestamp".into()),
+            file_created_at: Some("2020-01-02T03:04:05+00:00".into()),
+            ..Default::default()
+        };
+        apply_filesystem_capture_time_fallback(&mut created);
+        assert_eq!(
+            created.captured_at_local.as_deref(),
+            Some("2020-01-02T03:04:05")
+        );
+        assert_eq!(created.capture_timezone.as_deref(), Some("+00:00"));
+        assert_eq!(
+            created.capture_time_source.as_deref(),
+            Some("filesystem_created_time")
+        );
+        assert_eq!(created.capture_time_confidence.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn mdls_delimiter_parser_keeps_timestamp_colons_in_the_value() {
+        let values = parse_command_key_values(
+            "kMDItemContentCreationDate = 2019-10-30 01:46:24 +0000\n\
+             kMDItemPixelWidth = 5456\n\
+             format: jpeg\n\
+             kMDItemFSCreationDate = (null)\n",
+        );
+        assert_eq!(
+            values.get("kMDItemContentCreationDate").map(String::as_str),
+            Some("2019-10-30 01:46:24 +0000")
+        );
+        assert_eq!(
+            values.get("kMDItemPixelWidth").map(String::as_str),
+            Some("5456")
+        );
+        assert_eq!(values.get("format").map(String::as_str), Some("jpeg"));
+        assert!(!values.contains_key("kMDItemFSCreationDate"));
+    }
+
+    #[test]
+    fn embedded_metadata_reader_is_bounded_and_read_only() {
+        let source = Cursor::new(vec![0_u8; 32]);
+        let mut reader = BoundedMetadataReader::new(source, 8);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(
+            reader.seek(SeekFrom::Start(9)).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
@@ -1426,5 +2021,146 @@ mod tests {
         bytes.extend_from_slice(&data_bytes.to_le_bytes());
         bytes.resize(bytes.len() + data_bytes as usize, 0);
         bytes
+    }
+
+    /// A small, synthetic JPEG with an APP1 Exif payload. It contains no photo pixels and is
+    /// used only to exercise metadata parsing; it must never be replaced with customer media.
+    /// Layout: SOI, APP1 (`Exif\\0\\0`), little-endian TIFF, IFD0 (`DateTime` plus Exif IFD
+    /// pointer), Exif IFD (optional timestamp fields), and trailing ASCII payloads.
+    fn synthetic_exif_jpeg(times: SyntheticExifTimes<'_>) -> Vec<u8> {
+        let mut primary_entries = Vec::new();
+        if let Some(value) = times.date_time {
+            primary_entries.push((0x0132_u16, exif_ascii(value)));
+        }
+
+        let mut exif_entries = Vec::new();
+        push_exif_ascii(&mut exif_entries, 0x9003, times.date_time_original);
+        push_exif_ascii(&mut exif_entries, 0x9004, times.date_time_digitized);
+        push_exif_ascii(&mut exif_entries, 0x9010, times.offset);
+        push_exif_ascii(&mut exif_entries, 0x9011, times.offset_original);
+        push_exif_ascii(&mut exif_entries, 0x9012, times.offset_digitized);
+        push_exif_ascii(&mut exif_entries, 0x9290, times.subsec);
+        push_exif_ascii(&mut exif_entries, 0x9291, times.subsec_original);
+        push_exif_ascii(&mut exif_entries, 0x9292, times.subsec_digitized);
+
+        let ifd0_len = 2 + (primary_entries.len() + 1) * 12 + 4;
+        let exif_ifd_offset = 8 + ifd0_len;
+        let exif_ifd_len = 2 + exif_entries.len() * 12 + 4;
+        let mut next_payload_offset = (exif_ifd_offset + exif_ifd_len) as u32;
+        let primary_entries = attach_payload_offsets(&primary_entries, &mut next_payload_offset);
+        let exif_entries = attach_payload_offsets(&exif_entries, &mut next_payload_offset);
+
+        let mut tiff = Vec::with_capacity(next_payload_offset as usize);
+        tiff.extend_from_slice(b"II");
+        push_u16_le(&mut tiff, 42);
+        push_u32_le(&mut tiff, 8);
+
+        push_u16_le(&mut tiff, (primary_entries.len() + 1) as u16);
+        for entry in &primary_entries {
+            push_ascii_ifd_entry(&mut tiff, entry);
+        }
+        push_u16_le(&mut tiff, 0x8769); // ExifIFDPointer
+        push_u16_le(&mut tiff, 4); // LONG
+        push_u32_le(&mut tiff, 1);
+        push_u32_le(&mut tiff, exif_ifd_offset as u32);
+        push_u32_le(&mut tiff, 0); // no next IFD
+
+        assert_eq!(tiff.len(), exif_ifd_offset);
+        push_u16_le(&mut tiff, exif_entries.len() as u16);
+        for entry in &exif_entries {
+            push_ascii_ifd_entry(&mut tiff, entry);
+        }
+        push_u32_le(&mut tiff, 0); // no next IFD from the Exif child directory
+
+        for entry in primary_entries.iter().chain(&exif_entries) {
+            if entry.value.len() > 4 {
+                tiff.extend_from_slice(&entry.value);
+            }
+        }
+        assert_eq!(tiff.len(), next_payload_offset as usize);
+
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(&tiff);
+        let app1_len = u16::try_from(app1.len() + 2).expect("synthetic APP1 fits JPEG limit");
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1];
+        jpeg.extend_from_slice(&app1_len.to_be_bytes());
+        jpeg.extend_from_slice(&app1);
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+        jpeg
+    }
+
+    #[derive(Default)]
+    struct SyntheticExifTimes<'a> {
+        date_time: Option<&'a str>,
+        date_time_original: Option<&'a str>,
+        date_time_digitized: Option<&'a str>,
+        subsec: Option<&'a str>,
+        subsec_original: Option<&'a str>,
+        subsec_digitized: Option<&'a str>,
+        offset: Option<&'a str>,
+        offset_original: Option<&'a str>,
+        offset_digitized: Option<&'a str>,
+    }
+
+    struct SyntheticExifEntry {
+        tag: u16,
+        value: Vec<u8>,
+        offset: u32,
+    }
+
+    fn push_exif_ascii(entries: &mut Vec<(u16, Vec<u8>)>, tag: u16, value: Option<&str>) {
+        if let Some(value) = value {
+            entries.push((tag, exif_ascii(value)));
+        }
+    }
+
+    fn exif_ascii(value: &str) -> Vec<u8> {
+        assert!(value.is_ascii(), "synthetic Exif fixture must be ASCII");
+        let mut bytes = value.as_bytes().to_vec();
+        bytes.push(0);
+        bytes
+    }
+
+    fn attach_payload_offsets(
+        entries: &[(u16, Vec<u8>)],
+        next_payload_offset: &mut u32,
+    ) -> Vec<SyntheticExifEntry> {
+        entries
+            .iter()
+            .map(|(tag, value)| {
+                let offset = *next_payload_offset;
+                if value.len() > 4 {
+                    *next_payload_offset = next_payload_offset
+                        .checked_add(value.len() as u32)
+                        .expect("synthetic Exif fixture payload fits u32");
+                }
+                SyntheticExifEntry {
+                    tag: *tag,
+                    value: value.clone(),
+                    offset,
+                }
+            })
+            .collect()
+    }
+
+    fn push_ascii_ifd_entry(output: &mut Vec<u8>, entry: &SyntheticExifEntry) {
+        push_u16_le(output, entry.tag);
+        push_u16_le(output, 2); // ASCII
+        push_u32_le(output, entry.value.len() as u32);
+        if entry.value.len() <= 4 {
+            let mut inline = [0_u8; 4];
+            inline[..entry.value.len()].copy_from_slice(&entry.value);
+            output.extend_from_slice(&inline);
+        } else {
+            push_u32_le(output, entry.offset);
+        }
+    }
+
+    fn push_u16_le(output: &mut Vec<u8>, value: u16) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32_le(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_le_bytes());
     }
 }

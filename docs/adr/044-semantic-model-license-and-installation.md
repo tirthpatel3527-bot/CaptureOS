@@ -19,9 +19,11 @@ missing or configured-checksum mismatch. The local runtime itself,
 [`tract`](https://github.com/sonos/tract), is dual MIT/Apache-2.0; that runtime license is not a
 license for model weights.
 
-The provider remains `NOT_INSTALLED` or `PENDING_REFERENCE_VALIDATION` until it validates
-versioned image and text reference vectors from the registered immutable source. This is a
-technical compatibility gate as well as a license/provenance gate.
+The provider remains unavailable until it validates the static manifest, exact fixed RGB24
+reference raster checksum, tokenizer self-test, and versioned image/text reference vectors from
+the registered immutable source. This is a technical compatibility gate as well as a
+license/provenance gate. It does not turn a model-card label or a self-described conversion into
+legal approval for CaptureOS distribution.
 
 ## Consequences
 

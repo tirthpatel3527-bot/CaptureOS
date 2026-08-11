@@ -50,6 +50,8 @@ export interface ProjectIndexSummary {
   supportedMediaCount: number;
   unknownCount: number;
   duplicateFastFingerprintCount: number;
+  /** Active local Moment cards only; reading this count never starts analysis. */
+  momentCount: number;
   lastIndexedFolder: string | null;
   storageVolumeIdentity: string | null;
 }
@@ -111,6 +113,8 @@ export interface VisualMediaQuery {
   lensModel?: string;
   capturedFrom?: string;
   capturedTo?: string;
+  /** Optional active M7 Moment membership scope, validated by the local backend. */
+  momentId?: string;
   limit: number;
   offset: number;
 }
@@ -171,6 +175,20 @@ export interface VisualMediaPage {
 export type CullingMode = "all_photos" | "similar_sets" | "ai_review_queue";
 export type CullingFilter = "all" | "unreviewed" | "keep" | "reject" | "review" | "starred" | "five_star" | "four_plus" | "strong_candidates" | "technical_issues" | "possible_duplicates" | "similar_groups" | "faces" | "blur_review";
 export type CullingDecision = "keep" | "review" | "reject";
+
+/**
+ * A bounded human-review query. `momentId` is an optional project-owned
+ * Moment scope; it never changes culling decisions, Similar Sets, or review
+ * history semantics.
+ */
+export interface CullingWorkspaceQuery {
+  mode: CullingMode;
+  filter: CullingFilter;
+  groupId?: string;
+  momentId?: string;
+  limit: number;
+  offset: number;
+}
 
 export interface CullingDecisionView {
   decision: CullingDecision | null;
@@ -257,6 +275,8 @@ export interface MediaMetadata {
   capturedAtLocal: string | null;
   captureTimezone: string | null;
   captureTimeSource: string | null;
+  /** Qualitative provenance assessment for the resolved local capture time. */
+  captureTimeConfidence: string | null;
   width: number | null;
   height: number | null;
   orientation: string | null;
@@ -424,6 +444,25 @@ export interface MediaPreparationProgress {
   message: string | null;
 }
 
+/**
+ * Progress for a photographer-requested, local-only capture-time metadata refresh.
+ * It reads available copies without changing originals, previews, semantic data, or
+ * human review decisions. A completed refresh does not implicitly rebuild Moments.
+ */
+export interface MetadataRefreshProgress {
+  state: "queued" | "running" | "completed" | "failed" | "interrupted" | string;
+  itemsCompleted: number;
+  itemsTotal: number;
+  errorCount: number;
+  resolvedCaptureTimeCount: number;
+  highConfidenceCaptureTimeCount: number;
+  copyConflictCount: number;
+  currentAssetId: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  message: string | null;
+}
+
 export interface MediaCapability {
   format: string;
   metadata: boolean;
@@ -548,6 +587,8 @@ export interface SemanticModelIdentity {
   provider: string;
   licenseUrl: string | null;
   embeddingDimension: number | null;
+  /** Size of the checksum-validated, closed local pack; never a filesystem path. */
+  installedBytes: number | null;
 }
 
 export interface SemanticModelStatus {
@@ -582,6 +623,175 @@ export interface SemanticIndexProgress {
   lastError: string | null;
 }
 
+/**
+ * Milestone 7 Moment Brain is a local, project-scoped structural timeline.
+ * These projections deliberately contain display evidence instead of source
+ * paths, embedding vectors, numeric semantic scores, or identity claims.
+ */
+export type MomentAnalysisState = "idle" | "queued" | "running" | "paused" | "completed" | "failed" | "interrupted" | string;
+export type MomentBoundaryStrength = "continuous" | "moderate" | "strong" | "unavailable" | string;
+export type MomentLabelSource = "human" | "generic_visual_vocabulary" | "project_checklist" | "none" | string;
+export type MomentLabelStrength = "strong" | "moderate" | "weak" | "unavailable" | string;
+export type CoverageConfirmationState = "unreviewed" | "confirmed_covered" | "needs_review" | "not_covered" | string;
+
+export interface MomentAnalysisProgress {
+  state: MomentAnalysisState;
+  active: boolean;
+  paused: boolean;
+  stage: string;
+  /** Existing local scheduler mode for an explicitly requested Moment analysis. */
+  resourceMode: SemanticResourceMode | string;
+  completed: number;
+  total: number;
+  errorCount: number;
+  timelineReady: boolean;
+  momentCount: number;
+  ungroupedAssetCount: number;
+  lastError: string | null;
+  message: string | null;
+}
+
+/** A qualitative, evidence-grounded boundary explanation; never a probability. */
+export interface MomentBoundaryEvidenceView {
+  strength: MomentBoundaryStrength;
+  summary: string;
+  signals: string[];
+}
+
+/**
+ * `displayLabel` is selected in this order: human label, supported local
+ * suggestion, then "Untitled Moment". The underlying AI suggestion remains
+ * available for developer details after a human rename.
+ */
+export interface MomentLabelView {
+  displayLabel: string;
+  aiSuggestedLabel: string | null;
+  humanLabel: string | null;
+  source: MomentLabelSource;
+  strength: MomentLabelStrength;
+  evidence: string[];
+}
+
+export interface MomentRepresentativeView {
+  assetId: string;
+  filename: string;
+  thumbnailPreviewUrl: string | null;
+  /** An AI suggestion is a starting point only; a human choice is authoritative. */
+  source: "ai_suggested" | "human" | string;
+  evidence: string[];
+}
+
+export interface MomentSummaryView {
+  id: string;
+  ordinal: number;
+  label: MomentLabelView;
+  capturedFrom: string | null;
+  capturedTo: string | null;
+  captureTimeState: "observed" | "partially_observed" | "unavailable" | string;
+  assetCount: number;
+  /** Project-local factual review context. These counters never change any decision or set. */
+  similarSetCount: number;
+  keepCount: number;
+  rejectCount: number;
+  reviewCount: number;
+  unreviewedCount: number;
+  starredCount: number;
+  technicalIssueCount: number;
+  representative: MomentRepresentativeView | null;
+  boundaryBefore: MomentBoundaryEvidenceView | null;
+  /** True when a human split or merge constraint shaped this materialized Moment. */
+  hasHumanStructureOverride: boolean;
+}
+
+export interface MomentClockDiagnosticView {
+  cameraLabel: string;
+  summary: string;
+  state: "possible_offset" | "unavailable" | string;
+}
+
+/** A factual interval with no locally recorded capture activity; never a missing-coverage claim. */
+export interface MomentTimelineGapView {
+  startedAt: string;
+  endedAt: string;
+  durationSeconds: number;
+  explanation: string;
+}
+
+export interface MomentTimelineRequest {
+  limit: number;
+  offset: number;
+}
+
+export interface MomentTimelineView {
+  progress: MomentAnalysisProgress | null;
+  moments: MomentSummaryView[];
+  hasMore: boolean;
+  totalMoments: number;
+  ungroupedAssetCount: number;
+  timelineGaps: MomentTimelineGapView[];
+  clockDiagnostics: MomentClockDiagnosticView[];
+}
+
+/** Bounded semantic retrieval of current-project Moment cards only. */
+export interface MomentSearchRequest {
+  query: string;
+  limit: number;
+}
+
+/**
+ * No vectors, numeric similarity scores, paths, or object/identity claims leave the backend.
+ * Results are local retrieval rankings of compatible durable Moment centroids only.
+ */
+export interface MomentSearchResponse {
+  query: string;
+  results: MomentSummaryView[];
+  hasMore: boolean;
+  totalResults: number;
+  semanticAvailable: boolean;
+  semanticApplied: boolean;
+  semanticUnavailableReason: string | null;
+  identitySearchBlocked: boolean;
+  message: string | null;
+}
+
+export interface MomentDetailRequest {
+  momentId: string;
+  limit: number;
+  offset: number;
+}
+
+export interface MomentDetailView {
+  moment: MomentSummaryView;
+  boundaryEvidence: MomentBoundaryEvidenceView[];
+}
+
+export interface CoverageChecklistItemView {
+  id: string;
+  phrase: string;
+  state: CoverageConfirmationState;
+  confirmedMomentId: string | null;
+  confirmedAssetId: string | null;
+  updatedAt: string | null;
+}
+
+export interface MomentChecklistView {
+  id: string;
+  name: string;
+  items: CoverageChecklistItemView[];
+}
+
+export interface CreateCoverageChecklistItemInput {
+  checklistId?: string;
+  phrase: string;
+}
+
+export interface UpdateCoverageConfirmationInput {
+  checklistItemId: string;
+  state: CoverageConfirmationState;
+  momentId?: string;
+  assetId?: string;
+}
+
 export type MagicSearchSort = "relevance" | "captureTime" | "technicalQuality" | "rating";
 
 export interface MagicSearchRequest {
@@ -590,15 +800,19 @@ export interface MagicSearchRequest {
   descending: boolean;
   limit: number;
   offset: number;
+  /** Optional project-owned Moment scope. The backend must validate ownership. */
+  momentId?: string;
 }
 
 /**
- * User-facing evidence only. A semantic score is intentionally not exposed as
- * an object, identity, or localized detection claim.
+ * User-facing evidence only. `semanticScore` is a local similarity ranking
+ * signal, not confidence or an object, identity, or localized detection claim.
  */
 export interface MagicSearchResult {
   item: VisualMediaRow;
   scoreLabel: "High" | "Medium" | "Low" | string | null;
+  /** Null when the result was produced only by deterministic filters. */
+  semanticScore: number | null;
   explanation: string;
   matchedEvidence: string[];
 }
@@ -611,9 +825,13 @@ export interface MagicSearchResponse {
   query: string;
   results: MagicSearchResult[];
   hasMore: boolean;
+  /** Count in the backend's current bounded result set; vectors and paths never leave the backend. */
+  totalResults: number;
   semanticAvailable: boolean;
   semanticApplied: boolean;
   semanticUnavailableReason: string | null;
+  /** True when the request asked for person identity recognition, which M6 does not provide. */
+  identitySearchBlocked: boolean;
   parsedFilters: MagicSearchParsedFilters;
   message: string | null;
 }

@@ -21,6 +21,6 @@ search. Face count is permissible only as existing anonymous deterministic evide
 
 Semantic functionality remains usable offline once a local model pack and compatible embeddings
 exist. A source volume being offline does not make a cached embedding leave the device or cease to
-be searchable. Users can rebuild/delete derived semantic cache/index data through CaptureOS
-controls without changing original media, catalog/project identity, Capture Intelligence history,
-or photographer decisions.
+be searchable. The local index can be rebuilt through the Magic Search indexing control without
+changing original media, catalog/project identity, Capture Intelligence history, or photographer
+decisions. Milestone 6 does not expose a clear-index/delete-derived-data control.

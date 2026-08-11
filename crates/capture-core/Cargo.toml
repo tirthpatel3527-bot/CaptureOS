@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
 capture-graph = { path = "../capture-graph" }
 capture-intelligence = { path = "../capture-intelligence" }
 chrono.workspace = true
@@ -13,6 +14,7 @@ media-model = { path = "../media-model" }
 media-index = { path = "../media-index" }
 media-visual = { path = "../media-visual" }
 magic-search = { path = "../magic-search" }
+moment-brain = { path = "../moment-brain" }
 persistence = { path = "../persistence" }
 serde.workspace = true
 serde_json.workspace = true
@@ -21,4 +23,5 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+magic-search = { path = "../magic-search", features = ["test-support"] }
 tempfile.workspace = true

@@ -1,0 +1,38 @@
+{
+  "fixtureVersion": "captureos-moment-timeline.synthetic.v1",
+  "kind": "deterministic-generated-timeline-manifest",
+  "contains": [
+    "numeric timestamp or explicit missing timestamp",
+    "synthetic structural segment identifier",
+    "generated 768-dimensional numeric semantic-style signature",
+    "synthetic camera/lens/orientation/anonymous-face-count categories"
+  ],
+  "doesNotContain": [
+    "customer media",
+    "private AI Test media",
+    "original paths",
+    "model weights",
+    "identity or demographic labels",
+    "event or wedding-stage labels",
+    "network resource"
+  ],
+  "intentionalCases": [
+    {
+      "id": "sequence-a",
+      "meaning": "small capture gaps with one continuing synthetic visual signature; no structural boundary"
+    },
+    {
+      "id": "sequence-b",
+      "meaning": "large synthetic visual transition; structural boundary"
+    },
+    {
+      "id": "sequence-c",
+      "meaning": "camera/lens/orientation transition with continuing synthetic signature; supporting evidence only"
+    },
+    {
+      "id": "sequence-d",
+      "meaning": "large capture gap with repeated synthetic signature; the combined strategy must not treat a single signal as universal truth"
+    }
+  ],
+  "groundTruthMeaning": "Synthetic structural segment changes only; not a claim of real-world event truth or semantic label accuracy."
+}

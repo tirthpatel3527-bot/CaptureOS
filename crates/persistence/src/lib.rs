@@ -1,13 +1,17 @@
 //! SQLite catalog persistence. SQL stays behind this repository boundary.
 
 use capture_graph::{EntityRef, Relationship, RelationshipKind};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use media_model::*;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 use thiserror::Error;
+use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 13;
+// This is a query-page size, never a catalog/result limit. Moment semantic search continues
+// until its cursor is exhausted so it cannot silently omit a large project's later Moments.
+const MOMENT_SEARCH_ROW_PAGE_SIZE: u32 = 256;
 
 #[derive(Debug, Error)]
 pub enum PersistenceError {
@@ -66,6 +70,8 @@ pub struct ProjectIndexSummary {
     pub supported_media_count: u64,
     pub unknown_count: u64,
     pub duplicate_fast_fingerprint_count: u64,
+    /// Active, project-scoped M7 structural cards only. Reading this count never starts analysis.
+    pub moment_count: u64,
     pub last_indexed_folder: Option<String>,
     pub storage_volume_identity: Option<String>,
 }
@@ -221,6 +227,9 @@ pub struct VisualMediaQuery {
     pub lens_model: Option<String>,
     pub captured_from: Option<String>,
     pub captured_to: Option<String>,
+    /// An M7 membership scope. It is validated against the selected project server-side; the
+    /// renderer never supplies an arbitrary asset-ID list as a substitute for membership.
+    pub moment_id: Option<String>,
     pub limit: u32,
     pub offset: u32,
 }
@@ -236,6 +245,7 @@ impl Default for VisualMediaQuery {
             lens_model: None,
             captured_from: None,
             captured_to: None,
+            moment_id: None,
             limit: 120,
             offset: 0,
         }
@@ -421,6 +431,8 @@ pub struct CullingQuery {
     pub mode: String,
     pub filter: String,
     pub group_id: Option<String>,
+    /// Optional M7 structural scope. It remains a normal MediaAsset decision workflow.
+    pub moment_id: Option<String>,
     pub limit: u32,
     pub offset: u32,
 }
@@ -431,6 +443,7 @@ impl Default for CullingQuery {
             mode: "all_photos".into(),
             filter: "all".into(),
             group_id: None,
+            moment_id: None,
             limit: 60,
             offset: 0,
         }
@@ -640,6 +653,7 @@ pub struct SemanticInputCandidate {
     pub project_id: String,
     pub file_instance_id: String,
     pub filename: String,
+    pub media_type: String,
     pub input_fingerprint: String,
     pub preview_relative_path: Option<String>,
     pub preview_status: String,
@@ -676,9 +690,304 @@ pub struct SemanticSearchCandidate {
     pub decision: Option<String>,
     pub sharpness_band: Option<String>,
     pub blur_level: Option<String>,
+    pub technical_quality_band: Option<String>,
     pub technical_quality_score: Option<f64>,
     pub camera_model: Option<String>,
     pub captured_at: Option<String>,
+}
+
+/// A compact, project-owned row for local Moment Brain analysis. It deliberately contains only
+/// durable catalog/analysis evidence; neither original paths nor previews are exposed here.
+/// `face_count: None` means the existing anonymous-face evidence is unavailable, not zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MomentAnalysisInput {
+    pub asset_id: String,
+    pub captured_at: Option<String>,
+    pub capture_time_source: Option<String>,
+    pub camera_model: Option<String>,
+    pub lens_model: Option<String>,
+    pub orientation: Option<String>,
+    pub face_count: Option<u64>,
+    pub technical_quality_band: Option<String>,
+    pub technical_quality_score: Option<f64>,
+    pub rating: u8,
+    pub starred: bool,
+    pub decision: Option<String>,
+    pub similar_set_ids: Vec<String>,
+    pub embedding: Option<Vec<f32>>,
+}
+
+/// A bounded, project-scoped handoff for an append-only Moment Brain update.
+///
+/// It contains complete memberships from only the two latest active structural Moments plus
+/// media that is not currently an active member (including durable `ungrouped` rows). It never
+/// materializes the rest of the catalog or its semantic vectors. A caller must request a full
+/// rebuild when this is absent or when a new input is chronologically out of order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MomentIncrementalAnalysisWindow {
+    pub timeline_id: String,
+    pub active_run_id: String,
+    pub active_semantic_model_key: Option<String>,
+    /// Latest known timestamp in the active membership projection, if one exists.
+    pub previous_latest_captured_at: Option<String>,
+    /// One greater than the current maximum active membership ordinal.
+    pub global_ordinal_base: u64,
+    /// Earliest active membership ordinal represented by `preceding_context`.
+    pub affected_tail_start_ordinal: u64,
+    /// One greater than the maximum active Moment-record ordinal preserved before the tail.
+    /// Core offsets new tail Moment/segment ordinals from this value to avoid UI ordering
+    /// collisions with the earlier active projection.
+    pub moment_ordinal_base: u64,
+    /// Whole members of the latest two active Moments, never a partial Moment.
+    pub preceding_context: Vec<MomentAnalysisInput>,
+    /// Active `ungrouped` and newly catalogued still photos that are not active Moment members.
+    pub pending_inputs: Vec<MomentAnalysisInput>,
+}
+
+/// Stored output from one local, versioned structural-analysis run. This is intentionally a
+/// data record rather than a UI view: raw centroids and score components never cross the desktop
+/// boundary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MomentRecord {
+    pub id: String,
+    pub project_id: String,
+    pub timeline_id: String,
+    pub run_id: String,
+    pub segment_id: String,
+    pub anchor_asset_id: String,
+    pub ordinal: u64,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub asset_count: u64,
+    pub ai_representative_asset_id: Option<String>,
+    pub centroid: Option<Vec<f32>>,
+    pub centroid_dimensions: Option<usize>,
+    pub suggested_label: Option<String>,
+    pub label_confidence: Option<f64>,
+    pub label_evidence: serde_json::Value,
+    pub label_state: String,
+    pub created_at: String,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MomentMembershipRecord {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub moment_id: Option<String>,
+    pub media_asset_id: String,
+    pub ordinal: u64,
+    /// `member` or the explicit `ungrouped` state. An unavailable timestamp/evidence never
+    /// becomes a fabricated membership.
+    pub membership_state: String,
+    pub created_at: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MomentBoundaryEvidenceRecord {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub left_asset_id: String,
+    pub right_asset_id: String,
+    pub ordinal: u64,
+    pub category: String,
+    pub components: serde_json::Value,
+    pub explanation: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentTimelineStatusRecord {
+    pub timeline_id: String,
+    pub project_id: String,
+    pub state: String,
+    pub analyzer_id: String,
+    pub analyzer_version: String,
+    pub boundary_algorithm_version: String,
+    pub semantic_model_key: Option<String>,
+    pub input_catalog_version: String,
+    pub active_run_id: Option<String>,
+    pub moment_count: u64,
+    pub eligible_count: u64,
+    pub ungrouped_count: u64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentTimelineRow {
+    pub id: String,
+    pub ordinal: u64,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub asset_count: u64,
+    pub ai_representative_asset_id: Option<String>,
+    pub human_representative_asset_id: Option<String>,
+    pub suggested_label: Option<String>,
+    pub human_label: Option<String>,
+    pub display_label: String,
+    pub label_state: String,
+    pub similar_set_count: u64,
+    pub keep_count: u64,
+    pub reject_count: u64,
+    pub review_count: u64,
+    pub unreviewed_count: u64,
+    pub starred_count: u64,
+    pub technical_issue_count: u64,
+    pub boundary_category: Option<String>,
+    pub boundary_explanation: Option<String>,
+    pub human_override_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineGapView {
+    pub started_at: String,
+    pub ended_at: String,
+    pub duration_seconds: u64,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentTimelinePage {
+    pub timeline: Option<MomentTimelineStatusRecord>,
+    pub moments: Vec<MomentTimelineRow>,
+    pub gaps: Vec<TimelineGapView>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentDetailRecord {
+    pub moment: MomentTimelineRow,
+    pub label_evidence: Vec<String>,
+    pub membership_count: u64,
+    pub has_human_label: bool,
+    pub has_human_representative: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageChecklistItemView {
+    pub id: String,
+    pub text: String,
+    pub created_at: String,
+    pub confirmation_state: Option<String>,
+    pub confirmed_at: Option<String>,
+    pub moment_id: Option<String>,
+    pub media_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverageChecklistItemRecord {
+    pub id: String,
+    pub project_id: String,
+    pub text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MomentAnalysisRunRecord {
+    pub id: String,
+    pub timeline_id: String,
+    pub project_id: String,
+    pub state: String,
+    pub analyzer_id: String,
+    pub analyzer_version: String,
+    pub boundary_algorithm_version: String,
+    pub semantic_model_key: Option<String>,
+    pub input_catalog_version: String,
+    pub items_total: u64,
+    pub items_completed: u64,
+    pub error_count: u64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Advisory, local-only evidence that two actual camera clock streams may be offset. A missing
+/// `possible_offset_seconds` is deliberately distinct from an offset of zero: callers must not
+/// turn an absent or inconclusive diagnostic into a claim that no offset exists.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraClockOffsetDiagnosticRecord {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub camera_a: String,
+    pub camera_b: String,
+    pub possible_offset_seconds: Option<i64>,
+    pub evidence_json: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineSegmentRecord {
+    pub id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub ordinal: u64,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub asset_count: u64,
+    pub boundary_category: Option<String>,
+    pub boundary_evidence: serde_json::Value,
+    pub created_at: String,
+    pub stale: bool,
+}
+
+/// A human structural constraint anchored to adjacent actual assets, never a fragile display
+/// ordinal. `split` forces a boundary; `merge` prevents one when both assets remain eligible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MomentOverrideOperation {
+    pub id: String,
+    pub project_id: String,
+    pub operation: String,
+    pub left_asset_id: String,
+    pub right_asset_id: String,
+    pub created_at: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MomentSearchCandidate {
+    pub moment_id: String,
+    pub centroid: Vec<f32>,
+    pub row: MomentTimelineRow,
+}
+
+/// Bounded, project-scoped deterministic predicates used by Magic Search when an image/text
+/// model is unavailable or when a hybrid query needs metadata evidence. This deliberately
+/// contains no embedding vector, filesystem path, or human-decision mutation capability.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticMetadataQuery {
+    pub face_count: Option<u64>,
+    pub rating_exact: Option<u8>,
+    pub rating_minimum: Option<u8>,
+    pub decision: Option<String>,
+    pub require_sharp: bool,
+    pub require_blurry: bool,
+    pub require_technical_issue: bool,
+    pub camera_model: Option<String>,
+    /// Optional active M7 Moment membership scope. This is an internal, project-validated
+    /// predicate and never accepts caller-provided MediaAsset collections.
+    pub moment_id: Option<String>,
+    pub sort: SemanticMetadataSort,
+    pub descending: bool,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SemanticMetadataSort {
+    #[default]
+    CaptureTime,
+    TechnicalQuality,
+    Rating,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -737,6 +1046,7 @@ pub struct MediaMetadataRecord {
     pub captured_at_local: Option<String>,
     pub capture_timezone: Option<String>,
     pub capture_time_source: Option<String>,
+    pub capture_time_confidence: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub orientation: Option<String>,
@@ -765,6 +1075,27 @@ pub struct MediaMetadataRecord {
     pub bit_depth: Option<u32>,
     pub channels: Option<u32>,
     pub raw_metadata: serde_json::Value,
+}
+
+/// One read-only metadata observation from a specific physical copy. The logical
+/// `media_metadata` row holds the deterministic resolved value; these rows preserve the
+/// per-copy evidence needed to diagnose a disagreement without treating filesystem times as
+/// equivalent to camera capture metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureTimeObservationRecord {
+    pub media_asset_id: String,
+    pub source_file_instance_id: String,
+    pub source_fingerprint: String,
+    pub extractor: String,
+    pub extractor_version: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub extracted_at: String,
+    pub captured_at_raw: Option<String>,
+    pub captured_at_local: Option<String>,
+    pub capture_timezone: Option<String>,
+    pub capture_time_source: Option<String>,
+    pub capture_time_confidence: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -907,6 +1238,20 @@ pub trait CatalogRepository {
         &self,
         asset_id: &str,
     ) -> Result<Vec<MediaPreparationCandidate>>;
+    /// Returns whole logical assets in a stable bounded batch, with every currently available
+    /// physical copy for each selected asset. It is used only by the explicit metadata refresh
+    /// worker, never by frontend pagination.
+    fn capture_time_refresh_candidates(
+        &self,
+        project_id: &ProjectId,
+        after_asset_id: Option<&str>,
+        asset_limit: u32,
+    ) -> Result<Vec<MediaPreparationCandidate>>;
+    fn capture_time_refresh_asset_count(&self, project_id: &ProjectId) -> Result<u64>;
+    fn upsert_capture_time_observation(
+        &self,
+        observation: &CaptureTimeObservationRecord,
+    ) -> Result<()>;
     fn upsert_media_metadata(&self, metadata: &MediaMetadataRecord) -> Result<()>;
     fn upsert_preview_artifact(&self, artifact: &PreviewArtifactRecord) -> Result<()>;
     fn clear_preview_artifacts(&self, project_id: &ProjectId) -> Result<()>;
@@ -1037,6 +1382,13 @@ pub trait CatalogRepository {
         model: &SemanticModelConfig,
     ) -> Result<Vec<SemanticInputCandidate>>;
     fn upsert_semantic_embedding(&self, embedding: &SemanticEmbeddingRecord) -> Result<()>;
+    /// A model, preprocessing, or metric replacement never erases prior local evidence. It
+    /// marks it stale so the active index cannot silently compare incompatible vectors.
+    fn mark_other_semantic_embeddings_stale(
+        &self,
+        project_id: &ProjectId,
+        model: &SemanticModelConfig,
+    ) -> Result<u64>;
     fn semantic_embeddings_for_index(
         &self,
         project_id: &ProjectId,
@@ -1051,8 +1403,7 @@ pub trait CatalogRepository {
     fn semantic_metadata_candidates(
         &self,
         project_id: &ProjectId,
-        limit: u32,
-        offset: u32,
+        query: &SemanticMetadataQuery,
     ) -> Result<Vec<SemanticSearchCandidate>>;
     fn upsert_semantic_index_version(&self, version: &SemanticIndexVersion) -> Result<()>;
     fn active_semantic_index_version(
@@ -1078,16 +1429,140 @@ pub trait CatalogRepository {
         limit: u32,
     ) -> Result<Vec<MagicSearchHistoryEntry>>;
     fn clear_magic_search_history(&self, project_id: &ProjectId) -> Result<u64>;
-    fn latest_semantic_indexing_job(
-        &self,
-        project_id: &ProjectId,
-    ) -> Result<Option<BackgroundJob>>;
+    fn latest_semantic_indexing_job(&self, project_id: &ProjectId)
+        -> Result<Option<BackgroundJob>>;
     fn semantic_index_terminal_counts(
         &self,
         project_id: &ProjectId,
         model: &SemanticModelConfig,
     ) -> Result<SemanticIndexTerminalCounts>;
     fn recover_interrupted_semantic_indexing(&self) -> Result<u64>;
+    /// Reads only local, durable still-photo evidence for Moment Brain. A model tuple filters
+    /// incompatible M6 vectors rather than ever mixing semantic spaces.
+    fn moment_analysis_inputs(
+        &self,
+        project_id: &ProjectId,
+        model: Option<&SemanticModelConfig>,
+    ) -> Result<Vec<MomentAnalysisInput>>;
+    /// Returns a small append-only handoff when a project has an active Moment timeline. This
+    /// does not replace active rows; core must preserve/reapply human overrides around any later
+    /// projection write. `None` deliberately asks the caller to use a first/full analysis.
+    fn moment_incremental_analysis_window(
+        &self,
+        project_id: &ProjectId,
+        model: Option<&SemanticModelConfig>,
+    ) -> Result<Option<MomentIncrementalAnalysisWindow>>;
+    fn active_moment_override_operations(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<MomentOverrideOperation>>;
+    /// Replaces only the active AI-derived projection. Historical runs, human events, labels,
+    /// representatives, and override operations remain durable and untouched.
+    fn replace_active_moment_analysis(
+        &self,
+        timeline: &MomentTimelineStatusRecord,
+        run: &MomentAnalysisRunRecord,
+        segments: &[TimelineSegmentRecord],
+        moments: &[MomentRecord],
+        memberships: &[MomentMembershipRecord],
+        boundaries: &[MomentBoundaryEvidenceRecord],
+    ) -> Result<()>;
+    /// Replaces a structurally whole active tail only. Earlier active records/memberships remain
+    /// visible, while tail history is marked stale/inactive. The caller must use the bounded
+    /// window's `affected_tail_start_ordinal` and preserve human constraints in the replacement.
+    // The replacement is intentionally kept as distinct durable projections so callers cannot
+    // accidentally combine a tail write with an unrelated full projection.
+    #[allow(clippy::too_many_arguments)]
+    fn replace_active_moment_analysis_tail(
+        &self,
+        timeline: &MomentTimelineStatusRecord,
+        run: &MomentAnalysisRunRecord,
+        affected_tail_start_ordinal: u64,
+        segments: &[TimelineSegmentRecord],
+        moments: &[MomentRecord],
+        memberships: &[MomentMembershipRecord],
+        boundaries: &[MomentBoundaryEvidenceRecord],
+    ) -> Result<()>;
+    fn moment_timeline_status(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<MomentTimelineStatusRecord>>;
+    fn moment_timeline_page(
+        &self,
+        project_id: &ProjectId,
+        limit: u32,
+        offset: u32,
+    ) -> Result<MomentTimelinePage>;
+    fn moment_detail(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+    ) -> Result<Option<MomentDetailRecord>>;
+    fn moment_belongs_to_project(&self, project_id: &ProjectId, moment_id: &str) -> Result<bool>;
+    fn moment_contains_asset(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+        asset_id: &str,
+    ) -> Result<bool>;
+    fn filter_active_moment_assets(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+        asset_ids: &[String],
+    ) -> Result<Vec<String>>;
+    fn rename_moment(&self, project_id: &ProjectId, moment_id: &str, label: &str) -> Result<()>;
+    fn set_moment_human_representative(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+        asset_id: &str,
+    ) -> Result<()>;
+    fn merge_adjacent_moments(
+        &self,
+        project_id: &ProjectId,
+        left_moment_id: &str,
+        right_moment_id: &str,
+    ) -> Result<()>;
+    fn split_moment(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+        after_asset_id: &str,
+    ) -> Result<()>;
+    fn coverage_checklist_items(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<CoverageChecklistItemView>>;
+    fn create_coverage_checklist_item(&self, item: &CoverageChecklistItemRecord) -> Result<()>;
+    fn update_coverage_confirmation(
+        &self,
+        project_id: &ProjectId,
+        checklist_item_id: &str,
+        state: &str,
+        moment_id: Option<&str>,
+        media_asset_id: Option<&str>,
+    ) -> Result<()>;
+    /// Appends advisory local clock evidence for one completed Moment-analysis run. This never
+    /// writes capture timestamps or attempts a clock correction.
+    fn record_camera_clock_offset_diagnostics(
+        &self,
+        diagnostics: &[CameraClockOffsetDiagnosticRecord],
+    ) -> Result<()>;
+    /// Reads diagnostics attached to the project's current active Moment-analysis run. An empty
+    /// result means no current diagnostic is available; it must never be presented as evidence
+    /// that all camera clocks are aligned.
+    fn latest_camera_clock_offset_diagnostics(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<CameraClockOffsetDiagnosticRecord>>;
+    fn moment_search_candidates(
+        &self,
+        project_id: &ProjectId,
+        model: &SemanticModelConfig,
+    ) -> Result<Vec<MomentSearchCandidate>>;
+    fn latest_moment_analysis_job(&self, project_id: &ProjectId) -> Result<Option<BackgroundJob>>;
+    fn recover_interrupted_moment_analysis(&self) -> Result<u64>;
     fn project_index_summary(&self, project_id: &ProjectId) -> Result<ProjectIndexSummary>;
     fn project_library(&self) -> Result<Vec<ProjectLibraryItem>>;
     fn insert_ingest_job(&self, job: &IngestJob) -> Result<()>;
@@ -1194,6 +1669,16 @@ impl SqliteRepository {
             self.connection.execute_batch(MIGRATION_011)?;
             self.connection
                 .pragma_update(None, "user_version", 11_i64)?;
+        }
+        if version < 12 {
+            self.connection.execute_batch(MIGRATION_012)?;
+            self.connection
+                .pragma_update(None, "user_version", 12_i64)?;
+        }
+        if version < 13 {
+            self.connection.execute_batch(MIGRATION_013)?;
+            self.connection
+                .pragma_update(None, "user_version", 13_i64)?;
         }
         Ok(())
     }
@@ -1437,6 +1922,107 @@ impl SqliteRepository {
         Ok(changed as u64)
     }
 
+    /// Fetches a deliberately bounded set of locally durable Moment Brain inputs. `predicate`
+    /// and `order_by` are private, fixed SQL fragments assembled below; customer text and IDs
+    /// remain bound values in `extra_parameters` and are never interpolated into SQL.
+    fn moment_analysis_inputs_for_predicate(
+        &self,
+        project_id: &ProjectId,
+        model: Option<&SemanticModelConfig>,
+        predicate: &str,
+        mut extra_parameters: Vec<rusqlite::types::Value>,
+        order_by: &str,
+    ) -> Result<Vec<MomentAnalysisInput>> {
+        let select_vector = if model.is_some() {
+            "stored.embedding_blob, stored.dimensions"
+        } else {
+            "NULL AS embedding_blob, NULL AS dimensions"
+        };
+        let join_vector = if model.is_some() {
+            "LEFT JOIN semantic_embeddings stored ON stored.media_asset_id = a.id AND stored.project_id = a.project_id AND stored.stale = 0 AND stored.status = 'ready' AND stored.model_id = ?2 AND stored.provider = ?3 AND stored.model_version = ?4 AND stored.embedding_version = ?5 AND stored.preprocessing_version = ?6 AND stored.metric = ?7 AND stored.dimensions = ?8"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT a.id,
+                COALESCE(metadata.captured_at_local, a.captured_at), metadata.capture_time_source,
+                metadata.camera_model, metadata.lens_model, metadata.orientation,
+                CASE WHEN EXISTS (SELECT 1 FROM analysis_artifacts face_artifact WHERE face_artifact.media_asset_id = a.id AND face_artifact.artifact_type = 'face_detection' AND face_artifact.stale = 0 AND face_artifact.status = 'ready') THEN (SELECT COUNT(*) FROM face_analyses face WHERE face.media_asset_id = a.id AND face.input_fingerprint = (SELECT face_artifact.input_fingerprint FROM analysis_artifacts face_artifact WHERE face_artifact.media_asset_id = a.id AND face_artifact.artifact_type = 'face_detection' AND face_artifact.stale = 0 AND face_artifact.status = 'ready' ORDER BY face_artifact.generated_at DESC, face_artifact.id DESC LIMIT 1)) ELSE NULL END,
+                (SELECT quality.technical_quality_band FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
+                (SELECT quality.technical_quality_score FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
+                COALESCE(decision.rating, 0), COALESCE(decision.starred, 0), decision.decision,
+                COALESCE((SELECT group_concat(g.id, char(31)) FROM similarity_groups g JOIN similarity_group_members gm ON gm.group_id = g.id WHERE gm.media_asset_id = a.id AND g.project_id = a.project_id AND g.stale = 0), ''),
+                {select_vector}
+             FROM media_assets a
+             LEFT JOIN media_metadata metadata ON metadata.media_asset_id = a.id
+             LEFT JOIN media_decisions decision ON decision.media_asset_id = a.id AND decision.project_id = a.project_id
+             {join_vector}
+             WHERE a.project_id = ?1 AND a.media_type IN ('raw_photo', 'jpeg', 'heif', 'png', 'tiff') {predicate}
+             ORDER BY {order_by}"
+        );
+        let mut bound = vec![rusqlite::types::Value::from(project_id.to_string())];
+        if let Some(model) = model {
+            bound.extend([
+                model.model_id.clone().into(),
+                model.provider.clone().into(),
+                model.model_version.clone().into(),
+                model.embedding_version.clone().into(),
+                model.preprocessing_version.clone().into(),
+                model.metric.clone().into(),
+                (model.dimensions as i64).into(),
+            ]);
+        }
+        bound.append(&mut extra_parameters);
+        self.read_moment_analysis_inputs(&sql, bound)
+    }
+
+    fn read_moment_analysis_inputs(
+        &self,
+        sql: &str,
+        bound: Vec<rusqlite::types::Value>,
+    ) -> Result<Vec<MomentAnalysisInput>> {
+        let mut statement = self.connection.prepare(sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(bound), |row| {
+            let dimensions = row.get::<_, Option<i64>>(14)?;
+            let embedding = match (row.get::<_, Option<Vec<u8>>>(13)?, dimensions) {
+                (Some(blob), Some(dimensions)) => {
+                    Some(decode_semantic_vector(&blob, dimensions as usize).map_err(to_sql_error)?)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        13,
+                        "embedding_blob".into(),
+                        rusqlite::types::Type::Blob,
+                    ))
+                }
+            };
+            let groups = row.get::<_, String>(12)?;
+            Ok(MomentAnalysisInput {
+                asset_id: row.get(0)?,
+                captured_at: row.get(1)?,
+                capture_time_source: row.get(2)?,
+                camera_model: row.get(3)?,
+                lens_model: row.get(4)?,
+                orientation: row.get(5)?,
+                face_count: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+                technical_quality_band: row.get(7)?,
+                technical_quality_score: row.get(8)?,
+                rating: row.get::<_, i64>(9)? as u8,
+                starred: row.get(10)?,
+                decision: row.get(11)?,
+                similar_set_ids: if groups.is_empty() {
+                    Vec::new()
+                } else {
+                    groups.split('\u{1f}').map(str::to_owned).collect()
+                },
+                embedding,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     fn count(&self, table: &str) -> Result<u64> {
         // Only literal internal table names are used by `counts`; never accept UI input here.
         self.connection
@@ -1445,6 +2031,173 @@ impl SqliteRepository {
             })
             .map_err(Into::into)
     }
+}
+
+fn validate_moment_tail_payload(
+    timeline: &MomentTimelineStatusRecord,
+    run: &MomentAnalysisRunRecord,
+    affected_tail_start_ordinal: u64,
+    segments: &[TimelineSegmentRecord],
+    moments: &[MomentRecord],
+    memberships: &[MomentMembershipRecord],
+    boundaries: &[MomentBoundaryEvidenceRecord],
+) -> Result<BTreeSet<String>> {
+    if timeline.project_id != run.project_id || timeline.timeline_id != run.timeline_id {
+        return Err(PersistenceError::InvalidData(
+            "timeline and tail analysis run identities differ".into(),
+        ));
+    }
+    if timeline.active_run_id.is_none() {
+        return Err(PersistenceError::InvalidData(
+            "tail replacement requires an existing active Moment analysis run".into(),
+        ));
+    }
+    let mut segment_ids = BTreeSet::new();
+    for segment in segments {
+        if segment.project_id != timeline.project_id || segment.run_id != run.id {
+            return Err(PersistenceError::InvalidData(
+                "tail segment does not belong to the selected timeline run/project".into(),
+            ));
+        }
+        if segment.stale {
+            return Err(PersistenceError::InvalidData(
+                "tail replacement cannot insert a stale timeline segment".into(),
+            ));
+        }
+        if !segment_ids.insert(segment.id.as_str()) {
+            return Err(PersistenceError::InvalidData(
+                "tail analysis contains duplicate segment IDs".into(),
+            ));
+        }
+    }
+
+    let mut moment_ids = BTreeSet::new();
+    let mut moment_ordinals = BTreeSet::new();
+    let mut new_asset_ids = BTreeSet::new();
+    for moment in moments {
+        if moment.project_id != timeline.project_id
+            || moment.timeline_id != timeline.timeline_id
+            || moment.run_id != run.id
+            || !segment_ids.contains(moment.segment_id.as_str())
+        {
+            return Err(PersistenceError::InvalidData(
+                "tail Moment record does not belong to the supplied project, timeline, run, and segment"
+                    .into(),
+            ));
+        }
+        if moment.stale {
+            return Err(PersistenceError::InvalidData(
+                "tail replacement cannot insert a stale Moment record".into(),
+            ));
+        }
+        if !moment_ids.insert(moment.id.as_str()) || !moment_ordinals.insert(moment.ordinal) {
+            return Err(PersistenceError::InvalidData(
+                "tail analysis contains duplicate Moment IDs or ordinals".into(),
+            ));
+        }
+        new_asset_ids.insert(moment.anchor_asset_id.clone());
+        if let Some(representative) = &moment.ai_representative_asset_id {
+            new_asset_ids.insert(representative.clone());
+        }
+    }
+
+    let mut membership_asset_ids = BTreeSet::new();
+    let mut membership_ordinals = BTreeSet::new();
+    for membership in memberships {
+        if membership.project_id != timeline.project_id
+            || membership.run_id != run.id
+            || !membership.active
+            || membership.ordinal < affected_tail_start_ordinal
+        {
+            return Err(PersistenceError::InvalidData(
+                "tail membership is outside the supplied active tail or belongs to another project/run"
+                    .into(),
+            ));
+        }
+        if !membership_asset_ids.insert(membership.media_asset_id.as_str())
+            || !membership_ordinals.insert(membership.ordinal)
+        {
+            return Err(PersistenceError::InvalidData(
+                "tail analysis contains duplicate membership media assets or ordinals".into(),
+            ));
+        }
+        match membership.membership_state.as_str() {
+            "member" => {
+                let Some(moment_id) = membership.moment_id.as_deref() else {
+                    return Err(PersistenceError::InvalidData(
+                        "tail member membership requires a supplied Moment ID".into(),
+                    ));
+                };
+                if !moment_ids.contains(moment_id) {
+                    return Err(PersistenceError::InvalidData(
+                        "tail membership refers to a Moment outside the supplied tail".into(),
+                    ));
+                }
+            }
+            "ungrouped" if membership.moment_id.is_none() => {}
+            "ungrouped" => {
+                return Err(PersistenceError::InvalidData(
+                    "tail ungrouped membership cannot point to a Moment".into(),
+                ))
+            }
+            _ => {
+                return Err(PersistenceError::InvalidData(
+                    "tail membership has an unsupported state".into(),
+                ))
+            }
+        }
+        new_asset_ids.insert(membership.media_asset_id.clone());
+    }
+    let mut boundary_ids = BTreeSet::new();
+    let mut boundary_ordinals = BTreeSet::new();
+    for boundary in boundaries {
+        if boundary.project_id != timeline.project_id || boundary.run_id != run.id {
+            return Err(PersistenceError::InvalidData(
+                "tail boundary evidence belongs to another project or run".into(),
+            ));
+        }
+        if !boundary_ids.insert(boundary.id.as_str()) || !boundary_ordinals.insert(boundary.ordinal)
+        {
+            return Err(PersistenceError::InvalidData(
+                "tail analysis contains duplicate boundary evidence IDs or ordinals".into(),
+            ));
+        }
+        new_asset_ids.insert(boundary.left_asset_id.clone());
+        new_asset_ids.insert(boundary.right_asset_id.clone());
+    }
+    Ok(new_asset_ids)
+}
+
+fn assert_moment_tail_assets_belong_to_project(
+    connection: &Connection,
+    project_id: &ProjectId,
+    asset_ids: &BTreeSet<String>,
+) -> Result<()> {
+    // SQLite's host-parameter cap must not become an artificial catalog/tail limit. Chunking
+    // bound IDs preserves the local project check for arbitrarily large append batches.
+    for chunk in asset_ids.iter().collect::<Vec<_>>().chunks(500) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COUNT(DISTINCT id) FROM media_assets WHERE project_id = ? AND id IN ({placeholders})"
+        );
+        let mut parameters = vec![rusqlite::types::Value::from(project_id.to_string())];
+        parameters.extend(chunk.iter().map(|asset_id| (*asset_id).to_owned().into()));
+        let count: i64 =
+            connection.query_row(&sql, rusqlite::params_from_iter(parameters), |row| {
+                row.get(0)
+            })?;
+        if count != chunk.len() as i64 {
+            return Err(PersistenceError::InvalidData(
+                "tail analysis referenced a media asset outside the selected project".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl CatalogRepository for SqliteRepository {
@@ -2094,6 +2847,13 @@ impl CatalogRepository for SqliteRepository {
         project_id: &ProjectId,
         query: &VisualMediaQuery,
     ) -> Result<VisualMediaPage> {
+        if let Some(moment_id) = &query.moment_id {
+            if !self.moment_belongs_to_project(project_id, moment_id)? {
+                return Err(PersistenceError::InvalidData(
+                    "moment does not belong to the selected project".into(),
+                ));
+            }
+        }
         let filter_sql = visual_filter_sql(&query.filter);
         let order_sql = visual_sort_sql(query.sort);
         let direction = if query.descending { "DESC" } else { "ASC" };
@@ -2102,7 +2862,7 @@ impl CatalogRepository for SqliteRepository {
         // `filter_sql`, `order_sql`, and `direction` come exclusively from enums; UI text is
         // bound below and never interpolated into SQL.
         let sql = format!(
-            "WITH ranked_instances AS (SELECT fi.id, fi.media_asset_id, fi.relative_path, fi.observed_at, fi.is_available, fi.index_root_id, fi.storage_volume_id, roots.selected_path, volumes.display_name AS volume_name, volumes.id AS volume_id, ROW_NUMBER() OVER (PARTITION BY fi.media_asset_id ORDER BY fi.is_available DESC, CASE WHEN EXISTS (SELECT 1 FROM media_metadata chosen WHERE chosen.media_asset_id = fi.media_asset_id AND chosen.source_file_instance_id = fi.id AND chosen.status = 'ready') THEN 1 ELSE 0 END DESC, fi.observed_at DESC, fi.id ASC) AS instance_rank FROM file_instances fi LEFT JOIN index_roots roots ON roots.id = fi.index_root_id JOIN storage_volumes volumes ON volumes.id = fi.storage_volume_id), primary_instances AS (SELECT * FROM ranked_instances WHERE instance_rank = 1) SELECT a.id, pi.id, a.display_name, a.media_type, a.extension, a.byte_size, COALESCE(m.captured_at_local, a.captured_at, a.observed_modified_at), pi.observed_at, pi.relative_path, pi.selected_path, pi.volume_name, pi.volume_id, pi.is_available, CASE WHEN small.status = 'ready' THEN small.id END, CASE WHEN medium.status = 'ready' THEN medium.id END, CASE WHEN preview.status = 'ready' THEN preview.id END, {resolved_preview_status}, {resolved_preview_failure_reason}, m.width, m.height, m.duration_ms, m.camera_model, m.lens_model, m.codec FROM media_assets a JOIN primary_instances pi ON pi.media_asset_id = a.id LEFT JOIN media_metadata m ON m.media_asset_id = a.id LEFT JOIN preview_artifacts small ON small.media_asset_id = a.id AND small.source_file_instance_id = pi.id AND small.size_class = 'small' AND small.artifact_type IN ('thumbnail', 'poster') LEFT JOIN preview_artifacts medium ON medium.media_asset_id = a.id AND medium.source_file_instance_id = pi.id AND medium.size_class = 'medium' AND medium.artifact_type IN ('thumbnail', 'poster') LEFT JOIN preview_artifacts preview ON preview.media_asset_id = a.id AND preview.source_file_instance_id = pi.id AND preview.size_class = 'preview' AND preview.artifact_type IN ('thumbnail', 'poster') WHERE a.project_id = ?1 AND {filter_sql} AND (?2 IS NULL OR lower(a.display_name) LIKE '%' || lower(?2) || '%' OR lower(COALESCE(m.camera_model, '')) LIKE '%' || lower(?2) || '%' OR lower(COALESCE(m.lens_model, '')) LIKE '%' || lower(?2) || '%') AND (?3 IS NULL OR lower(COALESCE(m.camera_model, '')) = lower(?3)) AND (?4 IS NULL OR lower(COALESCE(m.lens_model, '')) = lower(?4)) AND (?5 IS NULL OR COALESCE(m.captured_at_local, a.captured_at) >= ?5) AND (?6 IS NULL OR COALESCE(m.captured_at_local, a.captured_at) <= ?6) ORDER BY {order_sql} {direction}, a.id ASC LIMIT ?7 OFFSET ?8"
+            "WITH ranked_instances AS (SELECT fi.id, fi.media_asset_id, fi.relative_path, fi.observed_at, fi.is_available, fi.index_root_id, fi.storage_volume_id, roots.selected_path, volumes.display_name AS volume_name, volumes.id AS volume_id, ROW_NUMBER() OVER (PARTITION BY fi.media_asset_id ORDER BY fi.is_available DESC, CASE WHEN EXISTS (SELECT 1 FROM media_metadata chosen WHERE chosen.media_asset_id = fi.media_asset_id AND chosen.source_file_instance_id = fi.id AND chosen.status = 'ready') THEN 1 ELSE 0 END DESC, fi.observed_at DESC, fi.id ASC) AS instance_rank FROM file_instances fi LEFT JOIN index_roots roots ON roots.id = fi.index_root_id JOIN storage_volumes volumes ON volumes.id = fi.storage_volume_id), primary_instances AS (SELECT * FROM ranked_instances WHERE instance_rank = 1) SELECT a.id, pi.id, a.display_name, a.media_type, a.extension, a.byte_size, COALESCE(m.captured_at_local, a.captured_at, a.observed_modified_at), pi.observed_at, pi.relative_path, pi.selected_path, pi.volume_name, pi.volume_id, pi.is_available, CASE WHEN small.status = 'ready' THEN small.id END, CASE WHEN medium.status = 'ready' THEN medium.id END, CASE WHEN preview.status = 'ready' THEN preview.id END, {resolved_preview_status}, {resolved_preview_failure_reason}, m.width, m.height, m.duration_ms, m.camera_model, m.lens_model, m.codec FROM media_assets a JOIN primary_instances pi ON pi.media_asset_id = a.id LEFT JOIN media_metadata m ON m.media_asset_id = a.id LEFT JOIN preview_artifacts small ON small.media_asset_id = a.id AND small.source_file_instance_id = pi.id AND small.size_class = 'small' AND small.artifact_type IN ('thumbnail', 'poster') LEFT JOIN preview_artifacts medium ON medium.media_asset_id = a.id AND medium.source_file_instance_id = pi.id AND medium.size_class = 'medium' AND medium.artifact_type IN ('thumbnail', 'poster') LEFT JOIN preview_artifacts preview ON preview.media_asset_id = a.id AND preview.source_file_instance_id = pi.id AND preview.size_class = 'preview' AND preview.artifact_type IN ('thumbnail', 'poster') WHERE a.project_id = ?1 AND {filter_sql} AND (?2 IS NULL OR lower(a.display_name) LIKE '%' || lower(?2) || '%' OR lower(COALESCE(m.camera_model, '')) LIKE '%' || lower(?2) || '%' OR lower(COALESCE(m.lens_model, '')) LIKE '%' || lower(?2) || '%') AND (?3 IS NULL OR lower(COALESCE(m.camera_model, '')) = lower(?3)) AND (?4 IS NULL OR lower(COALESCE(m.lens_model, '')) = lower(?4)) AND (?5 IS NULL OR COALESCE(m.captured_at_local, a.captured_at) >= ?5) AND (?6 IS NULL OR COALESCE(m.captured_at_local, a.captured_at) <= ?6) AND (?7 IS NULL OR EXISTS (SELECT 1 FROM moment_memberships mm WHERE mm.project_id = a.project_id AND mm.media_asset_id = a.id AND mm.moment_id = ?7 AND mm.active = 1 AND mm.membership_state = 'member')) ORDER BY {order_sql} {direction}, a.id ASC LIMIT ?8 OFFSET ?9"
         );
         let mut statement = self.connection.prepare(&sql)?;
         let bound_limit = query.limit.saturating_add(1) as i64;
@@ -2115,6 +2875,7 @@ impl CatalogRepository for SqliteRepository {
                     query.lens_model.as_deref(),
                     query.captured_from.as_deref(),
                     query.captured_to.as_deref(),
+                    query.moment_id.as_deref(),
                     bound_limit,
                     query.offset as i64
                 ],
@@ -2156,7 +2917,7 @@ impl CatalogRepository for SqliteRepository {
         let metadata = self
             .connection
             .query_row(
-                "SELECT media_asset_id, source_file_instance_id, source_fingerprint, extractor, extractor_version, status, failure_reason, extracted_at, mime_type, byte_size, captured_at_raw, captured_at_local, capture_timezone, capture_time_source, width, height, orientation, camera_make, camera_model, lens_make, lens_model, focal_length_mm, focal_length_equivalent_mm, aperture, shutter_speed, iso, exposure_compensation, flash, white_balance, color_space, gps_present, duration_ms, frame_rate, codec, pixel_format, bitrate, audio_streams, video_streams, sample_rate, bit_depth, channels, raw_metadata_json FROM media_metadata WHERE media_asset_id = ?1",
+                "SELECT media_asset_id, source_file_instance_id, source_fingerprint, extractor, extractor_version, status, failure_reason, extracted_at, mime_type, byte_size, captured_at_raw, captured_at_local, capture_timezone, capture_time_source, capture_time_confidence, width, height, orientation, camera_make, camera_model, lens_make, lens_model, focal_length_mm, focal_length_equivalent_mm, aperture, shutter_speed, iso, exposure_compensation, flash, white_balance, color_space, gps_present, duration_ms, frame_rate, codec, pixel_format, bitrate, audio_streams, video_streams, sample_rate, bit_depth, channels, raw_metadata_json FROM media_metadata WHERE media_asset_id = ?1",
                 params![asset_id.to_string()],
                 media_metadata_from_row,
             )
@@ -2284,10 +3045,116 @@ impl CatalogRepository for SqliteRepository {
         candidates
     }
 
+    fn capture_time_refresh_candidates(
+        &self,
+        project_id: &ProjectId,
+        after_asset_id: Option<&str>,
+        asset_limit: u32,
+    ) -> Result<Vec<MediaPreparationCandidate>> {
+        let asset_limit = asset_limit.clamp(1, 512);
+        let mut statement = self.connection.prepare(
+            "WITH selected_assets AS (
+                 SELECT id
+                 FROM media_assets
+                 WHERE project_id = ?1
+                   AND (?2 IS NULL OR id > ?2)
+                   AND EXISTS (
+                     SELECT 1 FROM file_instances available
+                     WHERE available.media_asset_id = media_assets.id
+                       AND available.is_available = 1
+                   )
+                 ORDER BY id ASC
+                 LIMIT ?3
+             )
+             SELECT a.id, fi.id, a.display_name, a.media_type, roots.selected_path,
+                    fi.relative_path, COALESCE(a.content_hash, a.fast_fingerprint, a.id),
+                    fi.is_available
+             FROM selected_assets selected
+             JOIN media_assets a ON a.id = selected.id
+             JOIN file_instances fi ON fi.media_asset_id = a.id AND fi.is_available = 1
+             LEFT JOIN index_roots roots ON roots.id = fi.index_root_id
+             ORDER BY a.id ASC, fi.observed_at DESC, fi.id ASC",
+        )?;
+        let candidates = statement
+            .query_map(
+                params![project_id.to_string(), after_asset_id, asset_limit as i64],
+                |row| {
+                    Ok(MediaPreparationCandidate {
+                        asset_id: row.get(0)?,
+                        file_instance_id: row.get(1)?,
+                        filename: row.get(2)?,
+                        media_type: row.get(3)?,
+                        selected_root: row.get(4)?,
+                        relative_path: row.get(5)?,
+                        source_fingerprint: row.get(6)?,
+                        is_available: row.get(7)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into);
+        candidates
+    }
+
+    fn capture_time_refresh_asset_count(&self, project_id: &ProjectId) -> Result<u64> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM media_assets a
+                 WHERE a.project_id = ?1
+                   AND EXISTS (
+                     SELECT 1 FROM file_instances fi
+                     WHERE fi.media_asset_id = a.id AND fi.is_available = 1
+                   )",
+                params![project_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(Into::into)
+    }
+
+    fn upsert_capture_time_observation(
+        &self,
+        observation: &CaptureTimeObservationRecord,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO capture_time_observations (media_asset_id, source_file_instance_id, source_fingerprint, extractor, extractor_version, status, failure_reason, extracted_at, captured_at_raw, captured_at_local, capture_timezone, capture_time_source, capture_time_confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(media_asset_id, source_file_instance_id) DO UPDATE SET
+               source_fingerprint = excluded.source_fingerprint,
+               extractor = excluded.extractor,
+               extractor_version = excluded.extractor_version,
+               status = excluded.status,
+               failure_reason = excluded.failure_reason,
+               extracted_at = excluded.extracted_at,
+               captured_at_raw = excluded.captured_at_raw,
+               captured_at_local = excluded.captured_at_local,
+               capture_timezone = excluded.capture_timezone,
+               capture_time_source = excluded.capture_time_source,
+               capture_time_confidence = excluded.capture_time_confidence",
+            params![
+                observation.media_asset_id,
+                observation.source_file_instance_id,
+                observation.source_fingerprint,
+                observation.extractor,
+                observation.extractor_version,
+                observation.status,
+                observation.failure_reason,
+                observation.extracted_at,
+                observation.captured_at_raw,
+                observation.captured_at_local,
+                observation.capture_timezone,
+                observation.capture_time_source,
+                observation.capture_time_confidence,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn upsert_media_metadata(&self, metadata: &MediaMetadataRecord) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO media_metadata (media_asset_id, source_file_instance_id, source_fingerprint, extractor, extractor_version, status, failure_reason, extracted_at, mime_type, byte_size, captured_at_raw, captured_at_local, capture_timezone, capture_time_source, width, height, orientation, camera_make, camera_model, lens_make, lens_model, focal_length_mm, focal_length_equivalent_mm, aperture, shutter_speed, iso, exposure_compensation, flash, white_balance, color_space, gps_present, duration_ms, frame_rate, codec, pixel_format, bitrate, audio_streams, video_streams, sample_rate, bit_depth, channels, raw_metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42) ON CONFLICT(media_asset_id) DO UPDATE SET source_file_instance_id = excluded.source_file_instance_id, source_fingerprint = excluded.source_fingerprint, extractor = excluded.extractor, extractor_version = excluded.extractor_version, status = excluded.status, failure_reason = excluded.failure_reason, extracted_at = excluded.extracted_at, mime_type = excluded.mime_type, byte_size = excluded.byte_size, captured_at_raw = excluded.captured_at_raw, captured_at_local = excluded.captured_at_local, capture_timezone = excluded.capture_timezone, capture_time_source = excluded.capture_time_source, width = excluded.width, height = excluded.height, orientation = excluded.orientation, camera_make = excluded.camera_make, camera_model = excluded.camera_model, lens_make = excluded.lens_make, lens_model = excluded.lens_model, focal_length_mm = excluded.focal_length_mm, focal_length_equivalent_mm = excluded.focal_length_equivalent_mm, aperture = excluded.aperture, shutter_speed = excluded.shutter_speed, iso = excluded.iso, exposure_compensation = excluded.exposure_compensation, flash = excluded.flash, white_balance = excluded.white_balance, color_space = excluded.color_space, gps_present = excluded.gps_present, duration_ms = excluded.duration_ms, frame_rate = excluded.frame_rate, codec = excluded.codec, pixel_format = excluded.pixel_format, bitrate = excluded.bitrate, audio_streams = excluded.audio_streams, video_streams = excluded.video_streams, sample_rate = excluded.sample_rate, bit_depth = excluded.bit_depth, channels = excluded.channels, raw_metadata_json = excluded.raw_metadata_json",
-            params![metadata.media_asset_id, metadata.source_file_instance_id, metadata.source_fingerprint, metadata.extractor, metadata.extractor_version, metadata.status, metadata.failure_reason, metadata.extracted_at, metadata.mime_type, metadata.byte_size.map(|value| value as i64), metadata.captured_at_raw, metadata.captured_at_local, metadata.capture_timezone, metadata.capture_time_source, metadata.width.map(|value| value as i64), metadata.height.map(|value| value as i64), metadata.orientation, metadata.camera_make, metadata.camera_model, metadata.lens_make, metadata.lens_model, metadata.focal_length_mm, metadata.focal_length_equivalent_mm, metadata.aperture, metadata.shutter_speed, metadata.iso.map(|value| value as i64), metadata.exposure_compensation, metadata.flash, metadata.white_balance, metadata.color_space, metadata.gps_present, metadata.duration_ms.map(|value| value as i64), metadata.frame_rate, metadata.codec, metadata.pixel_format, metadata.bitrate.map(|value| value as i64), metadata.audio_streams.map(|value| value as i64), metadata.video_streams.map(|value| value as i64), metadata.sample_rate.map(|value| value as i64), metadata.bit_depth.map(|value| value as i64), metadata.channels.map(|value| value as i64), json(&metadata.raw_metadata)?],
+            "INSERT INTO media_metadata (media_asset_id, source_file_instance_id, source_fingerprint, extractor, extractor_version, status, failure_reason, extracted_at, mime_type, byte_size, captured_at_raw, captured_at_local, capture_timezone, capture_time_source, capture_time_confidence, width, height, orientation, camera_make, camera_model, lens_make, lens_model, focal_length_mm, focal_length_equivalent_mm, aperture, shutter_speed, iso, exposure_compensation, flash, white_balance, color_space, gps_present, duration_ms, frame_rate, codec, pixel_format, bitrate, audio_streams, video_streams, sample_rate, bit_depth, channels, raw_metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43) ON CONFLICT(media_asset_id) DO UPDATE SET source_file_instance_id = excluded.source_file_instance_id, source_fingerprint = excluded.source_fingerprint, extractor = excluded.extractor, extractor_version = excluded.extractor_version, status = excluded.status, failure_reason = excluded.failure_reason, extracted_at = excluded.extracted_at, mime_type = excluded.mime_type, byte_size = excluded.byte_size, captured_at_raw = excluded.captured_at_raw, captured_at_local = excluded.captured_at_local, capture_timezone = excluded.capture_timezone, capture_time_source = excluded.capture_time_source, capture_time_confidence = excluded.capture_time_confidence, width = excluded.width, height = excluded.height, orientation = excluded.orientation, camera_make = excluded.camera_make, camera_model = excluded.camera_model, lens_make = excluded.lens_make, lens_model = excluded.lens_model, focal_length_mm = excluded.focal_length_mm, focal_length_equivalent_mm = excluded.focal_length_equivalent_mm, aperture = excluded.aperture, shutter_speed = excluded.shutter_speed, iso = excluded.iso, exposure_compensation = excluded.exposure_compensation, flash = excluded.flash, white_balance = excluded.white_balance, color_space = excluded.color_space, gps_present = excluded.gps_present, duration_ms = excluded.duration_ms, frame_rate = excluded.frame_rate, codec = excluded.codec, pixel_format = excluded.pixel_format, bitrate = excluded.bitrate, audio_streams = excluded.audio_streams, video_streams = excluded.video_streams, sample_rate = excluded.sample_rate, bit_depth = excluded.bit_depth, channels = excluded.channels, raw_metadata_json = excluded.raw_metadata_json",
+            params![metadata.media_asset_id, metadata.source_file_instance_id, metadata.source_fingerprint, metadata.extractor, metadata.extractor_version, metadata.status, metadata.failure_reason, metadata.extracted_at, metadata.mime_type, metadata.byte_size.map(|value| value as i64), metadata.captured_at_raw, metadata.captured_at_local, metadata.capture_timezone, metadata.capture_time_source, metadata.capture_time_confidence, metadata.width.map(|value| value as i64), metadata.height.map(|value| value as i64), metadata.orientation, metadata.camera_make, metadata.camera_model, metadata.lens_make, metadata.lens_model, metadata.focal_length_mm, metadata.focal_length_equivalent_mm, metadata.aperture, metadata.shutter_speed, metadata.iso.map(|value| value as i64), metadata.exposure_compensation, metadata.flash, metadata.white_balance, metadata.color_space, metadata.gps_present, metadata.duration_ms.map(|value| value as i64), metadata.frame_rate, metadata.codec, metadata.pixel_format, metadata.bitrate.map(|value| value as i64), metadata.audio_streams.map(|value| value as i64), metadata.video_streams.map(|value| value as i64), metadata.sample_rate.map(|value| value as i64), metadata.bit_depth.map(|value| value as i64), metadata.channels.map(|value| value as i64), json(&metadata.raw_metadata)?],
         )?;
         Ok(())
     }
@@ -3420,13 +4287,24 @@ impl CatalogRepository for SqliteRepository {
         query: &CullingQuery,
     ) -> Result<CullingWorkspaceView> {
         validate_culling_mode(&query.mode)?;
+        if let Some(moment_id) = &query.moment_id {
+            if !self.moment_belongs_to_project(project_id, moment_id)? {
+                return Err(PersistenceError::InvalidData(
+                    "moment does not belong to the selected project".into(),
+                ));
+            }
+        }
         let filter_sql = culling_filter_sql(&query.filter)?;
+        let filter_context = query.moment_id.as_ref().map_or_else(
+            || query.filter.clone(),
+            |moment_id| format!("{};moment:{moment_id}", query.filter),
+        );
         let session =
-            self.start_or_resume_review_session(project_id, &query.mode, Some(&query.filter))?;
+            self.start_or_resume_review_session(project_id, &query.mode, Some(&filter_context))?;
         let mode_queue_sql = "(?3 <> 'ai_review_queue' OR EXISTS (SELECT 1 FROM analysis_recommendations r WHERE r.media_asset_id = a.id AND r.stale = 0 AND r.status = 'ready' AND r.label IN ('strong_candidate', 'strong_alternative', 'review', 'probable_duplicate', 'technical_issue')))";
         let group_sql = "(?3 <> 'similar_sets' OR EXISTS (SELECT 1 FROM similarity_group_members gm JOIN similarity_groups g ON g.id = gm.group_id WHERE gm.media_asset_id = a.id AND g.project_id = ?1 AND g.stale = 0 AND g.id = COALESCE(?2, (SELECT current_group.id FROM similarity_groups current_group WHERE current_group.project_id = ?1 AND current_group.stale = 0 ORDER BY current_group.created_at ASC, current_group.id ASC LIMIT 1))))";
         let sql = format!(
-            "SELECT a.id FROM media_assets a LEFT JOIN media_decisions md ON md.media_asset_id = a.id AND md.project_id = ?1 WHERE a.project_id = ?1 AND a.media_type IN ('raw_photo', 'jpeg', 'heif', 'png', 'tiff') AND {mode_queue_sql} AND {group_sql} AND {filter_sql} ORDER BY CASE WHEN ?3 = 'ai_review_queue' THEN CASE (SELECT r.label FROM analysis_recommendations r WHERE r.media_asset_id = a.id AND r.stale = 0 ORDER BY r.generated_at DESC, r.id DESC LIMIT 1) WHEN 'technical_issue' THEN 0 WHEN 'review' THEN 1 WHEN 'probable_duplicate' THEN 2 WHEN 'strong_candidate' THEN 3 WHEN 'strong_alternative' THEN 4 ELSE 5 END ELSE 0 END, COALESCE(a.captured_at, a.created_at), a.id ASC LIMIT ?4 OFFSET ?5"
+            "SELECT a.id FROM media_assets a LEFT JOIN media_decisions md ON md.media_asset_id = a.id AND md.project_id = ?1 WHERE a.project_id = ?1 AND a.media_type IN ('raw_photo', 'jpeg', 'heif', 'png', 'tiff') AND {mode_queue_sql} AND {group_sql} AND {filter_sql} AND (?4 IS NULL OR EXISTS (SELECT 1 FROM moment_memberships mm WHERE mm.project_id = a.project_id AND mm.media_asset_id = a.id AND mm.moment_id = ?4 AND mm.active = 1 AND mm.membership_state = 'member')) ORDER BY CASE WHEN ?3 = 'ai_review_queue' THEN CASE (SELECT r.label FROM analysis_recommendations r WHERE r.media_asset_id = a.id AND r.stale = 0 ORDER BY r.generated_at DESC, r.id DESC LIMIT 1) WHEN 'technical_issue' THEN 0 WHEN 'review' THEN 1 WHEN 'probable_duplicate' THEN 2 WHEN 'strong_candidate' THEN 3 WHEN 'strong_alternative' THEN 4 ELSE 5 END ELSE 0 END, COALESCE(a.captured_at, a.created_at), a.id ASC LIMIT ?5 OFFSET ?6"
         );
         let bound_limit = query.limit.clamp(1, 120).saturating_add(1) as i64;
         let mut asset_ids = self
@@ -3437,6 +4315,7 @@ impl CatalogRepository for SqliteRepository {
                     project_id.to_string(),
                     query.group_id.as_deref(),
                     query.mode,
+                    query.moment_id.as_deref(),
                     bound_limit,
                     query.offset as i64
                 ],
@@ -3907,6 +4786,7 @@ impl CatalogRepository for SqliteRepository {
               SELECT * FROM ranked_instances WHERE instance_rank = 1
             ), candidate_inputs AS (
               SELECT a.id AS asset_id, a.project_id, pi.id AS file_instance_id, a.display_name,
+                a.media_type,
                 COALESCE(
                   selected.source_fingerprint || CASE selected.artifact_type WHEN 'thumbnail' THEN '|preview:' ELSE '|analysis-preview:' END || selected.generator_version || ':' || selected.size_class,
                   a.content_hash, a.fast_fingerprint, a.id
@@ -3935,7 +4815,7 @@ impl CatalogRepository for SqliteRepository {
                 AND a.media_type IN ('raw_photo', 'jpeg', 'heif', 'png', 'tiff')
             )
             SELECT candidate.asset_id, candidate.project_id, candidate.file_instance_id, candidate.display_name,
-                   candidate.input_fingerprint, candidate.cache_relative_path,
+                   candidate.media_type, candidate.input_fingerprint, candidate.cache_relative_path,
                    COALESCE(candidate.selected_status, CASE WHEN candidate.is_available = 0 THEN 'needs_original' ELSE 'pending' END),
                    candidate.failure_reason, candidate.is_available
             FROM candidate_inputs candidate
@@ -3949,6 +4829,7 @@ impl CatalogRepository for SqliteRepository {
                 AND stored.embedding_version = ?5
                 AND stored.preprocessing_version = ?6
                 AND stored.metric = ?7
+                AND stored.dimensions = ?8
                 AND stored.stale = 0
                 AND stored.status IN ('ready', 'unsupported', 'corrupt', 'needs_original', 'failed')
             )
@@ -3964,6 +4845,7 @@ impl CatalogRepository for SqliteRepository {
                     model.embedding_version,
                     model.preprocessing_version,
                     model.metric,
+                    model.dimensions as i64,
                 ],
                 |row| {
                     Ok(SemanticInputCandidate {
@@ -3971,11 +4853,12 @@ impl CatalogRepository for SqliteRepository {
                         project_id: row.get(1)?,
                         file_instance_id: row.get(2)?,
                         filename: row.get(3)?,
-                        input_fingerprint: row.get(4)?,
-                        preview_relative_path: row.get(5)?,
-                        preview_status: row.get(6)?,
-                        preview_failure_reason: row.get(7)?,
-                        is_available: row.get(8)?,
+                        media_type: row.get(4)?,
+                        input_fingerprint: row.get(5)?,
+                        preview_relative_path: row.get(6)?,
+                        preview_status: row.get(7)?,
+                        preview_failure_reason: row.get(8)?,
+                        is_available: row.get(9)?,
                     })
                 },
             )?
@@ -3985,6 +4868,19 @@ impl CatalogRepository for SqliteRepository {
     }
 
     fn upsert_semantic_embedding(&self, embedding: &SemanticEmbeddingRecord) -> Result<()> {
+        let belongs_to_project: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM media_assets WHERE id = ?1 AND project_id = ?2)",
+            params![
+                embedding.media_asset_id.to_string(),
+                embedding.project_id.to_string()
+            ],
+            |row| row.get(0),
+        )?;
+        if !belongs_to_project {
+            return Err(PersistenceError::InvalidData(
+                "semantic embedding media asset does not belong to its project".into(),
+            ));
+        }
         let dimensions = embedding.model.dimensions;
         let blob = embedding
             .embedding
@@ -4009,20 +4905,66 @@ impl CatalogRepository for SqliteRepository {
         Ok(())
     }
 
+    fn mark_other_semantic_embeddings_stale(
+        &self,
+        project_id: &ProjectId,
+        model: &SemanticModelConfig,
+    ) -> Result<u64> {
+        let changed = self.connection.execute(
+            "UPDATE semantic_embeddings
+             SET stale = 1
+             WHERE project_id = ?1
+               AND stale = 0
+               AND (model_id <> ?2
+                    OR provider <> ?3
+                    OR model_version <> ?4
+                    OR embedding_version <> ?5
+                    OR preprocessing_version <> ?6
+                    OR metric <> ?7
+                    OR dimensions <> ?8)",
+            params![
+                project_id.to_string(),
+                model.model_id,
+                model.provider,
+                model.model_version,
+                model.embedding_version,
+                model.preprocessing_version,
+                model.metric,
+                model.dimensions as i64,
+            ],
+        )?;
+        Ok(changed as u64)
+    }
+
     fn semantic_embeddings_for_index(
         &self,
         project_id: &ProjectId,
         model: &SemanticModelConfig,
     ) -> Result<Vec<StoredSemanticVector>> {
         let mut statement = self.connection.prepare(
-            "SELECT media_asset_id, embedding_blob, dimensions FROM semantic_embeddings WHERE project_id = ?1 AND model_id = ?2 AND provider = ?3 AND model_version = ?4 AND embedding_version = ?5 AND preprocessing_version = ?6 AND metric = ?7 AND stale = 0 AND status = 'ready' ORDER BY media_asset_id ASC",
+            "SELECT media_asset_id, embedding_blob, dimensions FROM semantic_embeddings WHERE project_id = ?1 AND model_id = ?2 AND provider = ?3 AND model_version = ?4 AND embedding_version = ?5 AND preprocessing_version = ?6 AND metric = ?7 AND dimensions = ?8 AND stale = 0 AND status = 'ready' ORDER BY media_asset_id ASC",
         )?;
         let vectors = statement
             .query_map(
-                params![project_id.to_string(), model.model_id, model.provider, model.model_version, model.embedding_version, model.preprocessing_version, model.metric],
+                params![
+                    project_id.to_string(),
+                    model.model_id,
+                    model.provider,
+                    model.model_version,
+                    model.embedding_version,
+                    model.preprocessing_version,
+                    model.metric,
+                    model.dimensions as i64
+                ],
                 |row| {
                     let dimensions = row.get::<_, i64>(2)? as usize;
-                    let blob = row.get::<_, Option<Vec<u8>>>(1)?.ok_or_else(|| rusqlite::Error::InvalidColumnType(1, "embedding_blob".into(), rusqlite::types::Type::Null))?;
+                    let blob = row.get::<_, Option<Vec<u8>>>(1)?.ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            1,
+                            "embedding_blob".into(),
+                            rusqlite::types::Type::Null,
+                        )
+                    })?;
                     let asset_id: String = row.get(0)?;
                     let vector = decode_semantic_vector(&blob, dimensions).map_err(to_sql_error)?;
                     Ok(StoredSemanticVector { asset_id, vector })
@@ -4047,14 +4989,17 @@ impl CatalogRepository for SqliteRepository {
                 "semantic search candidate request exceeded its bounded index limit".into(),
             ));
         }
-        let placeholders = (0..asset_ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+        let placeholders = (0..asset_ids.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
         let select_vector = if model.is_some() {
             "stored.embedding_blob, stored.dimensions"
         } else {
             "NULL AS embedding_blob, NULL AS dimensions"
         };
         let join_vector = if model.is_some() {
-            "JOIN semantic_embeddings stored ON stored.media_asset_id = a.id AND stored.project_id = a.project_id AND stored.stale = 0 AND stored.status = 'ready' AND stored.model_id = ?2 AND stored.provider = ?3 AND stored.model_version = ?4 AND stored.embedding_version = ?5 AND stored.preprocessing_version = ?6 AND stored.metric = ?7"
+            "JOIN semantic_embeddings stored ON stored.media_asset_id = a.id AND stored.project_id = a.project_id AND stored.stale = 0 AND stored.status = 'ready' AND stored.model_id = ?2 AND stored.provider = ?3 AND stored.model_version = ?4 AND stored.embedding_version = ?5 AND stored.preprocessing_version = ?6 AND stored.metric = ?7 AND stored.dimensions = ?8"
         } else {
             ""
         };
@@ -4064,6 +5009,7 @@ impl CatalogRepository for SqliteRepository {
                 COALESCE(decision.rating, 0), decision.decision,
                 (SELECT quality.sharpness_band FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
                 (SELECT quality.blur_level FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
+                (SELECT quality.technical_quality_band FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
                 (SELECT quality.technical_quality_score FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
                 metadata.camera_model, COALESCE(metadata.captured_at_local, a.captured_at)
              FROM media_assets a
@@ -4082,6 +5028,7 @@ impl CatalogRepository for SqliteRepository {
                 model.embedding_version.clone().into(),
                 model.preprocessing_version.clone().into(),
                 model.metric.clone().into(),
+                (model.dimensions as i64).into(),
             ]);
         }
         bound.extend(asset_ids.iter().cloned().map(Into::into));
@@ -4090,9 +5037,17 @@ impl CatalogRepository for SqliteRepository {
             .query_map(rusqlite::params_from_iter(bound), |row| {
                 let dimensions = row.get::<_, Option<i64>>(2)?;
                 let vector = match (row.get::<_, Option<Vec<u8>>>(1)?, dimensions) {
-                    (Some(blob), Some(dimensions)) => Some(decode_semantic_vector(&blob, dimensions as usize).map_err(to_sql_error)?),
+                    (Some(blob), Some(dimensions)) => Some(
+                        decode_semantic_vector(&blob, dimensions as usize).map_err(to_sql_error)?,
+                    ),
                     (None, None) => None,
-                    _ => return Err(rusqlite::Error::InvalidColumnType(1, "embedding_blob".into(), rusqlite::types::Type::Blob)),
+                    _ => {
+                        return Err(rusqlite::Error::InvalidColumnType(
+                            1,
+                            "embedding_blob".into(),
+                            rusqlite::types::Type::Blob,
+                        ))
+                    }
                 };
                 Ok(SemanticSearchCandidate {
                     asset_id: row.get(0)?,
@@ -4102,9 +5057,10 @@ impl CatalogRepository for SqliteRepository {
                     decision: row.get(5)?,
                     sharpness_band: row.get(6)?,
                     blur_level: row.get(7)?,
-                    technical_quality_score: row.get(8)?,
-                    camera_model: row.get(9)?,
-                    captured_at: row.get(10)?,
+                    technical_quality_band: row.get(8)?,
+                    technical_quality_score: row.get(9)?,
+                    camera_model: row.get(10)?,
+                    captured_at: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -4115,25 +5071,89 @@ impl CatalogRepository for SqliteRepository {
     fn semantic_metadata_candidates(
         &self,
         project_id: &ProjectId,
-        limit: u32,
-        offset: u32,
+        query: &SemanticMetadataQuery,
     ) -> Result<Vec<SemanticSearchCandidate>> {
-        let mut statement = self.connection.prepare(
-            "SELECT a.id, NULL AS embedding_blob, NULL AS dimensions,
-                CASE WHEN EXISTS (SELECT 1 FROM analysis_artifacts face_artifact WHERE face_artifact.media_asset_id = a.id AND face_artifact.artifact_type = 'face_detection' AND face_artifact.stale = 0 AND face_artifact.status = 'ready') THEN (SELECT COUNT(*) FROM face_analyses face WHERE face.media_asset_id = a.id AND face.input_fingerprint = (SELECT face_artifact.input_fingerprint FROM analysis_artifacts face_artifact WHERE face_artifact.media_asset_id = a.id AND face_artifact.artifact_type = 'face_detection' AND face_artifact.stale = 0 AND face_artifact.status = 'ready' ORDER BY face_artifact.generated_at DESC, face_artifact.id DESC LIMIT 1)) ELSE NULL END,
-                COALESCE(decision.rating, 0), decision.decision,
-                (SELECT quality.sharpness_band FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
-                (SELECT quality.blur_level FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
-                (SELECT quality.technical_quality_score FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1),
-                metadata.camera_model, COALESCE(metadata.captured_at_local, a.captured_at)
+        let mut predicates = Vec::new();
+        let mut bound = vec![rusqlite::types::Value::from(project_id.to_string())];
+        if let Some(moment_id) = &query.moment_id {
+            if !self.moment_belongs_to_project(project_id, moment_id)? {
+                return Err(PersistenceError::InvalidData(
+                    "moment does not belong to the selected project".into(),
+                ));
+            }
+            predicates.push("EXISTS (SELECT 1 FROM moment_memberships mm WHERE mm.project_id = ? AND mm.media_asset_id = asset_id AND mm.moment_id = ? AND mm.active = 1 AND mm.membership_state = 'member')".to_owned());
+            bound.push(project_id.to_string().into());
+            bound.push(moment_id.clone().into());
+        }
+        if let Some(face_count) = query.face_count {
+            predicates.push("face_count = ?".to_owned());
+            bound.push((face_count as i64).into());
+        }
+        if let Some(rating) = query.rating_exact {
+            predicates.push("rating = ?".to_owned());
+            bound.push(i64::from(rating).into());
+        }
+        if let Some(rating) = query.rating_minimum {
+            predicates.push("rating >= ?".to_owned());
+            bound.push(i64::from(rating).into());
+        }
+        if let Some(decision) = &query.decision {
+            predicates.push("decision = ?".to_owned());
+            bound.push(decision.clone().into());
+        }
+        if query.require_sharp {
+            predicates.push("sharpness_band IN ('excellent', 'good')".to_owned());
+        }
+        if query.require_blurry {
+            predicates.push("blur_level IN ('moderate', 'high')".to_owned());
+        }
+        if query.require_technical_issue {
+            predicates.push("technical_quality_band = 'technical_issue'".to_owned());
+        }
+        if let Some(camera_model) = &query.camera_model {
+            predicates.push("lower(COALESCE(camera_model, '')) = lower(?)".to_owned());
+            bound.push(camera_model.clone().into());
+        }
+        let where_clause = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", predicates.join(" AND "))
+        };
+        let sort_column = match query.sort {
+            SemanticMetadataSort::CaptureTime => "captured_at",
+            SemanticMetadataSort::TechnicalQuality => "technical_quality_score",
+            SemanticMetadataSort::Rating => "rating",
+        };
+        let direction = if query.descending { "DESC" } else { "ASC" };
+        let sql = format!(
+            "WITH candidates AS (
+                SELECT a.id AS asset_id,
+                    CASE WHEN EXISTS (SELECT 1 FROM analysis_artifacts face_artifact WHERE face_artifact.media_asset_id = a.id AND face_artifact.artifact_type = 'face_detection' AND face_artifact.stale = 0 AND face_artifact.status = 'ready') THEN (SELECT COUNT(*) FROM face_analyses face WHERE face.media_asset_id = a.id AND face.input_fingerprint = (SELECT face_artifact.input_fingerprint FROM analysis_artifacts face_artifact WHERE face_artifact.media_asset_id = a.id AND face_artifact.artifact_type = 'face_detection' AND face_artifact.stale = 0 AND face_artifact.status = 'ready' ORDER BY face_artifact.generated_at DESC, face_artifact.id DESC LIMIT 1)) ELSE NULL END AS face_count,
+                    COALESCE(decision.rating, 0) AS rating, decision.decision AS decision,
+                    (SELECT quality.sharpness_band FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1) AS sharpness_band,
+                    (SELECT quality.blur_level FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1) AS blur_level,
+                    (SELECT quality.technical_quality_band FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1) AS technical_quality_band,
+                    (SELECT quality.technical_quality_score FROM technical_quality quality WHERE quality.media_asset_id = a.id AND quality.stale = 0 AND quality.status = 'ready' ORDER BY quality.generated_at DESC LIMIT 1) AS technical_quality_score,
+                    metadata.camera_model AS camera_model,
+                    COALESCE(metadata.captured_at_local, a.captured_at, a.created_at) AS captured_at
              FROM media_assets a
              LEFT JOIN media_decisions decision ON decision.media_asset_id = a.id AND decision.project_id = a.project_id
              LEFT JOIN media_metadata metadata ON metadata.media_asset_id = a.id
-             WHERE a.project_id = ?1
-             ORDER BY COALESCE(metadata.captured_at_local, a.captured_at, a.created_at) DESC, a.id ASC LIMIT ?2 OFFSET ?3",
-        )?;
+                 WHERE a.project_id = ?
+                   AND a.media_type IN ('raw_photo', 'jpeg', 'heif', 'png', 'tiff')
+             )
+             SELECT asset_id, NULL AS embedding_blob, NULL AS dimensions, face_count, rating, decision,
+                    sharpness_band, blur_level, technical_quality_band, technical_quality_score,
+                    camera_model, captured_at
+             FROM candidates {where_clause}
+             ORDER BY ({sort_column} IS NULL) ASC, {sort_column} {direction}, asset_id ASC
+             LIMIT ? OFFSET ?"
+        );
+        bound.push(i64::from(query.limit.clamp(1, 250)).into());
+        bound.push(i64::from(query.offset).into());
+        let mut statement = self.connection.prepare(&sql)?;
         let candidates = statement
-            .query_map(params![project_id.to_string(), limit as i64, offset as i64], |row| {
+            .query_map(rusqlite::params_from_iter(bound), |row| {
                 Ok(SemanticSearchCandidate {
                     asset_id: row.get(0)?,
                     vector: None,
@@ -4142,9 +5162,10 @@ impl CatalogRepository for SqliteRepository {
                     decision: row.get(5)?,
                     sharpness_band: row.get(6)?,
                     blur_level: row.get(7)?,
-                    technical_quality_score: row.get(8)?,
-                    camera_model: row.get(9)?,
-                    captured_at: row.get(10)?,
+                    technical_quality_band: row.get(8)?,
+                    technical_quality_score: row.get(9)?,
+                    camera_model: row.get(10)?,
+                    captured_at: row.get(11)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -4166,8 +5187,8 @@ impl CatalogRepository for SqliteRepository {
         model: &SemanticModelConfig,
     ) -> Result<Option<SemanticIndexVersion>> {
         self.connection.query_row(
-            "SELECT id, project_id, model_id, provider, model_version, embedding_version, preprocessing_version, metric, dimensions, index_format, index_relative_path, index_checksum, embedding_count, status, stale, created_at, rebuilt_at FROM semantic_index_versions WHERE project_id = ?1 AND model_id = ?2 AND provider = ?3 AND model_version = ?4 AND embedding_version = ?5 AND preprocessing_version = ?6 AND metric = ?7 AND stale = 0 ORDER BY rebuilt_at DESC, id DESC LIMIT 1",
-            params![project_id.to_string(), model.model_id, model.provider, model.model_version, model.embedding_version, model.preprocessing_version, model.metric],
+            "SELECT id, project_id, model_id, provider, model_version, embedding_version, preprocessing_version, metric, dimensions, index_format, index_relative_path, index_checksum, embedding_count, status, stale, created_at, rebuilt_at FROM semantic_index_versions WHERE project_id = ?1 AND model_id = ?2 AND provider = ?3 AND model_version = ?4 AND embedding_version = ?5 AND preprocessing_version = ?6 AND metric = ?7 AND dimensions = ?8 AND status = 'ready' AND stale = 0 ORDER BY rebuilt_at DESC, id DESC LIMIT 1",
+            params![project_id.to_string(), model.model_id, model.provider, model.model_version, model.embedding_version, model.preprocessing_version, model.metric, model.dimensions as i64],
             semantic_index_version_from_row,
         ).optional()?.map(Ok).transpose()
     }
@@ -4178,8 +5199,8 @@ impl CatalogRepository for SqliteRepository {
         model: &SemanticModelConfig,
     ) -> Result<u64> {
         let changed = self.connection.execute(
-            "UPDATE semantic_index_versions SET stale = 1, status = 'stale' WHERE project_id = ?1 AND stale = 0 AND (model_id <> ?2 OR provider <> ?3 OR model_version <> ?4 OR embedding_version <> ?5 OR preprocessing_version <> ?6 OR metric <> ?7)",
-            params![project_id.to_string(), model.model_id, model.provider, model.model_version, model.embedding_version, model.preprocessing_version, model.metric],
+            "UPDATE semantic_index_versions SET stale = 1, status = 'stale' WHERE project_id = ?1 AND stale = 0 AND (model_id <> ?2 OR provider <> ?3 OR model_version <> ?4 OR embedding_version <> ?5 OR preprocessing_version <> ?6 OR metric <> ?7 OR dimensions <> ?8)",
+            params![project_id.to_string(), model.model_id, model.provider, model.model_version, model.embedding_version, model.preprocessing_version, model.metric, model.dimensions as i64],
         )?;
         Ok(changed as u64)
     }
@@ -4206,11 +5227,31 @@ impl CatalogRepository for SqliteRepository {
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, query_text, normalized_query, plan_json, used_at, use_count FROM magic_search_history WHERE project_id = ?1 ORDER BY used_at DESC, id DESC LIMIT ?2",
         )?;
-        let history = statement.query_map(params![project_id.to_string(), limit.clamp(1, 100) as i64], |row| {
-            let plan: String = row.get(4)?;
-            let plan = serde_json::from_str(&plan).map_err(|error| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error)))?;
-            Ok(MagicSearchHistoryEntry { id: row.get(0)?, project_id: row.get(1)?, query_text: row.get(2)?, normalized_query: row.get(3)?, plan, used_at: row.get(5)?, use_count: row.get::<_, i64>(6)? as u64 })
-        })?.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into);
+        let history = statement
+            .query_map(
+                params![project_id.to_string(), limit.clamp(1, 100) as i64],
+                |row| {
+                    let plan: String = row.get(4)?;
+                    let plan = serde_json::from_str(&plan).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(MagicSearchHistoryEntry {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        query_text: row.get(2)?,
+                        normalized_query: row.get(3)?,
+                        plan,
+                        used_at: row.get(5)?,
+                        use_count: row.get::<_, i64>(6)? as u64,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into);
         history
     }
 
@@ -4237,10 +5278,22 @@ impl CatalogRepository for SqliteRepository {
         model: &SemanticModelConfig,
     ) -> Result<SemanticIndexTerminalCounts> {
         let mut statement = self.connection.prepare(
-            "WITH ranked AS (SELECT status, stale, ROW_NUMBER() OVER (PARTITION BY media_asset_id ORDER BY generated_at DESC) AS position FROM semantic_embeddings WHERE project_id = ?1 AND model_id = ?2 AND provider = ?3 AND model_version = ?4 AND embedding_version = ?5 AND preprocessing_version = ?6 AND metric = ?7) SELECT CASE WHEN stale = 1 THEN 'stale' ELSE status END, COUNT(*) FROM ranked WHERE position = 1 GROUP BY CASE WHEN stale = 1 THEN 'stale' ELSE status END",
+            "WITH ranked AS (SELECT status, stale, ROW_NUMBER() OVER (PARTITION BY media_asset_id ORDER BY generated_at DESC) AS position FROM semantic_embeddings WHERE project_id = ?1 AND model_id = ?2 AND provider = ?3 AND model_version = ?4 AND embedding_version = ?5 AND preprocessing_version = ?6 AND metric = ?7 AND dimensions = ?8) SELECT CASE WHEN stale = 1 THEN 'stale' ELSE status END, COUNT(*) FROM ranked WHERE position = 1 GROUP BY CASE WHEN stale = 1 THEN 'stale' ELSE status END",
         )?;
         let mut counts = SemanticIndexTerminalCounts::default();
-        for row in statement.query_map(params![project_id.to_string(), model.model_id, model.provider, model.model_version, model.embedding_version, model.preprocessing_version, model.metric], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)))? {
+        for row in statement.query_map(
+            params![
+                project_id.to_string(),
+                model.model_id,
+                model.provider,
+                model.model_version,
+                model.embedding_version,
+                model.preprocessing_version,
+                model.metric,
+                model.dimensions as i64
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
+        )? {
             let (status, count) = row?;
             counts.total += count;
             match status.as_str() {
@@ -4259,6 +5312,1193 @@ impl CatalogRepository for SqliteRepository {
     fn recover_interrupted_semantic_indexing(&self) -> Result<u64> {
         let changed = self.connection.execute(
             "UPDATE background_jobs SET state_json = '\"interrupted\"', stage_json = '\"semantic_index\"', error_message = COALESCE(error_message, 'Magic Search indexing was interrupted before completion; resume local indexing to continue.'), updated_at = ?1, finished_at = ?1 WHERE state_json = '\"running\"' AND resume_metadata_json LIKE '%\"pipeline\":\"semantic-indexing\"%'",
+            params![timestamp(&Utc::now())],
+        )?;
+        Ok(changed as u64)
+    }
+
+    fn moment_analysis_inputs(
+        &self,
+        project_id: &ProjectId,
+        model: Option<&SemanticModelConfig>,
+    ) -> Result<Vec<MomentAnalysisInput>> {
+        self.moment_analysis_inputs_for_predicate(
+            project_id,
+            model,
+            "",
+            Vec::new(),
+            "(COALESCE(metadata.captured_at_local, a.captured_at) IS NULL) ASC, COALESCE(metadata.captured_at_local, a.captured_at) ASC, a.id ASC",
+        )
+    }
+
+    fn moment_incremental_analysis_window(
+        &self,
+        project_id: &ProjectId,
+        model: Option<&SemanticModelConfig>,
+    ) -> Result<Option<MomentIncrementalAnalysisWindow>> {
+        let active_timeline = self
+            .connection
+            .query_row(
+                "SELECT id, active_run_id, semantic_model_key FROM shoot_timelines WHERE project_id = ?1",
+                params![project_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((timeline_id, Some(active_run_id), active_semantic_model_key)) = active_timeline
+        else {
+            return Ok(None);
+        };
+
+        // Whole Moment IDs are selected first, so the bounded context cannot start midway
+        // through a structural group. Two completed/current Moments provide enough continuity
+        // context for an append-only tail without loading historic project vectors.
+        let mut recent_moments = self
+            .connection
+            .prepare(
+                "SELECT record.id, record.ordinal
+                 FROM moment_records record
+                 WHERE record.project_id = ?1
+                   AND record.timeline_id = ?2
+                   AND record.stale = 0
+                   AND EXISTS (
+                       SELECT 1 FROM moment_memberships member
+                       WHERE member.project_id = record.project_id
+                         AND member.moment_id = record.id
+                         AND member.active = 1
+                         AND member.membership_state = 'member'
+                   )
+                 ORDER BY record.ordinal DESC, record.id DESC
+                 LIMIT 2",
+            )?
+            .query_map(params![project_id.to_string(), timeline_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        recent_moments
+            .sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        let context_moment_ids: Vec<String> = recent_moments
+            .iter()
+            .map(|(moment_id, _)| moment_id.clone())
+            .collect();
+
+        let maximum_active_ordinal: Option<i64> = self.connection.query_row(
+            "SELECT MAX(ordinal) FROM moment_memberships
+             WHERE project_id = ?1 AND active = 1",
+            params![project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let global_ordinal_base = match maximum_active_ordinal {
+            Some(value) => u64::try_from(value)
+                .map_err(|_| {
+                    PersistenceError::InvalidData(
+                        "active Moment membership ordinal must be non-negative".into(),
+                    )
+                })?
+                .saturating_add(1),
+            None => 0,
+        };
+
+        let affected_tail_start_ordinal = if context_moment_ids.is_empty() {
+            global_ordinal_base
+        } else {
+            let placeholders = std::iter::repeat_n("?", context_moment_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT MIN(ordinal) FROM moment_memberships
+                 WHERE project_id = ? AND active = 1 AND membership_state = 'member'
+                   AND moment_id IN ({placeholders})"
+            );
+            let mut parameters = vec![rusqlite::types::Value::from(project_id.to_string())];
+            parameters.extend(context_moment_ids.iter().cloned().map(Into::into));
+            let minimum: Option<i64> =
+                self.connection
+                    .query_row(&sql, rusqlite::params_from_iter(parameters), |row| {
+                        row.get(0)
+                    })?;
+            match minimum {
+                Some(value) => u64::try_from(value).map_err(|_| {
+                    PersistenceError::InvalidData(
+                        "active Moment membership ordinal must be non-negative".into(),
+                    )
+                })?,
+                None => global_ordinal_base,
+            }
+        };
+
+        let moment_ordinal_base: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(record.ordinal), -1) + 1
+             FROM moment_records record
+             WHERE record.project_id = ?1
+               AND record.timeline_id = ?2
+               AND record.stale = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM moment_memberships member
+                   WHERE member.project_id = record.project_id
+                     AND member.moment_id = record.id
+                     AND member.active = 1
+                     AND member.membership_state = 'member'
+                     AND member.ordinal >= ?3
+               )",
+            params![
+                project_id.to_string(),
+                timeline_id,
+                affected_tail_start_ordinal as i64
+            ],
+            |row| row.get(0),
+        )?;
+        let moment_ordinal_base = u64::try_from(moment_ordinal_base).map_err(|_| {
+            PersistenceError::InvalidData(
+                "preserved active Moment ordinal must be non-negative".into(),
+            )
+        })?;
+
+        let previous_latest_captured_at = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(metadata.captured_at_local, asset.captured_at)
+                 FROM moment_memberships member
+                 JOIN media_assets asset ON asset.id = member.media_asset_id
+                 LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id
+                 WHERE member.project_id = ?1
+                   AND member.active = 1
+                   AND member.membership_state = 'member'
+                   AND COALESCE(metadata.captured_at_local, asset.captured_at) IS NOT NULL
+                 ORDER BY member.ordinal DESC, member.media_asset_id DESC
+                 LIMIT 1",
+                params![project_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        // The analysis-input query operates on media asset IDs, whereas the query above chose
+        // Moment IDs to guarantee a whole-group context. Resolve the active member assets here
+        // instead of accidentally comparing media IDs with Moment-record IDs.
+        let context_asset_ids = if context_moment_ids.is_empty() {
+            Vec::new()
+        } else {
+            let placeholders = std::iter::repeat_n("?", context_moment_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT member.media_asset_id
+                 FROM moment_memberships member
+                 WHERE member.project_id = ?
+                   AND member.active = 1
+                   AND member.membership_state = 'member'
+                   AND member.moment_id IN ({placeholders})
+                 GROUP BY member.media_asset_id
+                 ORDER BY MIN(member.ordinal) ASC, member.media_asset_id ASC"
+            );
+            let mut parameters = vec![rusqlite::types::Value::from(project_id.to_string())];
+            parameters.extend(context_moment_ids.iter().cloned().map(Into::into));
+            self.connection
+                .prepare(&sql)?
+                .query_map(rusqlite::params_from_iter(parameters), |row| row.get(0))?
+                .collect::<std::result::Result<Vec<String>, _>>()?
+        };
+
+        let preceding_context = if context_asset_ids.is_empty() {
+            Vec::new()
+        } else {
+            let first_extra_parameter = if model.is_some() { 9 } else { 2 };
+            let placeholders = (0..context_asset_ids.len())
+                .map(|offset| format!("?{}", first_extra_parameter + offset))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.moment_analysis_inputs_for_predicate(
+                project_id,
+                model,
+                &format!(" AND a.id IN ({placeholders})"),
+                context_asset_ids.into_iter().map(Into::into).collect(),
+                "(COALESCE(metadata.captured_at_local, a.captured_at) IS NULL) ASC, COALESCE(metadata.captured_at_local, a.captured_at) ASC, a.id ASC",
+            )?
+        };
+
+        // Do not pull active members again. The second clause deliberately includes durable
+        // `ungrouped` results so a photo that later gains a usable capture timestamp or local
+        // embedding can participate in an explicit update without being lost.
+        let pending_inputs = self.moment_analysis_inputs_for_predicate(
+            project_id,
+            model,
+            " AND (
+                NOT EXISTS (
+                    SELECT 1 FROM moment_memberships active_member
+                    WHERE active_member.project_id = a.project_id
+                      AND active_member.media_asset_id = a.id
+                      AND active_member.active = 1
+                      AND active_member.membership_state = 'member'
+                )
+                OR EXISTS (
+                    SELECT 1 FROM moment_memberships active_ungrouped
+                    WHERE active_ungrouped.project_id = a.project_id
+                      AND active_ungrouped.media_asset_id = a.id
+                      AND active_ungrouped.active = 1
+                      AND active_ungrouped.membership_state = 'ungrouped'
+                )
+            )",
+            Vec::new(),
+            "(COALESCE(metadata.captured_at_local, a.captured_at) IS NULL) ASC, COALESCE(metadata.captured_at_local, a.captured_at) ASC, a.id ASC",
+        )?;
+
+        Ok(Some(MomentIncrementalAnalysisWindow {
+            timeline_id,
+            active_run_id,
+            active_semantic_model_key,
+            previous_latest_captured_at,
+            global_ordinal_base,
+            affected_tail_start_ordinal,
+            moment_ordinal_base,
+            preceding_context,
+            pending_inputs,
+        }))
+    }
+
+    fn active_moment_override_operations(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<MomentOverrideOperation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, project_id, operation, left_asset_id, right_asset_id, created_at, active
+             FROM moment_override_operations
+             WHERE project_id = ?1 AND active = 1
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let overrides = statement
+            .query_map(params![project_id.to_string()], |row| {
+                Ok(MomentOverrideOperation {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    operation: row.get(2)?,
+                    left_asset_id: row.get(3)?,
+                    right_asset_id: row.get(4)?,
+                    created_at: row.get(5)?,
+                    active: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into);
+        overrides
+    }
+
+    fn replace_active_moment_analysis(
+        &self,
+        timeline: &MomentTimelineStatusRecord,
+        run: &MomentAnalysisRunRecord,
+        segments: &[TimelineSegmentRecord],
+        moments: &[MomentRecord],
+        memberships: &[MomentMembershipRecord],
+        boundaries: &[MomentBoundaryEvidenceRecord],
+    ) -> Result<()> {
+        if timeline.project_id != run.project_id {
+            return Err(PersistenceError::InvalidData(
+                "timeline and analysis run project IDs differ".into(),
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE moment_memberships SET active = 0 WHERE project_id = ?1 AND active = 1",
+            params![timeline.project_id],
+        )?;
+        transaction.execute(
+            "UPDATE moment_records SET stale = 1 WHERE project_id = ?1 AND stale = 0",
+            params![timeline.project_id],
+        )?;
+        transaction.execute(
+            "UPDATE timeline_segments SET stale = 1 WHERE project_id = ?1 AND stale = 0",
+            params![timeline.project_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO shoot_timelines (id, project_id, active_run_id, state, analyzer_id, analyzer_version, boundary_algorithm_version, semantic_model_key, input_catalog_version, created_at, updated_at, last_analyzed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10)
+             ON CONFLICT(project_id) DO UPDATE SET id = excluded.id, active_run_id = excluded.active_run_id, state = excluded.state, analyzer_id = excluded.analyzer_id, analyzer_version = excluded.analyzer_version, boundary_algorithm_version = excluded.boundary_algorithm_version, semantic_model_key = excluded.semantic_model_key, input_catalog_version = excluded.input_catalog_version, updated_at = excluded.updated_at, last_analyzed_at = excluded.last_analyzed_at",
+            params![timeline.timeline_id, timeline.project_id, run.id, timeline.state, timeline.analyzer_id, timeline.analyzer_version, timeline.boundary_algorithm_version, timeline.semantic_model_key, timeline.input_catalog_version, timeline.updated_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO moment_analysis_runs (id, timeline_id, project_id, state, analyzer_id, analyzer_version, boundary_algorithm_version, semantic_model_key, input_catalog_version, items_total, items_completed, error_count, started_at, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![run.id, run.timeline_id, run.project_id, run.state, run.analyzer_id, run.analyzer_version, run.boundary_algorithm_version, run.semantic_model_key, run.input_catalog_version, run.items_total as i64, run.items_completed as i64, run.error_count as i64, run.started_at, run.finished_at],
+        )?;
+        for segment in segments {
+            transaction.execute(
+                "INSERT INTO timeline_segments (id, project_id, run_id, ordinal, started_at, ended_at, asset_count, boundary_category, boundary_evidence_json, created_at, stale)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![segment.id, segment.project_id, segment.run_id, segment.ordinal as i64, segment.started_at, segment.ended_at, segment.asset_count as i64, segment.boundary_category, json(&segment.boundary_evidence)?, segment.created_at, segment.stale],
+            )?;
+        }
+        for moment in moments {
+            let centroid = moment
+                .centroid
+                .as_ref()
+                .map(|values| encode_semantic_vector(values, values.len()))
+                .transpose()?;
+            transaction.execute(
+                "INSERT INTO moment_records (id, project_id, timeline_id, run_id, segment_id, anchor_asset_id, ordinal, started_at, ended_at, asset_count, ai_representative_asset_id, centroid_blob, centroid_dimensions, suggested_label, label_confidence, label_evidence_json, label_state, created_at, stale)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                params![moment.id, moment.project_id, moment.timeline_id, moment.run_id, moment.segment_id, moment.anchor_asset_id, moment.ordinal as i64, moment.started_at, moment.ended_at, moment.asset_count as i64, moment.ai_representative_asset_id, centroid, moment.centroid_dimensions.map(|value| value as i64), moment.suggested_label, moment.label_confidence, json(&moment.label_evidence)?, moment.label_state, moment.created_at, moment.stale],
+            )?;
+            transaction.execute(
+                "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_CREATED', ?4, ?5)",
+                params![Uuid::new_v4().to_string(), moment.project_id, moment.id, json(&serde_json::json!({"source":"local_analysis", "runId": moment.run_id}))?, moment.created_at],
+            )?;
+        }
+        for membership in memberships {
+            transaction.execute(
+                "INSERT INTO moment_memberships (id, project_id, run_id, moment_id, media_asset_id, ordinal, membership_state, created_at, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![membership.id, membership.project_id, membership.run_id, membership.moment_id, membership.media_asset_id, membership.ordinal as i64, membership.membership_state, membership.created_at, membership.active],
+            )?;
+        }
+        for boundary in boundaries {
+            transaction.execute(
+                "INSERT INTO moment_boundary_evidence (id, project_id, run_id, left_asset_id, right_asset_id, ordinal, category, components_json, explanation, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![boundary.id, boundary.project_id, boundary.run_id, boundary.left_asset_id, boundary.right_asset_id, boundary.ordinal as i64, boundary.category, json(&boundary.components)?, boundary.explanation, boundary.created_at],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_active_moment_analysis_tail(
+        &self,
+        timeline: &MomentTimelineStatusRecord,
+        run: &MomentAnalysisRunRecord,
+        affected_tail_start_ordinal: u64,
+        segments: &[TimelineSegmentRecord],
+        moments: &[MomentRecord],
+        memberships: &[MomentMembershipRecord],
+        boundaries: &[MomentBoundaryEvidenceRecord],
+    ) -> Result<()> {
+        let expected_active_run_id = timeline.active_run_id.as_deref().ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "tail replacement requires an existing active Moment analysis run".into(),
+            )
+        })?;
+        if run.id == expected_active_run_id {
+            return Err(PersistenceError::InvalidData(
+                "tail replacement must create a distinct Moment analysis run".into(),
+            ));
+        }
+        let tail_start = i64::try_from(affected_tail_start_ordinal).map_err(|_| {
+            PersistenceError::InvalidData(
+                "affected tail ordinal exceeds SQLite integer range".into(),
+            )
+        })?;
+        let referenced_assets = validate_moment_tail_payload(
+            timeline,
+            run,
+            affected_tail_start_ordinal,
+            segments,
+            moments,
+            memberships,
+            boundaries,
+        )?;
+        let selected_project = ProjectId::try_from(timeline.project_id.as_str())
+            .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+        assert_moment_tail_assets_belong_to_project(
+            &self.connection,
+            &selected_project,
+            &referenced_assets,
+        )?;
+        let new_membership_assets: BTreeSet<String> = memberships
+            .iter()
+            .map(|membership| membership.media_asset_id.clone())
+            .collect();
+        let new_moment_anchors: BTreeSet<String> = moments
+            .iter()
+            .map(|moment| moment.anchor_asset_id.clone())
+            .collect();
+
+        // A tail writer must never cut an existing active Moment in half. The window method
+        // selects whole latest Moment(s), but this check also protects direct callers.
+        let crosses_existing_moment: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM moment_memberships earlier
+                JOIN moment_memberships later
+                  ON later.project_id = earlier.project_id
+                 AND later.moment_id = earlier.moment_id
+                 AND later.active = 1
+                 AND later.membership_state = 'member'
+                WHERE earlier.project_id = ?1
+                  AND earlier.active = 1
+                  AND earlier.membership_state = 'member'
+                  AND earlier.ordinal < ?2
+                  AND later.ordinal >= ?2
+            )",
+            params![timeline.project_id, tail_start],
+            |row| row.get(0),
+        )?;
+        if crosses_existing_moment {
+            return Err(PersistenceError::InvalidData(
+                "affected tail start would split an active Moment; request a wider window or full rebuild"
+                    .into(),
+            ));
+        }
+
+        let old_tail_assets: BTreeSet<String> = self
+            .connection
+            .prepare(
+                "SELECT media_asset_id FROM moment_memberships
+                 WHERE project_id = ?1 AND active = 1 AND ordinal >= ?2
+                 ORDER BY ordinal ASC, media_asset_id ASC",
+            )?
+            .query_map(params![timeline.project_id, tail_start], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if !old_tail_assets.is_subset(&new_membership_assets) {
+            return Err(PersistenceError::InvalidData(
+                "tail replacement would drop an active membership; use a full rebuild instead"
+                    .into(),
+            ));
+        }
+
+        // Human labels/representatives are anchored to a stable asset, not a generated Moment
+        // ID. Requiring the corresponding anchor in the replacement makes a tail update fail
+        // closed rather than hide a photographer's current presentation choice.
+        let protected_tail_anchors: BTreeSet<String> = self
+            .connection
+            .prepare(
+                "SELECT record.anchor_asset_id
+                 FROM moment_records record
+                 WHERE record.project_id = ?1
+                   AND record.timeline_id = ?2
+                   AND record.stale = 0
+                   AND EXISTS (
+                       SELECT 1 FROM moment_memberships member
+                       WHERE member.project_id = record.project_id
+                         AND member.moment_id = record.id
+                         AND member.active = 1
+                         AND member.membership_state = 'member'
+                         AND member.ordinal >= ?3
+                   )
+                   AND (
+                       EXISTS (SELECT 1 FROM moment_human_labels label WHERE label.project_id = record.project_id AND label.anchor_asset_id = record.anchor_asset_id)
+                       OR EXISTS (SELECT 1 FROM moment_human_representatives representative WHERE representative.project_id = record.project_id AND representative.anchor_asset_id = record.anchor_asset_id)
+                   )",
+            )?
+            .query_map(
+                params![timeline.project_id, timeline.timeline_id, tail_start],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<_, _>>()?;
+        if !protected_tail_anchors.is_subset(&new_moment_anchors) {
+            return Err(PersistenceError::InvalidData(
+                "tail replacement would orphan a human Moment label or representative anchor; use a full rebuild with preserved anchors"
+                    .into(),
+            ));
+        }
+
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE timeline_segments
+             SET stale = 1
+             WHERE project_id = ?1
+               AND stale = 0
+               AND EXISTS (
+                   SELECT 1
+                   FROM moment_records record
+                   JOIN moment_memberships member ON member.moment_id = record.id
+                   WHERE record.segment_id = timeline_segments.id
+                     AND record.project_id = timeline_segments.project_id
+                     AND record.stale = 0
+                     AND member.project_id = timeline_segments.project_id
+                     AND member.active = 1
+                     AND member.membership_state = 'member'
+                     AND member.ordinal >= ?2
+               )",
+            params![timeline.project_id, tail_start],
+        )?;
+        transaction.execute(
+            "UPDATE moment_records
+             SET stale = 1
+             WHERE project_id = ?1
+               AND timeline_id = ?2
+               AND stale = 0
+               AND EXISTS (
+                   SELECT 1 FROM moment_memberships member
+                   WHERE member.project_id = moment_records.project_id
+                     AND member.moment_id = moment_records.id
+                     AND member.active = 1
+                     AND member.membership_state = 'member'
+                     AND member.ordinal >= ?3
+               )",
+            params![timeline.project_id, timeline.timeline_id, tail_start],
+        )?;
+        transaction.execute(
+            "UPDATE moment_memberships
+             SET active = 0
+             WHERE project_id = ?1 AND active = 1 AND ordinal >= ?2",
+            params![timeline.project_id, tail_start],
+        )?;
+
+        for moment in moments {
+            let collides_with_preserved_active: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM moment_records
+                    WHERE project_id = ?1 AND timeline_id = ?2 AND stale = 0 AND ordinal = ?3
+                )",
+                params![
+                    timeline.project_id,
+                    timeline.timeline_id,
+                    moment.ordinal as i64
+                ],
+                |row| row.get(0),
+            )?;
+            if collides_with_preserved_active {
+                return Err(PersistenceError::InvalidData(
+                    "tail Moment ordinal collides with preserved active projection; core must offset tail Moment ordinals"
+                        .into(),
+                ));
+            }
+        }
+
+        let timeline_updated = transaction.execute(
+            "UPDATE shoot_timelines
+             SET active_run_id = ?1,
+                 state = ?2,
+                 analyzer_id = ?3,
+                 analyzer_version = ?4,
+                 boundary_algorithm_version = ?5,
+                 semantic_model_key = ?6,
+                 input_catalog_version = ?7,
+                 updated_at = ?8,
+                 last_analyzed_at = ?8
+             WHERE id = ?9 AND project_id = ?10 AND active_run_id = ?11",
+            params![
+                run.id,
+                timeline.state,
+                timeline.analyzer_id,
+                timeline.analyzer_version,
+                timeline.boundary_algorithm_version,
+                timeline.semantic_model_key,
+                timeline.input_catalog_version,
+                timeline.updated_at,
+                timeline.timeline_id,
+                timeline.project_id,
+                expected_active_run_id,
+            ],
+        )?;
+        if timeline_updated != 1 {
+            return Err(PersistenceError::InvalidData(
+                "active Moment timeline changed before tail replacement; request a fresh window"
+                    .into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO moment_analysis_runs (id, timeline_id, project_id, state, analyzer_id, analyzer_version, boundary_algorithm_version, semantic_model_key, input_catalog_version, items_total, items_completed, error_count, started_at, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![run.id, run.timeline_id, run.project_id, run.state, run.analyzer_id, run.analyzer_version, run.boundary_algorithm_version, run.semantic_model_key, run.input_catalog_version, run.items_total as i64, run.items_completed as i64, run.error_count as i64, run.started_at, run.finished_at],
+        )?;
+        for segment in segments {
+            transaction.execute(
+                "INSERT INTO timeline_segments (id, project_id, run_id, ordinal, started_at, ended_at, asset_count, boundary_category, boundary_evidence_json, created_at, stale)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![segment.id, segment.project_id, segment.run_id, segment.ordinal as i64, segment.started_at, segment.ended_at, segment.asset_count as i64, segment.boundary_category, json(&segment.boundary_evidence)?, segment.created_at, segment.stale],
+            )?;
+        }
+        for moment in moments {
+            let centroid = moment
+                .centroid
+                .as_ref()
+                .map(|values| encode_semantic_vector(values, values.len()))
+                .transpose()?;
+            transaction.execute(
+                "INSERT INTO moment_records (id, project_id, timeline_id, run_id, segment_id, anchor_asset_id, ordinal, started_at, ended_at, asset_count, ai_representative_asset_id, centroid_blob, centroid_dimensions, suggested_label, label_confidence, label_evidence_json, label_state, created_at, stale)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                params![moment.id, moment.project_id, moment.timeline_id, moment.run_id, moment.segment_id, moment.anchor_asset_id, moment.ordinal as i64, moment.started_at, moment.ended_at, moment.asset_count as i64, moment.ai_representative_asset_id, centroid, moment.centroid_dimensions.map(|value| value as i64), moment.suggested_label, moment.label_confidence, json(&moment.label_evidence)?, moment.label_state, moment.created_at, moment.stale],
+            )?;
+            transaction.execute(
+                "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_CREATED', ?4, ?5)",
+                params![Uuid::new_v4().to_string(), moment.project_id, moment.id, json(&serde_json::json!({"source":"local_incremental_analysis", "runId": moment.run_id}))?, moment.created_at],
+            )?;
+        }
+        for membership in memberships {
+            transaction.execute(
+                "INSERT INTO moment_memberships (id, project_id, run_id, moment_id, media_asset_id, ordinal, membership_state, created_at, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![membership.id, membership.project_id, membership.run_id, membership.moment_id, membership.media_asset_id, membership.ordinal as i64, membership.membership_state, membership.created_at, membership.active],
+            )?;
+        }
+        for boundary in boundaries {
+            transaction.execute(
+                "INSERT INTO moment_boundary_evidence (id, project_id, run_id, left_asset_id, right_asset_id, ordinal, category, components_json, explanation, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![boundary.id, boundary.project_id, boundary.run_id, boundary.left_asset_id, boundary.right_asset_id, boundary.ordinal as i64, boundary.category, json(&boundary.components)?, boundary.explanation, boundary.created_at],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn moment_timeline_status(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Option<MomentTimelineStatusRecord>> {
+        self.connection.query_row(
+            "SELECT t.id, t.project_id, t.state, t.analyzer_id, t.analyzer_version, t.boundary_algorithm_version, t.semantic_model_key, t.input_catalog_version, t.active_run_id,
+                (SELECT COUNT(*) FROM moment_records m WHERE m.project_id = t.project_id AND m.timeline_id = t.id AND m.stale = 0),
+                (SELECT COUNT(*) FROM moment_memberships mm WHERE mm.project_id = t.project_id AND mm.active = 1),
+                (SELECT COUNT(*) FROM moment_memberships mm WHERE mm.project_id = t.project_id AND mm.active = 1 AND mm.membership_state = 'ungrouped'),
+                t.updated_at
+             FROM shoot_timelines t WHERE t.project_id = ?1",
+            params![project_id.to_string()],
+            |row| Ok(MomentTimelineStatusRecord {
+                timeline_id: row.get(0)?, project_id: row.get(1)?, state: row.get(2)?, analyzer_id: row.get(3)?, analyzer_version: row.get(4)?, boundary_algorithm_version: row.get(5)?, semantic_model_key: row.get(6)?, input_catalog_version: row.get(7)?, active_run_id: row.get(8)?, moment_count: row.get::<_, i64>(9)? as u64, eligible_count: row.get::<_, i64>(10)? as u64, ungrouped_count: row.get::<_, i64>(11)? as u64, updated_at: row.get(12)?,
+            }),
+        ).optional().map_err(Into::into)
+    }
+
+    fn moment_timeline_page(
+        &self,
+        project_id: &ProjectId,
+        limit: u32,
+        offset: u32,
+    ) -> Result<MomentTimelinePage> {
+        let limit = limit.clamp(1, 120);
+        let mut moments = moment_timeline_rows(
+            &self.connection,
+            project_id,
+            None,
+            limit.saturating_add(1),
+            offset,
+        )?;
+        let has_more = moments.len() > limit as usize;
+        moments.truncate(limit as usize);
+        Ok(MomentTimelinePage {
+            timeline: self.moment_timeline_status(project_id)?,
+            gaps: timeline_gaps(&self.connection, project_id)?,
+            moments,
+            has_more,
+        })
+    }
+
+    fn moment_detail(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+    ) -> Result<Option<MomentDetailRecord>> {
+        let Some(moment) =
+            moment_timeline_rows(&self.connection, project_id, Some(moment_id), 1, 0)?
+                .into_iter()
+                .next()
+        else {
+            return Ok(None);
+        };
+        let evidence_json = self.connection.query_row(
+            "SELECT label_evidence_json FROM moment_records WHERE id = ?1 AND project_id = ?2 AND stale = 0",
+            params![moment_id, project_id.to_string()], |row| row.get::<_, String>(0),
+        )?;
+        let evidence: serde_json::Value = serde_json::from_str(&evidence_json)?;
+        let label_evidence = evidence
+            .get("concepts")
+            .and_then(serde_json::Value::as_array)
+            .map(|concepts| {
+                concepts
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(MomentDetailRecord {
+            membership_count: moment.asset_count,
+            has_human_label: moment.human_label.is_some(),
+            has_human_representative: moment.human_representative_asset_id.is_some(),
+            moment,
+            label_evidence,
+        }))
+    }
+
+    fn moment_belongs_to_project(&self, project_id: &ProjectId, moment_id: &str) -> Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM moment_records WHERE id = ?1 AND project_id = ?2 AND stale = 0)",
+            params![moment_id, project_id.to_string()], |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
+    fn moment_contains_asset(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+        asset_id: &str,
+    ) -> Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND media_asset_id = ?3 AND active = 1 AND membership_state = 'member')",
+            params![project_id.to_string(), moment_id, asset_id], |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
+    fn filter_active_moment_assets(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+        asset_ids: &[String],
+    ) -> Result<Vec<String>> {
+        if !self.moment_belongs_to_project(project_id, moment_id)? {
+            return Err(PersistenceError::InvalidData(
+                "moment does not belong to the selected project".into(),
+            ));
+        }
+        if asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", asset_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT media_asset_id FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' AND media_asset_id IN ({placeholders})"
+        );
+        let mut bound = vec![
+            rusqlite::types::Value::from(project_id.to_string()),
+            moment_id.to_owned().into(),
+        ];
+        bound.extend(asset_ids.iter().cloned().map(Into::into));
+        self.connection
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(bound), |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn rename_moment(&self, project_id: &ProjectId, moment_id: &str, label: &str) -> Result<()> {
+        let label = label.trim();
+        if label.is_empty() || label.chars().count() > 160 {
+            return Err(PersistenceError::InvalidData(
+                "moment label must contain 1 through 160 characters".into(),
+            ));
+        }
+        let anchor = moment_anchor_asset_id(&self.connection, project_id, moment_id)?;
+        let now = timestamp(&Utc::now());
+        self.connection.execute(
+            "INSERT INTO moment_human_labels (id, project_id, anchor_asset_id, label, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(project_id, anchor_asset_id) DO UPDATE SET label = excluded.label, updated_at = excluded.updated_at",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), anchor, label, now],
+        )?;
+        self.connection.execute(
+            "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_RENAMED', ?4, ?5)",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), moment_id, json(&serde_json::json!({"label": label}))?, now],
+        )?;
+        Ok(())
+    }
+
+    fn set_moment_human_representative(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+        asset_id: &str,
+    ) -> Result<()> {
+        let anchor = moment_anchor_asset_id(&self.connection, project_id, moment_id)?;
+        if !self.moment_contains_asset(project_id, moment_id, asset_id)? {
+            return Err(PersistenceError::InvalidData(
+                "human representative must belong to the selected moment".into(),
+            ));
+        }
+        let now = timestamp(&Utc::now());
+        self.connection.execute(
+            "INSERT INTO moment_human_representatives (id, project_id, anchor_asset_id, media_asset_id, selected_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id, anchor_asset_id) DO UPDATE SET media_asset_id = excluded.media_asset_id, selected_at = excluded.selected_at",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), anchor, asset_id, now],
+        )?;
+        self.connection.execute(
+            "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_REPRESENTATIVE_CHANGED', ?4, ?5)",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), moment_id, json(&serde_json::json!({"assetId": asset_id}))?, now],
+        )?;
+        Ok(())
+    }
+
+    fn merge_adjacent_moments(
+        &self,
+        project_id: &ProjectId,
+        left_moment_id: &str,
+        right_moment_id: &str,
+    ) -> Result<()> {
+        let left = moment_record_for_edit(&self.connection, project_id, left_moment_id)?;
+        let right = moment_record_for_edit(&self.connection, project_id, right_moment_id)?;
+        if left.0 != right.0 || left.1 != right.1 || right.3 != left.3 + 1 {
+            return Err(PersistenceError::InvalidData(
+                "only adjacent active moments can be merged".into(),
+            ));
+        }
+        let left_last = self.connection.query_row(
+            "SELECT media_asset_id FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' ORDER BY ordinal DESC, media_asset_id DESC LIMIT 1",
+            params![project_id.to_string(), left_moment_id], |row| row.get::<_, String>(0),
+        )?;
+        let right_first = self.connection.query_row(
+            "SELECT media_asset_id FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' ORDER BY ordinal ASC, media_asset_id ASC LIMIT 1",
+            params![project_id.to_string(), right_moment_id], |row| row.get::<_, String>(0),
+        )?;
+        let now = timestamp(&Utc::now());
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO moment_override_operations (id, project_id, operation, left_asset_id, right_asset_id, created_at, active) VALUES (?1, ?2, 'merge', ?3, ?4, ?5, 1)
+             ON CONFLICT(project_id, operation, left_asset_id, right_asset_id) DO UPDATE SET active = 1, created_at = excluded.created_at",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), left_last, right_first, now],
+        )?;
+        transaction.execute(
+            "UPDATE moment_memberships SET moment_id = ?3 WHERE project_id = ?1 AND moment_id = ?2 AND active = 1",
+            params![project_id.to_string(), right_moment_id, left_moment_id],
+        )?;
+        transaction.execute(
+            "UPDATE moment_records SET stale = 1 WHERE id = ?1 AND project_id = ?2",
+            params![right_moment_id, project_id.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE moment_records SET asset_count = (SELECT COUNT(*) FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member'), ended_at = (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM moment_memberships member JOIN media_assets asset ON asset.id = member.media_asset_id LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE member.project_id = ?1 AND member.moment_id = ?2 AND member.active = 1 ORDER BY member.ordinal DESC LIMIT 1) WHERE id = ?2",
+            params![project_id.to_string(), left_moment_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_MERGED', ?4, ?5)",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), left_moment_id, json(&serde_json::json!({"mergedMomentId": right_moment_id}))?, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn split_moment(
+        &self,
+        project_id: &ProjectId,
+        moment_id: &str,
+        after_asset_id: &str,
+    ) -> Result<()> {
+        let (timeline_id, run_id, _segment_id, moment_ordinal, _anchor, _started, _ended) =
+            moment_record_for_edit(&self.connection, project_id, moment_id)?;
+        let after_ordinal: i64 = self.connection.query_row(
+            "SELECT ordinal FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND media_asset_id = ?3 AND active = 1 AND membership_state = 'member'",
+            params![project_id.to_string(), moment_id, after_asset_id], |row| row.get(0),
+        ).optional()?.ok_or_else(|| PersistenceError::InvalidData("split point must be a member of the selected moment".into()))?;
+        let next = self.connection.query_row(
+            "SELECT media_asset_id, ordinal FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' AND ordinal > ?3 ORDER BY ordinal ASC, media_asset_id ASC LIMIT 1",
+            params![project_id.to_string(), moment_id, after_ordinal], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ).optional()?.ok_or_else(|| PersistenceError::InvalidData("split point must leave at least one photo after it".into()))?;
+        let new_moment_id = Uuid::new_v4().to_string();
+        let new_segment_id = Uuid::new_v4().to_string();
+        let now = timestamp(&Utc::now());
+        let new_ordinal = moment_ordinal + 1;
+        let segment_ordinal: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM timeline_segments WHERE run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        let (after_time, next_time): (Option<String>, Option<String>) = self.connection.query_row(
+            "SELECT (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM media_assets asset LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE asset.id = ?1), (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM media_assets asset LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE asset.id = ?2)",
+            params![after_asset_id, next.0], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE moment_records SET ordinal = ordinal + 1000000 WHERE project_id = ?1 AND run_id = ?2 AND stale = 0 AND ordinal > ?3",
+            params![project_id.to_string(), run_id, moment_ordinal],
+        )?;
+        transaction.execute(
+            "UPDATE moment_records SET ordinal = ordinal - 999999 WHERE project_id = ?1 AND run_id = ?2 AND stale = 0 AND ordinal >= ?3",
+            params![project_id.to_string(), run_id, moment_ordinal + 1_000_001],
+        )?;
+        transaction.execute(
+            "INSERT INTO timeline_segments (id, project_id, run_id, ordinal, started_at, ended_at, asset_count, boundary_category, boundary_evidence_json, created_at, stale) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 'strong', ?6, ?7, 0)",
+            params![new_segment_id, project_id.to_string(), run_id, segment_ordinal, next_time, json(&serde_json::json!({"manual": true, "afterAssetId": after_asset_id}))?, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO moment_records (id, project_id, timeline_id, run_id, segment_id, anchor_asset_id, ordinal, started_at, ended_at, asset_count, ai_representative_asset_id, centroid_blob, centroid_dimensions, suggested_label, label_confidence, label_evidence_json, label_state, created_at, stale) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 0, NULL, NULL, NULL, NULL, NULL, '{}', 'abstained', ?9, 0)",
+            params![new_moment_id, project_id.to_string(), timeline_id, run_id, new_segment_id, next.0, new_ordinal, next_time, now],
+        )?;
+        transaction.execute(
+            "UPDATE moment_memberships SET moment_id = ?4 WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' AND ordinal > ?3",
+            params![project_id.to_string(), moment_id, after_ordinal, new_moment_id],
+        )?;
+        transaction.execute(
+            "UPDATE moment_records SET asset_count = (SELECT COUNT(*) FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member'), ended_at = ?3 WHERE id = ?2",
+            params![project_id.to_string(), moment_id, after_time],
+        )?;
+        transaction.execute(
+            "UPDATE moment_records SET asset_count = (SELECT COUNT(*) FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member'), ended_at = (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM moment_memberships member JOIN media_assets asset ON asset.id = member.media_asset_id LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE member.project_id = ?1 AND member.moment_id = ?2 AND member.active = 1 ORDER BY member.ordinal DESC LIMIT 1) WHERE id = ?2",
+            params![project_id.to_string(), new_moment_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO moment_override_operations (id, project_id, operation, left_asset_id, right_asset_id, created_at, active) VALUES (?1, ?2, 'split', ?3, ?4, ?5, 1) ON CONFLICT(project_id, operation, left_asset_id, right_asset_id) DO UPDATE SET active = 1, created_at = excluded.created_at",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), after_asset_id, next.0, now],
+        )?;
+        transaction.execute(
+            "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_SPLIT', ?4, ?5), (?6, ?2, ?7, 'MOMENT_CREATED', ?8, ?5)",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), moment_id, json(&serde_json::json!({"afterAssetId": after_asset_id, "newMomentId": new_moment_id}))?, now, Uuid::new_v4().to_string(), new_moment_id, json(&serde_json::json!({"source":"human_split", "afterAssetId": after_asset_id}))?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn coverage_checklist_items(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<CoverageChecklistItemView>> {
+        let mut statement = self.connection.prepare(
+            "SELECT item.id, item.phrase, item.created_at, confirmation.state, confirmation.confirmed_at, confirmation.moment_id, confirmation.media_asset_id
+             FROM coverage_checklist_items item LEFT JOIN coverage_confirmations confirmation ON confirmation.checklist_item_id = item.id AND confirmation.project_id = item.project_id
+             WHERE item.project_id = ?1 ORDER BY item.created_at ASC, item.id ASC",
+        )?;
+        let items = statement
+            .query_map(params![project_id.to_string()], |row| {
+                Ok(CoverageChecklistItemView {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    created_at: row.get(2)?,
+                    confirmation_state: row.get(3)?,
+                    confirmed_at: row.get(4)?,
+                    moment_id: row.get(5)?,
+                    media_asset_id: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into);
+        items
+    }
+
+    fn create_coverage_checklist_item(&self, item: &CoverageChecklistItemRecord) -> Result<()> {
+        let phrase = item.text.trim();
+        if phrase.is_empty() || phrase.chars().count() > 160 {
+            return Err(PersistenceError::InvalidData(
+                "checklist phrase must contain 1 through 160 characters".into(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO coverage_checklist_items (id, project_id, phrase, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(project_id, phrase) DO NOTHING",
+            params![item.id, item.project_id, phrase, item.created_at],
+        )?;
+        Ok(())
+    }
+
+    fn update_coverage_confirmation(
+        &self,
+        project_id: &ProjectId,
+        checklist_item_id: &str,
+        state: &str,
+        moment_id: Option<&str>,
+        media_asset_id: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(state, "confirmed_covered" | "needs_review" | "not_covered") {
+            return Err(PersistenceError::InvalidData(
+                "unsupported coverage confirmation state".into(),
+            ));
+        }
+        let checklist_owned: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM coverage_checklist_items WHERE id = ?1 AND project_id = ?2)", params![checklist_item_id, project_id.to_string()], |row| row.get(0),
+        )?;
+        if !checklist_owned {
+            return Err(PersistenceError::InvalidData(
+                "checklist item does not belong to the selected project".into(),
+            ));
+        }
+        if let Some(moment_id) = moment_id {
+            if !self.moment_belongs_to_project(project_id, moment_id)? {
+                return Err(PersistenceError::InvalidData(
+                    "moment does not belong to the selected project".into(),
+                ));
+            }
+        }
+        if let Some(asset_id) = media_asset_id {
+            let asset = MediaAssetId::try_from(asset_id)
+                .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+            if !self.media_asset_belongs_to_project(&asset, project_id)? {
+                return Err(PersistenceError::InvalidData(
+                    "media asset does not belong to the selected project".into(),
+                ));
+            }
+            if let Some(moment_id) = moment_id {
+                if !self.moment_contains_asset(project_id, moment_id, asset_id)? {
+                    return Err(PersistenceError::InvalidData(
+                        "coverage asset must belong to the selected moment".into(),
+                    ));
+                }
+            }
+        }
+        let now = timestamp(&Utc::now());
+        self.connection.execute(
+            "INSERT INTO coverage_confirmations (id, project_id, checklist_item_id, state, moment_id, media_asset_id, confirmed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(project_id, checklist_item_id) DO UPDATE SET state = excluded.state, moment_id = excluded.moment_id, media_asset_id = excluded.media_asset_id, confirmed_at = excluded.confirmed_at",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), checklist_item_id, state, moment_id, media_asset_id, now],
+        )?;
+        self.connection.execute(
+            "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'COVERAGE_CONFIRMED', ?4, ?5)",
+            params![Uuid::new_v4().to_string(), project_id.to_string(), moment_id, json(&serde_json::json!({"checklistItemId": checklist_item_id, "state": state, "assetId": media_asset_id}))?, now],
+        )?;
+        Ok(())
+    }
+
+    fn record_camera_clock_offset_diagnostics(
+        &self,
+        diagnostics: &[CameraClockOffsetDiagnosticRecord],
+    ) -> Result<()> {
+        if diagnostics.is_empty() {
+            return Ok(());
+        }
+        let first = &diagnostics[0];
+        if first.project_id.trim().is_empty() || first.run_id.trim().is_empty() {
+            return Err(PersistenceError::InvalidData(
+                "camera clock diagnostic requires a project and Moment analysis run".into(),
+            ));
+        }
+        let mut diagnostic_ids = BTreeSet::new();
+        for diagnostic in diagnostics {
+            if diagnostic.project_id != first.project_id || diagnostic.run_id != first.run_id {
+                return Err(PersistenceError::InvalidData(
+                    "camera clock diagnostics must be recorded for one project and analysis run"
+                        .into(),
+                ));
+            }
+            if diagnostic.id.trim().is_empty()
+                || diagnostic.camera_a.trim().is_empty()
+                || diagnostic.camera_b.trim().is_empty()
+                || diagnostic.camera_a == diagnostic.camera_b
+                || !diagnostic_ids.insert(diagnostic.id.as_str())
+            {
+                return Err(PersistenceError::InvalidData(
+                    "camera clock diagnostic requires unique IDs and two distinct camera labels"
+                        .into(),
+                ));
+            }
+        }
+        let run_belongs_to_project: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM moment_analysis_runs
+                WHERE id = ?1 AND project_id = ?2
+            )",
+            params![first.run_id, first.project_id],
+            |row| row.get(0),
+        )?;
+        if !run_belongs_to_project {
+            return Err(PersistenceError::InvalidData(
+                "camera clock diagnostic run does not belong to the selected project".into(),
+            ));
+        }
+
+        let transaction = self.connection.unchecked_transaction()?;
+        for diagnostic in diagnostics {
+            transaction.execute(
+                "INSERT INTO camera_clock_offset_diagnostics
+                    (id, project_id, run_id, camera_a, camera_b, possible_offset_seconds, evidence_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    diagnostic.id,
+                    diagnostic.project_id,
+                    diagnostic.run_id,
+                    diagnostic.camera_a,
+                    diagnostic.camera_b,
+                    diagnostic.possible_offset_seconds,
+                    json(&diagnostic.evidence_json)?,
+                    diagnostic.created_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn latest_camera_clock_offset_diagnostics(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<CameraClockOffsetDiagnosticRecord>> {
+        // Diagnostics are specific to a structural-analysis run. Showing an older run after a
+        // newer active projection exists would be misleading, so no rows is intentionally
+        // returned when the active run has no diagnostic evidence.
+        let mut statement = self.connection.prepare(
+            "SELECT diagnostic.id, diagnostic.project_id, diagnostic.run_id,
+                    diagnostic.camera_a, diagnostic.camera_b,
+                    diagnostic.possible_offset_seconds, diagnostic.evidence_json,
+                    diagnostic.created_at
+             FROM shoot_timelines timeline
+             JOIN camera_clock_offset_diagnostics diagnostic
+               ON diagnostic.project_id = timeline.project_id
+              AND diagnostic.run_id = timeline.active_run_id
+             WHERE timeline.project_id = ?1
+             ORDER BY diagnostic.camera_a ASC, diagnostic.camera_b ASC, diagnostic.id ASC",
+        )?;
+        let rows = statement.query_map(params![project_id.to_string()], |row| {
+            let evidence_json = row.get::<_, String>(6)?;
+            Ok(CameraClockOffsetDiagnosticRecord {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                run_id: row.get(2)?,
+                camera_a: row.get(3)?,
+                camera_b: row.get(4)?,
+                possible_offset_seconds: row.get(5)?,
+                evidence_json: serde_json::from_str(&evidence_json)
+                    .map_err(|error| to_sql_error(PersistenceError::from(error)))?,
+                created_at: row.get(7)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn moment_search_candidates(
+        &self,
+        project_id: &ProjectId,
+        model: &SemanticModelConfig,
+    ) -> Result<Vec<MomentSearchCandidate>> {
+        let mut by_id = std::collections::HashMap::<String, MomentTimelineRow>::new();
+        let mut after = None::<(u64, String)>;
+        loop {
+            let rows = moment_timeline_rows_after(
+                &self.connection,
+                project_id,
+                MOMENT_SEARCH_ROW_PAGE_SIZE,
+                after.as_ref().map(|(ordinal, id)| (*ordinal, id.as_str())),
+            )?;
+            let page_len = rows.len();
+            if page_len == 0 {
+                break;
+            }
+            after = rows.last().map(|row| (row.ordinal, row.id.clone()));
+            for row in rows {
+                by_id.insert(row.id.clone(), row);
+            }
+            if page_len < MOMENT_SEARCH_ROW_PAGE_SIZE as usize {
+                break;
+            }
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, centroid_blob, centroid_dimensions FROM moment_records WHERE project_id = ?1 AND stale = 0 AND centroid_blob IS NOT NULL AND centroid_dimensions = ?2 ORDER BY ordinal ASC, id ASC",
+        )?;
+        let mut candidates = Vec::new();
+        for row in statement.query_map(
+            params![project_id.to_string(), model.dimensions as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )? {
+            let (id, blob, dimensions) = row?;
+            if let Some(view) = by_id.remove(&id) {
+                candidates.push(MomentSearchCandidate {
+                    moment_id: id,
+                    centroid: decode_semantic_vector(&blob, dimensions as usize)?,
+                    row: view,
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn latest_moment_analysis_job(&self, project_id: &ProjectId) -> Result<Option<BackgroundJob>> {
+        self.connection.query_row(
+            "SELECT id, state_json, stage_json, items_completed, items_total, files_discovered, files_processed, error_count, project_id, index_root_id, error_message, resume_metadata_json, created_at, updated_at, finished_at FROM background_jobs WHERE project_id = ?1 AND resume_metadata_json LIKE '%\"pipeline\":\"moment-analysis\"%' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+            params![project_id.to_string()], background_job_tuple,
+        ).optional()?.map(background_job_from_tuple).transpose()
+    }
+
+    fn recover_interrupted_moment_analysis(&self) -> Result<u64> {
+        let changed = self.connection.execute(
+            "UPDATE background_jobs SET state_json = '\"interrupted\"', stage_json = '\"moment_analysis\"', error_message = COALESCE(error_message, 'Moment analysis was interrupted before completion; start a local update or rebuild to continue.'), updated_at = ?1, finished_at = ?1 WHERE state_json = '\"running\"' AND resume_metadata_json LIKE '%\"pipeline\":\"moment-analysis\"%'",
             params![timestamp(&Utc::now())],
         )?;
         Ok(changed as u64)
@@ -4300,6 +6540,11 @@ impl CatalogRepository for SqliteRepository {
             params![project_id.to_string()],
             |row| row.get::<_, i64>(0),
         )? as u64;
+        let moment_count = self.connection.query_row(
+            "SELECT COUNT(*) FROM moment_records WHERE project_id = ?1 AND stale = 0",
+            params![project_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
         let (last_indexed_folder, storage_volume_identity) = self.connection.query_row(
             "SELECT roots.selected_path, volumes.filesystem_identity FROM index_roots roots JOIN storage_volumes volumes ON volumes.id = roots.storage_volume_id WHERE roots.project_id = ?1 ORDER BY roots.last_indexed_at DESC, roots.added_at DESC LIMIT 1",
             params![project_id.to_string()],
@@ -4313,6 +6558,7 @@ impl CatalogRepository for SqliteRepository {
             supported_media_count,
             unknown_count,
             duplicate_fast_fingerprint_count,
+            moment_count,
             last_indexed_folder: (!last_indexed_folder.is_empty()).then_some(last_indexed_folder),
             storage_volume_identity,
         })
@@ -4804,6 +7050,211 @@ fn ingest_job_summary_for_id(
             ingest_job_summary_row,
         )
         .map_err(Into::into)
+}
+
+fn moment_timeline_rows(
+    connection: &Connection,
+    project_id: &ProjectId,
+    moment_id: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<MomentTimelineRow>> {
+    moment_timeline_rows_with_cursor(connection, project_id, moment_id, limit, offset, None)
+}
+
+/// Reads a bounded page after a stable `(ordinal, id)` cursor. It is used by local Moment
+/// semantic search so a project with more than 10,000 Moments is still searched in full without
+/// offset-scan degradation.
+fn moment_timeline_rows_after(
+    connection: &Connection,
+    project_id: &ProjectId,
+    limit: u32,
+    after: Option<(u64, &str)>,
+) -> Result<Vec<MomentTimelineRow>> {
+    moment_timeline_rows_with_cursor(connection, project_id, None, limit, 0, after)
+}
+
+fn moment_timeline_rows_with_cursor(
+    connection: &Connection,
+    project_id: &ProjectId,
+    moment_id: Option<&str>,
+    limit: u32,
+    offset: u32,
+    after: Option<(u64, &str)>,
+) -> Result<Vec<MomentTimelineRow>> {
+    let after_ordinal = after
+        .map(|(ordinal, _)| i64::try_from(ordinal))
+        .transpose()
+        .map_err(|_| {
+            PersistenceError::InvalidData("Moment ordinal exceeds SQLite integer range".into())
+        })?;
+    let after_id = after.map(|(_, id)| id);
+    let mut statement = connection.prepare(
+        "SELECT m.id, m.ordinal, m.started_at, m.ended_at, m.asset_count, m.ai_representative_asset_id,
+            human_rep.media_asset_id, m.suggested_label, human_label.label,
+            COALESCE(human_label.label, m.suggested_label, 'Untitled Moment'), m.label_state,
+            (SELECT COUNT(DISTINCT g.id) FROM moment_memberships member JOIN similarity_group_members group_member ON group_member.media_asset_id = member.media_asset_id JOIN similarity_groups g ON g.id = group_member.group_id AND g.stale = 0 WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member'),
+            (SELECT COALESCE(SUM(CASE WHEN decision.decision = 'keep' THEN 1 ELSE 0 END), 0) FROM moment_memberships member LEFT JOIN media_decisions decision ON decision.project_id = member.project_id AND decision.media_asset_id = member.media_asset_id WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member'),
+            (SELECT COALESCE(SUM(CASE WHEN decision.decision = 'reject' THEN 1 ELSE 0 END), 0) FROM moment_memberships member LEFT JOIN media_decisions decision ON decision.project_id = member.project_id AND decision.media_asset_id = member.media_asset_id WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member'),
+            (SELECT COALESCE(SUM(CASE WHEN decision.decision = 'review' THEN 1 ELSE 0 END), 0) FROM moment_memberships member LEFT JOIN media_decisions decision ON decision.project_id = member.project_id AND decision.media_asset_id = member.media_asset_id WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member'),
+            (SELECT COALESCE(SUM(CASE WHEN decision.decision IS NULL THEN 1 ELSE 0 END), 0) FROM moment_memberships member LEFT JOIN media_decisions decision ON decision.project_id = member.project_id AND decision.media_asset_id = member.media_asset_id WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member'),
+            (SELECT COALESCE(SUM(CASE WHEN decision.starred = 1 THEN 1 ELSE 0 END), 0) FROM moment_memberships member LEFT JOIN media_decisions decision ON decision.project_id = member.project_id AND decision.media_asset_id = member.media_asset_id WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member'),
+            (SELECT COUNT(*) FROM moment_memberships member WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member' AND EXISTS (SELECT 1 FROM technical_quality quality WHERE quality.media_asset_id = member.media_asset_id AND quality.stale = 0 AND quality.status = 'ready' AND quality.technical_quality_band = 'technical_issue')),
+            (SELECT category FROM moment_boundary_evidence boundary WHERE boundary.project_id = m.project_id AND boundary.run_id = m.run_id AND boundary.right_asset_id = m.anchor_asset_id ORDER BY boundary.ordinal DESC LIMIT 1),
+            (SELECT explanation FROM moment_boundary_evidence boundary WHERE boundary.project_id = m.project_id AND boundary.run_id = m.run_id AND boundary.right_asset_id = m.anchor_asset_id ORDER BY boundary.ordinal DESC LIMIT 1),
+            EXISTS(SELECT 1 FROM moment_human_labels label WHERE label.project_id = m.project_id AND label.anchor_asset_id = m.anchor_asset_id)
+              OR EXISTS(SELECT 1 FROM moment_human_representatives representative WHERE representative.project_id = m.project_id AND representative.anchor_asset_id = m.anchor_asset_id)
+              OR EXISTS(
+                  SELECT 1
+                  FROM moment_override_operations operation
+                  JOIN moment_memberships member
+                    ON member.project_id = operation.project_id
+                   AND member.media_asset_id IN (operation.left_asset_id, operation.right_asset_id)
+                   AND member.active = 1
+                   AND member.membership_state = 'member'
+                  WHERE operation.project_id = m.project_id
+                    AND operation.active = 1
+                    AND member.moment_id = m.id
+              )
+         FROM moment_records m
+         LEFT JOIN moment_human_labels human_label ON human_label.project_id = m.project_id AND human_label.anchor_asset_id = m.anchor_asset_id
+         LEFT JOIN moment_human_representatives human_rep ON human_rep.project_id = m.project_id AND human_rep.anchor_asset_id = m.anchor_asset_id
+         WHERE m.project_id = ?1
+           AND m.stale = 0
+           AND (?2 IS NULL OR m.id = ?2)
+           AND (
+               ?5 IS NULL
+               OR m.ordinal > ?5
+               OR (m.ordinal = ?5 AND m.id > ?6)
+           )
+         ORDER BY m.ordinal ASC, m.id ASC LIMIT ?3 OFFSET ?4",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                project_id.to_string(),
+                moment_id,
+                limit as i64,
+                offset as i64,
+                after_ordinal,
+                after_id,
+            ],
+            |row| {
+                Ok(MomentTimelineRow {
+                    id: row.get(0)?,
+                    ordinal: row.get::<_, i64>(1)? as u64,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    asset_count: row.get::<_, i64>(4)? as u64,
+                    ai_representative_asset_id: row.get(5)?,
+                    human_representative_asset_id: row.get(6)?,
+                    suggested_label: row.get(7)?,
+                    human_label: row.get(8)?,
+                    display_label: row.get(9)?,
+                    label_state: row.get(10)?,
+                    similar_set_count: row.get::<_, i64>(11)? as u64,
+                    keep_count: row.get::<_, i64>(12)? as u64,
+                    reject_count: row.get::<_, i64>(13)? as u64,
+                    review_count: row.get::<_, i64>(14)? as u64,
+                    unreviewed_count: row.get::<_, i64>(15)? as u64,
+                    starred_count: row.get::<_, i64>(16)? as u64,
+                    technical_issue_count: row.get::<_, i64>(17)? as u64,
+                    boundary_category: row.get(18)?,
+                    boundary_explanation: row.get(19)?,
+                    human_override_present: row.get(20)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into);
+    rows
+}
+
+fn timeline_gaps(connection: &Connection, project_id: &ProjectId) -> Result<Vec<TimelineGapView>> {
+    let mut statement = connection.prepare(
+        "SELECT started_at, ended_at FROM moment_records WHERE project_id = ?1 AND stale = 0 AND started_at IS NOT NULL AND ended_at IS NOT NULL ORDER BY ordinal ASC, id ASC",
+    )?;
+    let points = statement
+        .query_map(params![project_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut gaps = Vec::new();
+    for pair in points.windows(2) {
+        let Some(previous_end) = moment_chronology_millis(&pair[0].1) else {
+            continue;
+        };
+        let Some(next_start) = moment_chronology_millis(&pair[1].0) else {
+            continue;
+        };
+        let seconds = (next_start - previous_end) / 1_000;
+        // This is a factual display threshold only; it does not participate in segmentation or
+        // claim that an expected scene/event is missing.
+        if seconds >= 60 {
+            gaps.push(TimelineGapView {
+                started_at: pair[0].1.clone(),
+                ended_at: pair[1].0.clone(),
+                duration_seconds: seconds as u64,
+                explanation: "No capture activity recorded in this interval.".into(),
+            });
+        }
+    }
+    Ok(gaps)
+}
+
+/// Moment cards retain their stored capture strings. For an EXIF camera wall-clock value whose
+/// offset is explicitly unknown, this derives only a stable local ordering coordinate so factual
+/// gap display can remain available; it does not claim or persist a UTC conversion.
+fn moment_chronology_millis(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc).timestamp_millis())
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
+                .ok()
+                .map(|value| Utc.from_utc_datetime(&value).timestamp_millis())
+        })
+}
+
+fn moment_anchor_asset_id(
+    connection: &Connection,
+    project_id: &ProjectId,
+    moment_id: &str,
+) -> Result<String> {
+    connection
+        .query_row(
+            "SELECT anchor_asset_id FROM moment_records WHERE id = ?1 AND project_id = ?2 AND stale = 0",
+            params![moment_id, project_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| PersistenceError::InvalidData("moment does not belong to the selected project".into()))
+}
+
+type EditableMomentRecord = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+fn moment_record_for_edit(
+    connection: &Connection,
+    project_id: &ProjectId,
+    moment_id: &str,
+) -> Result<EditableMomentRecord> {
+    connection
+        .query_row(
+            "SELECT timeline_id, run_id, segment_id, ordinal, anchor_asset_id, started_at, ended_at FROM moment_records WHERE id = ?1 AND project_id = ?2 AND stale = 0",
+            params![moment_id, project_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )
+        .optional()?
+        .ok_or_else(|| PersistenceError::InvalidData("moment does not belong to the selected project".into()))
 }
 
 fn intelligence_summary_for_asset(
@@ -5350,9 +7801,9 @@ fn visual_media_row_from_row(row: &Row<'_>) -> rusqlite::Result<VisualMediaRow> 
 }
 
 fn media_metadata_from_row(row: &Row<'_>) -> rusqlite::Result<MediaMetadataRecord> {
-    let raw_metadata: String = row.get(41)?;
+    let raw_metadata: String = row.get(42)?;
     let raw_metadata = serde_json::from_str(&raw_metadata).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(41, rusqlite::types::Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(42, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(MediaMetadataRecord {
         media_asset_id: row.get(0)?,
@@ -5369,33 +7820,34 @@ fn media_metadata_from_row(row: &Row<'_>) -> rusqlite::Result<MediaMetadataRecor
         captured_at_local: row.get(11)?,
         capture_timezone: row.get(12)?,
         capture_time_source: row.get(13)?,
-        width: row.get::<_, Option<i64>>(14)?.map(|value| value as u32),
-        height: row.get::<_, Option<i64>>(15)?.map(|value| value as u32),
-        orientation: row.get(16)?,
-        camera_make: row.get(17)?,
-        camera_model: row.get(18)?,
-        lens_make: row.get(19)?,
-        lens_model: row.get(20)?,
-        focal_length_mm: row.get(21)?,
-        focal_length_equivalent_mm: row.get(22)?,
-        aperture: row.get(23)?,
-        shutter_speed: row.get(24)?,
-        iso: row.get::<_, Option<i64>>(25)?.map(|value| value as u32),
-        exposure_compensation: row.get(26)?,
-        flash: row.get(27)?,
-        white_balance: row.get(28)?,
-        color_space: row.get(29)?,
-        gps_present: row.get(30)?,
-        duration_ms: row.get::<_, Option<i64>>(31)?.map(|value| value as u64),
-        frame_rate: row.get(32)?,
-        codec: row.get(33)?,
-        pixel_format: row.get(34)?,
-        bitrate: row.get::<_, Option<i64>>(35)?.map(|value| value as u64),
-        audio_streams: row.get::<_, Option<i64>>(36)?.map(|value| value as u32),
-        video_streams: row.get::<_, Option<i64>>(37)?.map(|value| value as u32),
-        sample_rate: row.get::<_, Option<i64>>(38)?.map(|value| value as u32),
-        bit_depth: row.get::<_, Option<i64>>(39)?.map(|value| value as u32),
-        channels: row.get::<_, Option<i64>>(40)?.map(|value| value as u32),
+        capture_time_confidence: row.get(14)?,
+        width: row.get::<_, Option<i64>>(15)?.map(|value| value as u32),
+        height: row.get::<_, Option<i64>>(16)?.map(|value| value as u32),
+        orientation: row.get(17)?,
+        camera_make: row.get(18)?,
+        camera_model: row.get(19)?,
+        lens_make: row.get(20)?,
+        lens_model: row.get(21)?,
+        focal_length_mm: row.get(22)?,
+        focal_length_equivalent_mm: row.get(23)?,
+        aperture: row.get(24)?,
+        shutter_speed: row.get(25)?,
+        iso: row.get::<_, Option<i64>>(26)?.map(|value| value as u32),
+        exposure_compensation: row.get(27)?,
+        flash: row.get(28)?,
+        white_balance: row.get(29)?,
+        color_space: row.get(30)?,
+        gps_present: row.get(31)?,
+        duration_ms: row.get::<_, Option<i64>>(32)?.map(|value| value as u64),
+        frame_rate: row.get(33)?,
+        codec: row.get(34)?,
+        pixel_format: row.get(35)?,
+        bitrate: row.get::<_, Option<i64>>(36)?.map(|value| value as u64),
+        audio_streams: row.get::<_, Option<i64>>(37)?.map(|value| value as u32),
+        video_streams: row.get::<_, Option<i64>>(38)?.map(|value| value as u32),
+        sample_rate: row.get::<_, Option<i64>>(39)?.map(|value| value as u32),
+        bit_depth: row.get::<_, Option<i64>>(40)?.map(|value| value as u32),
+        channels: row.get::<_, Option<i64>>(41)?.map(|value| value as u32),
         raw_metadata,
     })
 }
@@ -5471,12 +7923,15 @@ fn semantic_index_version_from_row(row: &Row<'_>) -> rusqlite::Result<SemanticIn
 }
 
 fn encode_semantic_vector(values: &[f32], dimensions: usize) -> Result<Vec<u8>> {
-    if values.len() != dimensions || values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+    if values.len() != dimensions
+        || values.is_empty()
+        || values.iter().any(|value| !value.is_finite())
+    {
         return Err(PersistenceError::InvalidData(
             "semantic embedding dimensions or values were invalid".into(),
         ));
     }
-    let mut encoded = Vec::with_capacity(values.len() * std::mem::size_of::<f32>());
+    let mut encoded = Vec::with_capacity(std::mem::size_of_val(values));
     for value in values {
         encoded.extend_from_slice(&value.to_le_bytes());
     }
@@ -6205,6 +8660,203 @@ CREATE INDEX idx_saved_magic_searches_project
 COMMIT;
 "#;
 
+// M7 keeps the legacy Phase-0 `shoots` / `moments` scaffold untouched. These tables hold a
+// versioned, project-scoped local analysis projection with direct memberships and explicit human
+// override records; they never become the source of truth for Similar Sets or culling decisions.
+const MIGRATION_012: &str = r#"
+BEGIN;
+CREATE TABLE shoot_timelines (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL UNIQUE REFERENCES projects(id),
+  active_run_id TEXT,
+  state TEXT NOT NULL,
+  analyzer_id TEXT NOT NULL,
+  analyzer_version TEXT NOT NULL,
+  boundary_algorithm_version TEXT NOT NULL,
+  semantic_model_key TEXT,
+  input_catalog_version TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_analyzed_at TEXT
+);
+CREATE TABLE moment_analysis_runs (
+  id TEXT PRIMARY KEY,
+  timeline_id TEXT NOT NULL REFERENCES shoot_timelines(id),
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  state TEXT NOT NULL,
+  analyzer_id TEXT NOT NULL,
+  analyzer_version TEXT NOT NULL,
+  boundary_algorithm_version TEXT NOT NULL,
+  semantic_model_key TEXT,
+  input_catalog_version TEXT NOT NULL,
+  items_total INTEGER NOT NULL CHECK (items_total >= 0),
+  items_completed INTEGER NOT NULL CHECK (items_completed >= 0),
+  error_count INTEGER NOT NULL CHECK (error_count >= 0),
+  started_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE TABLE timeline_segments (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES moment_analysis_runs(id),
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  started_at TEXT,
+  ended_at TEXT,
+  asset_count INTEGER NOT NULL CHECK (asset_count >= 0),
+  boundary_category TEXT,
+  boundary_evidence_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  stale INTEGER NOT NULL DEFAULT 0 CHECK (stale IN (0, 1)),
+  UNIQUE(run_id, ordinal)
+);
+CREATE TABLE moment_records (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  timeline_id TEXT NOT NULL REFERENCES shoot_timelines(id),
+  run_id TEXT NOT NULL REFERENCES moment_analysis_runs(id),
+  segment_id TEXT NOT NULL REFERENCES timeline_segments(id),
+  anchor_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  started_at TEXT,
+  ended_at TEXT,
+  asset_count INTEGER NOT NULL CHECK (asset_count >= 0),
+  ai_representative_asset_id TEXT REFERENCES media_assets(id),
+  centroid_blob BLOB,
+  centroid_dimensions INTEGER,
+  suggested_label TEXT,
+  label_confidence REAL,
+  label_evidence_json TEXT NOT NULL,
+  label_state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  stale INTEGER NOT NULL DEFAULT 0 CHECK (stale IN (0, 1)),
+  UNIQUE(run_id, ordinal)
+);
+CREATE TABLE moment_memberships (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES moment_analysis_runs(id),
+  moment_id TEXT REFERENCES moment_records(id),
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  membership_state TEXT NOT NULL CHECK (membership_state IN ('member', 'ungrouped')),
+  created_at TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  UNIQUE(run_id, media_asset_id)
+);
+CREATE TABLE moment_boundary_evidence (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES moment_analysis_runs(id),
+  left_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  right_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  category TEXT NOT NULL,
+  components_json TEXT NOT NULL,
+  explanation TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(run_id, ordinal)
+);
+CREATE TABLE moment_human_labels (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  anchor_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  label TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(project_id, anchor_asset_id)
+);
+CREATE TABLE moment_human_representatives (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  anchor_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  selected_at TEXT NOT NULL,
+  UNIQUE(project_id, anchor_asset_id)
+);
+CREATE TABLE moment_override_operations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  operation TEXT NOT NULL CHECK (operation IN ('split', 'merge')),
+  left_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  right_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  created_at TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  UNIQUE(project_id, operation, left_asset_id, right_asset_id)
+);
+CREATE TABLE moment_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  moment_id TEXT,
+  event_type TEXT NOT NULL CHECK (event_type IN ('MOMENT_CREATED', 'MOMENT_RENAMED', 'MOMENT_MERGED', 'MOMENT_SPLIT', 'MOMENT_REPRESENTATIVE_CHANGED', 'COVERAGE_CONFIRMED')),
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE coverage_checklist_items (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  phrase TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(project_id, phrase)
+);
+CREATE TABLE coverage_confirmations (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  checklist_item_id TEXT NOT NULL REFERENCES coverage_checklist_items(id),
+  state TEXT NOT NULL CHECK (state IN ('confirmed_covered', 'needs_review', 'not_covered')),
+  moment_id TEXT,
+  media_asset_id TEXT REFERENCES media_assets(id),
+  confirmed_at TEXT NOT NULL,
+  UNIQUE(project_id, checklist_item_id)
+);
+CREATE TABLE camera_clock_offset_diagnostics (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  run_id TEXT NOT NULL REFERENCES moment_analysis_runs(id),
+  camera_a TEXT NOT NULL,
+  camera_b TEXT NOT NULL,
+  possible_offset_seconds INTEGER,
+  evidence_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_shoot_timelines_project ON shoot_timelines(project_id, updated_at DESC);
+CREATE INDEX idx_moment_runs_project ON moment_analysis_runs(project_id, started_at DESC);
+CREATE INDEX idx_segments_project_run ON timeline_segments(project_id, run_id, ordinal);
+CREATE INDEX idx_moment_records_active ON moment_records(project_id, timeline_id, stale, ordinal);
+CREATE INDEX idx_moment_memberships_asset ON moment_memberships(project_id, media_asset_id, active);
+CREATE INDEX idx_moment_memberships_moment ON moment_memberships(project_id, moment_id, active, ordinal);
+CREATE INDEX idx_moment_boundary_run ON moment_boundary_evidence(project_id, run_id, ordinal);
+CREATE INDEX idx_moment_events_project ON moment_events(project_id, created_at DESC);
+CREATE INDEX idx_coverage_items_project ON coverage_checklist_items(project_id, created_at DESC);
+COMMIT;
+"#;
+
+// M7.1 keeps one logical resolved timestamp on `media_metadata` while retaining the narrowly
+// scoped per-copy observations needed to explain conflicts. It is additive: existing previews,
+// semantic embeddings, culling decisions, Similar Sets, and M7 human events are untouched.
+const MIGRATION_013: &str = r#"
+BEGIN;
+ALTER TABLE media_metadata ADD COLUMN capture_time_confidence TEXT;
+CREATE TABLE capture_time_observations (
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  source_file_instance_id TEXT NOT NULL REFERENCES file_instances(id),
+  source_fingerprint TEXT NOT NULL,
+  extractor TEXT NOT NULL,
+  extractor_version TEXT NOT NULL,
+  status TEXT NOT NULL,
+  failure_reason TEXT,
+  extracted_at TEXT NOT NULL,
+  captured_at_raw TEXT,
+  captured_at_local TEXT,
+  capture_timezone TEXT,
+  capture_time_source TEXT,
+  capture_time_confidence TEXT,
+  PRIMARY KEY(media_asset_id, source_file_instance_id)
+);
+CREATE INDEX idx_capture_time_observations_asset
+  ON capture_time_observations(media_asset_id, capture_time_source, captured_at_local);
+COMMIT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6307,6 +8959,7 @@ mod tests {
             captured_at_local: Some(timestamp(&now())),
             capture_timezone: None,
             capture_time_source: Some("exif".into()),
+            capture_time_confidence: Some("high".into()),
             width: Some(4000),
             height: Some(3000),
             orientation: Some("1".into()),
@@ -8461,6 +11114,7 @@ mod tests {
                     mode: "ai_review_queue".into(),
                     filter: "all".into(),
                     group_id: None,
+                    moment_id: None,
                     limit: 60,
                     offset: 0,
                 },
@@ -8480,6 +11134,7 @@ mod tests {
                     mode: "all_photos".into(),
                     filter: "unreviewed".into(),
                     group_id: None,
+                    moment_id: None,
                     limit: 60,
                     offset: 0,
                 },
@@ -8496,6 +11151,7 @@ mod tests {
                     mode: "all_photos".into(),
                     filter: "unreviewed".into(),
                     group_id: None,
+                    moment_id: None,
                     limit: 60,
                     offset: 60,
                 },
@@ -8545,5 +11201,969 @@ mod tests {
         assert_eq!(recovered.state, WorkflowRunState::Interrupted);
         assert_eq!(recovered.stage, JobStage::Finalize);
         assert!(recovered.error_message.unwrap().contains("interrupted"));
+    }
+
+    fn semantic_model(dimensions: usize, version: &str) -> SemanticModelConfig {
+        SemanticModelConfig {
+            model_id: "local-test-model".into(),
+            provider: "test-provider".into(),
+            model_version: version.into(),
+            embedding_version: format!("embedding-{version};dimensions={dimensions}"),
+            preprocessing_version: "preview-v1".into(),
+            metric: "normalized-dot-v1".into(),
+            dimensions,
+        }
+    }
+
+    fn m7_test_timeline(
+        project_id: &ProjectId,
+        timeline_id: &str,
+        active_run_id: &str,
+    ) -> MomentTimelineStatusRecord {
+        MomentTimelineStatusRecord {
+            timeline_id: timeline_id.into(),
+            project_id: project_id.to_string(),
+            state: "ready".into(),
+            analyzer_id: "local-moment-brain".into(),
+            analyzer_version: "test-v1".into(),
+            boundary_algorithm_version: "test-boundaries-v1".into(),
+            semantic_model_key: None,
+            input_catalog_version: "test-input-v1".into(),
+            active_run_id: Some(active_run_id.into()),
+            moment_count: 0,
+            eligible_count: 0,
+            ungrouped_count: 0,
+            updated_at: timestamp(&now()),
+        }
+    }
+
+    fn m7_test_run(
+        project_id: &ProjectId,
+        timeline_id: &str,
+        run_id: &str,
+        item_count: u64,
+    ) -> MomentAnalysisRunRecord {
+        MomentAnalysisRunRecord {
+            id: run_id.into(),
+            timeline_id: timeline_id.into(),
+            project_id: project_id.to_string(),
+            state: "ready".into(),
+            analyzer_id: "local-moment-brain".into(),
+            analyzer_version: "test-v1".into(),
+            boundary_algorithm_version: "test-boundaries-v1".into(),
+            semantic_model_key: None,
+            input_catalog_version: "test-input-v1".into(),
+            items_total: item_count,
+            items_completed: item_count,
+            error_count: 0,
+            started_at: timestamp(&now()),
+            finished_at: Some(timestamp(&now())),
+        }
+    }
+
+    fn m7_test_segment(
+        project_id: &ProjectId,
+        run_id: &str,
+        id: &str,
+        ordinal: u64,
+        asset_count: u64,
+    ) -> TimelineSegmentRecord {
+        TimelineSegmentRecord {
+            id: id.into(),
+            project_id: project_id.to_string(),
+            run_id: run_id.into(),
+            ordinal,
+            started_at: None,
+            ended_at: None,
+            asset_count,
+            boundary_category: None,
+            boundary_evidence: serde_json::json!({"test": true}),
+            created_at: timestamp(&now()),
+            stale: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn m7_test_moment(
+        project_id: &ProjectId,
+        timeline_id: &str,
+        run_id: &str,
+        segment_id: &str,
+        id: &str,
+        anchor_asset_id: &str,
+        ordinal: u64,
+        asset_count: u64,
+    ) -> MomentRecord {
+        MomentRecord {
+            id: id.into(),
+            project_id: project_id.to_string(),
+            timeline_id: timeline_id.into(),
+            run_id: run_id.into(),
+            segment_id: segment_id.into(),
+            anchor_asset_id: anchor_asset_id.into(),
+            ordinal,
+            started_at: None,
+            ended_at: None,
+            asset_count,
+            ai_representative_asset_id: Some(anchor_asset_id.into()),
+            centroid: None,
+            centroid_dimensions: None,
+            suggested_label: None,
+            label_confidence: None,
+            label_evidence: serde_json::json!({"state": "abstained"}),
+            label_state: "abstained".into(),
+            created_at: timestamp(&now()),
+            stale: false,
+        }
+    }
+
+    fn m7_test_membership(
+        project_id: &ProjectId,
+        run_id: &str,
+        id: &str,
+        moment_id: Option<&str>,
+        media_asset_id: &str,
+        ordinal: u64,
+        membership_state: &str,
+    ) -> MomentMembershipRecord {
+        MomentMembershipRecord {
+            id: id.into(),
+            project_id: project_id.to_string(),
+            run_id: run_id.into(),
+            moment_id: moment_id.map(str::to_owned),
+            media_asset_id: media_asset_id.into(),
+            ordinal,
+            membership_state: membership_state.into(),
+            created_at: timestamp(&now()),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn m7_incremental_window_and_tail_replacement_preserve_active_projection_and_human_history() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let assets = (0_u128..7)
+            .map(|offset| culling_asset(&repository, &project.id, 80_000 + offset))
+            .collect::<Vec<_>>();
+        let asset_ids = assets
+            .iter()
+            .map(|asset| asset.id.to_string())
+            .collect::<Vec<_>>();
+        for (ordinal, asset_id) in asset_ids.iter().enumerate() {
+            repository
+                .connection
+                .execute(
+                    "UPDATE media_assets SET captured_at = ?1 WHERE id = ?2",
+                    params![format!("2025-01-01T10:00:0{ordinal}+00:00"), asset_id],
+                )
+                .unwrap();
+        }
+
+        let timeline_id = "m7-tail-timeline";
+        let initial_run_id = "m7-tail-initial-run";
+        let initial_timeline = m7_test_timeline(&project.id, timeline_id, initial_run_id);
+        let initial_run = m7_test_run(&project.id, timeline_id, initial_run_id, 5);
+        let initial_segments = vec![
+            m7_test_segment(&project.id, initial_run_id, "m7-segment-0", 0, 2),
+            m7_test_segment(&project.id, initial_run_id, "m7-segment-1", 1, 2),
+            m7_test_segment(&project.id, initial_run_id, "m7-segment-2", 2, 1),
+        ];
+        let initial_moments = vec![
+            m7_test_moment(
+                &project.id,
+                timeline_id,
+                initial_run_id,
+                "m7-segment-0",
+                "m7-moment-0",
+                &asset_ids[0],
+                0,
+                2,
+            ),
+            m7_test_moment(
+                &project.id,
+                timeline_id,
+                initial_run_id,
+                "m7-segment-1",
+                "m7-moment-1",
+                &asset_ids[2],
+                1,
+                2,
+            ),
+            m7_test_moment(
+                &project.id,
+                timeline_id,
+                initial_run_id,
+                "m7-segment-2",
+                "m7-moment-2",
+                &asset_ids[4],
+                2,
+                1,
+            ),
+        ];
+        let initial_memberships = vec![
+            m7_test_membership(
+                &project.id,
+                initial_run_id,
+                "m7-member-0",
+                Some("m7-moment-0"),
+                &asset_ids[0],
+                0,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                initial_run_id,
+                "m7-member-1",
+                Some("m7-moment-0"),
+                &asset_ids[1],
+                1,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                initial_run_id,
+                "m7-member-2",
+                Some("m7-moment-1"),
+                &asset_ids[2],
+                2,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                initial_run_id,
+                "m7-member-3",
+                Some("m7-moment-1"),
+                &asset_ids[3],
+                3,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                initial_run_id,
+                "m7-member-4",
+                Some("m7-moment-2"),
+                &asset_ids[4],
+                4,
+                "member",
+            ),
+        ];
+        repository
+            .replace_active_moment_analysis(
+                &initial_timeline,
+                &initial_run,
+                &initial_segments,
+                &initial_moments,
+                &initial_memberships,
+                &[],
+            )
+            .unwrap();
+        // This durable ungrouped row must be included in a later update rather than silently
+        // falling out of the active projection. Asset 6 is a newly catalogued non-member.
+        repository
+            .connection
+            .execute(
+                "INSERT INTO moment_memberships (id, project_id, run_id, moment_id, media_asset_id, ordinal, membership_state, created_at, active)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 5, 'ungrouped', ?5, 1)",
+                params![
+                    "m7-initial-ungrouped-5",
+                    project.id.to_string(),
+                    initial_run_id,
+                    asset_ids[5],
+                    timestamp(&now()),
+                ],
+            )
+            .unwrap();
+
+        let window = repository
+            .moment_incremental_analysis_window(&project.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.timeline_id, timeline_id);
+        assert_eq!(window.active_run_id, initial_run_id);
+        assert_eq!(
+            window.previous_latest_captured_at.as_deref(),
+            Some("2025-01-01T10:00:04+00:00")
+        );
+        assert_eq!(window.global_ordinal_base, 6);
+        assert_eq!(window.affected_tail_start_ordinal, 2);
+        assert_eq!(window.moment_ordinal_base, 1);
+        assert_eq!(
+            window
+                .preceding_context
+                .iter()
+                .map(|input| input.asset_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                asset_ids[2].as_str(),
+                asset_ids[3].as_str(),
+                asset_ids[4].as_str()
+            ]
+        );
+        assert_eq!(
+            window
+                .pending_inputs
+                .iter()
+                .map(|input| input.asset_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![asset_ids[5].as_str(), asset_ids[6].as_str()]
+        );
+
+        repository
+            .rename_moment(&project.id, "m7-moment-1", "Human tail label")
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "INSERT INTO moment_override_operations (id, project_id, operation, left_asset_id, right_asset_id, created_at, active)
+                 VALUES (?1, ?2, 'split', ?3, ?4, ?5, 1)",
+                params![
+                    "m7-active-split",
+                    project.id.to_string(),
+                    asset_ids[2],
+                    asset_ids[3],
+                    timestamp(&now()),
+                ],
+            )
+            .unwrap();
+
+        let tail_run_id = "m7-tail-replacement-run";
+        let tail_timeline = m7_test_timeline(&project.id, timeline_id, initial_run_id);
+        let tail_run = m7_test_run(&project.id, timeline_id, tail_run_id, 5);
+        let tail_segments = vec![
+            m7_test_segment(&project.id, tail_run_id, "m7-tail-segment-1", 1, 2),
+            m7_test_segment(&project.id, tail_run_id, "m7-tail-segment-2", 2, 3),
+        ];
+        let tail_moments = vec![
+            m7_test_moment(
+                &project.id,
+                timeline_id,
+                tail_run_id,
+                "m7-tail-segment-1",
+                "m7-tail-moment-1",
+                &asset_ids[2],
+                1,
+                2,
+            ),
+            m7_test_moment(
+                &project.id,
+                timeline_id,
+                tail_run_id,
+                "m7-tail-segment-2",
+                "m7-tail-moment-2",
+                &asset_ids[4],
+                2,
+                3,
+            ),
+        ];
+        let tail_memberships = vec![
+            m7_test_membership(
+                &project.id,
+                tail_run_id,
+                "m7-tail-member-2",
+                Some("m7-tail-moment-1"),
+                &asset_ids[2],
+                2,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                tail_run_id,
+                "m7-tail-member-3",
+                Some("m7-tail-moment-1"),
+                &asset_ids[3],
+                3,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                tail_run_id,
+                "m7-tail-member-4",
+                Some("m7-tail-moment-2"),
+                &asset_ids[4],
+                4,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                tail_run_id,
+                "m7-tail-member-5",
+                Some("m7-tail-moment-2"),
+                &asset_ids[5],
+                5,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                tail_run_id,
+                "m7-tail-member-6",
+                Some("m7-tail-moment-2"),
+                &asset_ids[6],
+                6,
+                "member",
+            ),
+        ];
+        let tail_boundaries = vec![MomentBoundaryEvidenceRecord {
+            id: "m7-tail-boundary-4".into(),
+            project_id: project.id.to_string(),
+            run_id: tail_run_id.into(),
+            left_asset_id: asset_ids[3].clone(),
+            right_asset_id: asset_ids[4].clone(),
+            ordinal: 0,
+            category: "strong".into(),
+            components: serde_json::json!({"test": "tail boundary"}),
+            explanation: "Local structural evidence supports this boundary.".into(),
+            created_at: timestamp(&now()),
+        }];
+        repository
+            .replace_active_moment_analysis_tail(
+                &tail_timeline,
+                &tail_run,
+                window.affected_tail_start_ordinal,
+                &tail_segments,
+                &tail_moments,
+                &tail_memberships,
+                &tail_boundaries,
+            )
+            .unwrap();
+
+        let status = repository
+            .moment_timeline_status(&project.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.timeline_id, timeline_id);
+        assert_eq!(status.active_run_id.as_deref(), Some(tail_run_id));
+        assert_eq!(status.moment_count, 3);
+        assert_eq!(status.eligible_count, 7);
+        assert_eq!(status.ungrouped_count, 0);
+        let stale_initial_tail_moment: bool = repository
+            .connection
+            .query_row(
+                "SELECT stale FROM moment_records WHERE id = 'm7-moment-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let preserved_initial_moment: bool = repository
+            .connection
+            .query_row(
+                "SELECT stale FROM moment_records WHERE id = 'm7-moment-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_ungrouped_active: bool = repository
+            .connection
+            .query_row(
+                "SELECT active FROM moment_memberships WHERE id = 'm7-initial-ungrouped-5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stale_initial_tail_moment);
+        assert!(!preserved_initial_moment);
+        assert!(!old_ungrouped_active);
+
+        let page = repository.moment_timeline_page(&project.id, 10, 0).unwrap();
+        assert!(page.moments.iter().any(|row| row.id == "m7-moment-0"));
+        let renamed_tail = page
+            .moments
+            .iter()
+            .find(|row| row.id == "m7-tail-moment-1")
+            .unwrap();
+        assert_eq!(renamed_tail.display_label, "Human tail label");
+        assert!(renamed_tail.human_override_present);
+        let boundary_tail = page
+            .moments
+            .iter()
+            .find(|row| row.id == "m7-tail-moment-2")
+            .unwrap();
+        assert_eq!(boundary_tail.boundary_category.as_deref(), Some("strong"));
+        assert_eq!(
+            boundary_tail.boundary_explanation.as_deref(),
+            Some("Local structural evidence supports this boundary.")
+        );
+        let rename_event_count: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1 AND event_type = 'MOMENT_RENAMED'",
+                params![project.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rename_event_count, 1);
+    }
+
+    #[test]
+    fn m7_moment_semantic_search_does_not_stop_after_ten_thousand_moments() {
+        const MOMENT_COUNT: usize = 10_001;
+
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        let anchor = asset(project.id.clone());
+        repository.insert_project(&project).unwrap();
+        repository.insert_media_asset(&anchor).unwrap();
+        let timeline_id = "m7-search-large-timeline";
+        let run_id = "m7-search-large-run";
+        let timeline = m7_test_timeline(&project.id, timeline_id, run_id);
+        let run = m7_test_run(&project.id, timeline_id, run_id, MOMENT_COUNT as u64);
+        let mut segments = Vec::with_capacity(MOMENT_COUNT);
+        let mut moments = Vec::with_capacity(MOMENT_COUNT);
+        for ordinal in 0..MOMENT_COUNT {
+            let segment_id = format!("m7-search-segment-{ordinal:05}");
+            let moment_id = format!("m7-search-moment-{ordinal:05}");
+            segments.push(m7_test_segment(
+                &project.id,
+                run_id,
+                &segment_id,
+                ordinal as u64,
+                0,
+            ));
+            let mut moment = m7_test_moment(
+                &project.id,
+                timeline_id,
+                run_id,
+                &segment_id,
+                &moment_id,
+                &anchor.id.to_string(),
+                ordinal as u64,
+                0,
+            );
+            moment.centroid = Some(vec![1.0, 0.0]);
+            moment.centroid_dimensions = Some(2);
+            moments.push(moment);
+        }
+        repository
+            .replace_active_moment_analysis(&timeline, &run, &segments, &moments, &[], &[])
+            .unwrap();
+
+        let candidates = repository
+            .moment_search_candidates(&project.id, &semantic_model(2, "m7-search"))
+            .unwrap();
+        assert_eq!(candidates.len(), MOMENT_COUNT);
+        assert_eq!(
+            candidates.first().unwrap().moment_id,
+            "m7-search-moment-00000"
+        );
+        assert_eq!(
+            candidates.last().unwrap().moment_id,
+            "m7-search-moment-10000"
+        );
+    }
+
+    #[test]
+    fn m7_human_moment_edits_and_checklist_confirmation_survive_file_backed_restart() {
+        let directory = tempdir().unwrap();
+        let catalog = directory.path().join("m7-restart.sqlite3");
+        let (project_id, anchor_asset_id, representative_asset_id) = {
+            let repository = SqliteRepository::open(&catalog).unwrap();
+            let project = project();
+            repository.insert_project(&project).unwrap();
+            repository.insert_storage_volume(&volume()).unwrap();
+            let assets = (0_u128..4)
+                .map(|offset| culling_asset(&repository, &project.id, 90_000 + offset))
+                .collect::<Vec<_>>();
+            let asset_ids = assets
+                .iter()
+                .map(|asset| asset.id.to_string())
+                .collect::<Vec<_>>();
+            let timeline_id = "m7-restart-timeline";
+            let run_id = "m7-restart-run";
+            let timeline = m7_test_timeline(&project.id, timeline_id, run_id);
+            let run = m7_test_run(&project.id, timeline_id, run_id, 4);
+            let segments = vec![
+                m7_test_segment(&project.id, run_id, "m7-restart-segment-0", 0, 2),
+                m7_test_segment(&project.id, run_id, "m7-restart-segment-1", 1, 2),
+            ];
+            let moments = vec![
+                m7_test_moment(
+                    &project.id,
+                    timeline_id,
+                    run_id,
+                    "m7-restart-segment-0",
+                    "m7-restart-moment-0",
+                    &asset_ids[0],
+                    0,
+                    2,
+                ),
+                m7_test_moment(
+                    &project.id,
+                    timeline_id,
+                    run_id,
+                    "m7-restart-segment-1",
+                    "m7-restart-moment-1",
+                    &asset_ids[2],
+                    1,
+                    2,
+                ),
+            ];
+            let memberships = vec![
+                m7_test_membership(
+                    &project.id,
+                    run_id,
+                    "m7-restart-member-0",
+                    Some("m7-restart-moment-0"),
+                    &asset_ids[0],
+                    0,
+                    "member",
+                ),
+                m7_test_membership(
+                    &project.id,
+                    run_id,
+                    "m7-restart-member-1",
+                    Some("m7-restart-moment-0"),
+                    &asset_ids[1],
+                    1,
+                    "member",
+                ),
+                m7_test_membership(
+                    &project.id,
+                    run_id,
+                    "m7-restart-member-2",
+                    Some("m7-restart-moment-1"),
+                    &asset_ids[2],
+                    2,
+                    "member",
+                ),
+                m7_test_membership(
+                    &project.id,
+                    run_id,
+                    "m7-restart-member-3",
+                    Some("m7-restart-moment-1"),
+                    &asset_ids[3],
+                    3,
+                    "member",
+                ),
+            ];
+            repository
+                .replace_active_moment_analysis(
+                    &timeline,
+                    &run,
+                    &segments,
+                    &moments,
+                    &memberships,
+                    &[],
+                )
+                .unwrap();
+            repository
+                .rename_moment(&project.id, "m7-restart-moment-0", "Photographer label")
+                .unwrap();
+            repository
+                .set_moment_human_representative(&project.id, "m7-restart-moment-0", &asset_ids[1])
+                .unwrap();
+            repository
+                .split_moment(&project.id, "m7-restart-moment-0", &asset_ids[0])
+                .unwrap();
+            let split_moment_id: String = repository
+                .connection
+                .query_row(
+                    "SELECT id FROM moment_records
+                     WHERE project_id = ?1 AND stale = 0 AND anchor_asset_id = ?2",
+                    params![project.id.to_string(), asset_ids[1]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            repository
+                .merge_adjacent_moments(&project.id, "m7-restart-moment-0", &split_moment_id)
+                .unwrap();
+            repository
+                .create_coverage_checklist_item(&CoverageChecklistItemRecord {
+                    id: "m7-restart-checklist".into(),
+                    project_id: project.id.to_string(),
+                    text: "Photographer-provided checklist phrase".into(),
+                    created_at: timestamp(&now()),
+                })
+                .unwrap();
+            repository
+                .update_coverage_confirmation(
+                    &project.id,
+                    "m7-restart-checklist",
+                    "confirmed_covered",
+                    Some("m7-restart-moment-0"),
+                    Some(&asset_ids[0]),
+                )
+                .unwrap();
+            (project.id, asset_ids[0].clone(), asset_ids[1].clone())
+        };
+
+        let reopened = SqliteRepository::open(&catalog).unwrap();
+        let page = reopened.moment_timeline_page(&project_id, 10, 0).unwrap();
+        let edited = page
+            .moments
+            .iter()
+            .find(|row| row.id == "m7-restart-moment-0")
+            .unwrap();
+        assert_eq!(edited.display_label, "Photographer label");
+        assert_eq!(
+            edited.human_representative_asset_id.as_deref(),
+            Some(representative_asset_id.as_str())
+        );
+        let operations = reopened
+            .active_moment_override_operations(&project_id)
+            .unwrap();
+        assert!(operations
+            .iter()
+            .any(|operation| operation.operation == "split"));
+        assert!(operations
+            .iter()
+            .any(|operation| operation.operation == "merge"));
+        let checklist = reopened.coverage_checklist_items(&project_id).unwrap();
+        assert_eq!(checklist.len(), 1);
+        assert_eq!(
+            checklist[0].confirmation_state.as_deref(),
+            Some("confirmed_covered")
+        );
+        assert_eq!(
+            checklist[0].moment_id.as_deref(),
+            Some("m7-restart-moment-0")
+        );
+        assert_eq!(
+            checklist[0].media_asset_id.as_deref(),
+            Some(anchor_asset_id.as_str())
+        );
+        let human_event_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM moment_events
+                 WHERE project_id = ?1
+                   AND event_type IN (
+                       'MOMENT_RENAMED',
+                       'MOMENT_REPRESENTATIVE_CHANGED',
+                       'MOMENT_SPLIT',
+                       'MOMENT_MERGED',
+                       'COVERAGE_CONFIRMED'
+                   )",
+                params![project_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(human_event_count, 5);
+    }
+
+    #[test]
+    fn m7_clock_diagnostics_are_project_scoped_and_tied_to_the_active_run() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let first_project = project();
+        let second_project = Project {
+            id: id(91_001, ProjectId::from_uuid),
+            name: "Second M7 project".into(),
+            created_at: now(),
+        };
+        repository.insert_project(&first_project).unwrap();
+        repository.insert_project(&second_project).unwrap();
+
+        let first_timeline_id = "m7-clock-first-timeline";
+        let first_run_id = "m7-clock-first-run";
+        let second_timeline_id = "m7-clock-second-timeline";
+        let second_run_id = "m7-clock-second-run";
+        repository
+            .replace_active_moment_analysis(
+                &m7_test_timeline(&first_project.id, first_timeline_id, first_run_id),
+                &m7_test_run(&first_project.id, first_timeline_id, first_run_id, 0),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        repository
+            .replace_active_moment_analysis(
+                &m7_test_timeline(&second_project.id, second_timeline_id, second_run_id),
+                &m7_test_run(&second_project.id, second_timeline_id, second_run_id, 0),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let first_diagnostic = CameraClockOffsetDiagnosticRecord {
+            id: "m7-clock-first-diagnostic".into(),
+            project_id: first_project.id.to_string(),
+            run_id: first_run_id.into(),
+            camera_a: "Camera A".into(),
+            camera_b: "Camera B".into(),
+            possible_offset_seconds: Some(120),
+            evidence_json: serde_json::json!({
+                "state": "advisory",
+                "supportingPairCount": 8,
+            }),
+            created_at: timestamp(&now()),
+        };
+        let second_diagnostic = CameraClockOffsetDiagnosticRecord {
+            id: "m7-clock-second-diagnostic".into(),
+            project_id: second_project.id.to_string(),
+            run_id: second_run_id.into(),
+            camera_a: "Camera C".into(),
+            camera_b: "Camera D".into(),
+            // Inconclusive evidence stays explicit and is not coerced to zero seconds.
+            possible_offset_seconds: None,
+            evidence_json: serde_json::json!({"state": "inconclusive"}),
+            created_at: timestamp(&now()),
+        };
+        repository
+            .record_camera_clock_offset_diagnostics(std::slice::from_ref(&first_diagnostic))
+            .unwrap();
+        repository
+            .record_camera_clock_offset_diagnostics(std::slice::from_ref(&second_diagnostic))
+            .unwrap();
+        assert_eq!(
+            repository
+                .latest_camera_clock_offset_diagnostics(&first_project.id)
+                .unwrap(),
+            vec![first_diagnostic]
+        );
+        assert_eq!(
+            repository
+                .latest_camera_clock_offset_diagnostics(&second_project.id)
+                .unwrap(),
+            vec![second_diagnostic]
+        );
+
+        // A later active run with no diagnostic must not make a stale diagnostic appear current
+        // or be converted into a claim that there is no clock offset.
+        let replacement_run_id = "m7-clock-first-replacement-run";
+        repository
+            .replace_active_moment_analysis(
+                &m7_test_timeline(&first_project.id, first_timeline_id, replacement_run_id),
+                &m7_test_run(&first_project.id, first_timeline_id, replacement_run_id, 0),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(repository
+            .latest_camera_clock_offset_diagnostics(&first_project.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repository
+                .latest_camera_clock_offset_diagnostics(&second_project.id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn m6_embeddings_and_history_are_project_scoped_and_model_changes_stale_prior_vectors() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let first_project = project();
+        let second_project = Project {
+            id: id(200, ProjectId::from_uuid),
+            name: "Second project".into(),
+            created_at: now(),
+        };
+        let first_asset = asset(first_project.id.clone());
+        repository.insert_project(&first_project).unwrap();
+        repository.insert_project(&second_project).unwrap();
+        repository.insert_media_asset(&first_asset).unwrap();
+        let mut video = first_asset.clone();
+        video.id = id(201, MediaAssetId::from_uuid);
+        video.media_type = MediaType::Video;
+        video.display_name = "clip.mov".into();
+        video.extension = Some("mov".into());
+        repository.insert_media_asset(&video).unwrap();
+        let metadata_only = repository
+            .semantic_metadata_candidates(
+                &first_project.id,
+                &SemanticMetadataQuery {
+                    limit: 10,
+                    ..SemanticMetadataQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            metadata_only
+                .iter()
+                .map(|candidate| candidate.asset_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_asset.id.to_string()]
+        );
+        let model = semantic_model(3, "v1");
+
+        let wrong_project = SemanticEmbeddingRecord {
+            media_asset_id: first_asset.id.clone(),
+            project_id: second_project.id.clone(),
+            input_fingerprint: "input-v1".into(),
+            model: model.clone(),
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            generated_at: now(),
+            status: AnalysisStatus::Ready,
+            error_message: None,
+        };
+        assert!(repository
+            .upsert_semantic_embedding(&wrong_project)
+            .is_err());
+
+        repository
+            .upsert_semantic_embedding(&SemanticEmbeddingRecord {
+                project_id: first_project.id.clone(),
+                ..wrong_project
+            })
+            .unwrap();
+        assert_eq!(
+            repository
+                .semantic_embeddings_for_index(&first_project.id, &model)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let replacement = semantic_model(4, "v2");
+        assert_eq!(
+            repository
+                .mark_other_semantic_embeddings_stale(&first_project.id, &replacement)
+                .unwrap(),
+            1
+        );
+        assert!(repository
+            .semantic_embeddings_for_index(&first_project.id, &model)
+            .unwrap()
+            .is_empty());
+
+        repository
+            .record_magic_search_history(
+                &first_project.id,
+                "yellow boat",
+                "yellow boat",
+                &serde_json::json!({ "chips": [] }),
+            )
+            .unwrap();
+        repository
+            .record_magic_search_history(
+                &second_project.id,
+                "woman in red",
+                "woman in red",
+                &serde_json::json!({ "chips": [] }),
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .magic_search_history(&first_project.id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            repository
+                .clear_magic_search_history(&first_project.id)
+                .unwrap(),
+            1
+        );
+        assert!(repository
+            .magic_search_history(&first_project.id, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repository
+                .magic_search_history(&second_project.id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

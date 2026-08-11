@@ -9,43 +9,57 @@ use capture_intelligence::{
     PlatformFaceDetector, RecommendationInput, TechnicalEvidence, DETERMINISTIC_PROVIDER,
     DETERMINISTIC_VERSION, FACE_ANALYSIS_SETTINGS_VERSION,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use ingest::{
     copy_and_verify, preflight, CopyVerificationOutcome, DefaultDestinationLayout,
     DestinationLayout, IngestRequest, LocalAvailableSpace, PreflightIssue, PreflightReport,
     PreflightSeverity,
 };
+pub use magic_search::SiglipProviderCache;
 use magic_search::{
-    discover_siglip_provider, local_siglip_capability, plan_query, rank_normalized_vectors,
-    IndexCandidates, LocalModelCapability, PersistentVectorIndex, SemanticEmbeddingProvider,
-    SemanticProviderIdentity, ValidatedModelPackMetadata, SUPPORTED_SIGLIP_PACK_DIRECTORY,
+    normalize_embedding, plan_query, rank_normalized_vectors, IndexCandidates,
+    PersistentVectorIndex, SemanticEmbeddingProvider, SemanticProviderIdentity, SiglipOnnxProvider,
+    SUPPORTED_SIGLIP_PACK_DIRECTORY,
 };
 use media_index::{scan_read_only, IndexCandidate, IndexEvent};
 use media_model::*;
 use media_visual::{
-    clear_cache, extract_metadata, prepare_analysis_preview, prepare_previews, ArtifactStatus,
-    LocalVisualAdapters, ThumbnailProvider, ANALYSIS_PREVIEW_GENERATOR_VERSION,
-    ANALYSIS_PREVIEW_LONG_EDGE, GENERATOR_VERSION,
+    capture_time_priority, clear_cache, extract_metadata, prepare_analysis_preview,
+    prepare_previews, ArtifactStatus, CaptureTimeCandidate, LocalVisualAdapters, ThumbnailProvider,
+    ANALYSIS_PREVIEW_GENERATOR_VERSION, ANALYSIS_PREVIEW_LONG_EDGE, GENERATOR_VERSION,
+    METADATA_EXTRACTOR_VERSION,
+};
+use moment_brain::{
+    analyze_append_only_tail, analyze_timeline, derive_clock_offset_diagnostics,
+    AppendOnlyTailAnalysisRequest, ExistingHumanDecision, GenericLabelConcept,
+    HumanPresentationSignals, IncrementalDisposition, LabelCandidate, LabelCandidateKind,
+    Orientation as MomentOrientation, SemanticVector, TimelineAnalysis, TimelineAnalysisConfig,
+    TimelineAnalysisRequest, TimelineAssetInput,
 };
 use persistence::{
-    AnalysisInputCandidate, CaptureIntelligenceTerminalCounts, CatalogCounts, CatalogRepository,
-    CullingDecisionUpdate, CullingDecisionView, CullingProgress, CullingQuery, CullingReportRow,
-    CullingWorkspaceView, FaceAnalysisProviderConfig, IndexedMediaRow, IngestAuditEvent,
-    IngestItemRecord, IngestReport, MediaAssetDetail, MediaBrowserFilter, MediaMetadataRecord,
-    MagicSearchHistoryEntry, PersistenceError, PreviewArtifactRecord, ProjectIndexSummary,
-    ProjectLibraryItem as PersistedProjectLibraryItem, Result as PersistenceResult,
-    ReviewSessionView, SemanticEmbeddingRecord, SemanticIndexTerminalCounts,
-    SemanticIndexVersion, SemanticInputCandidate, SemanticModelConfig, SemanticSearchCandidate,
-    SimilarityGroupView, StoredSemanticVector, VisualMediaPage, VisualMediaQuery,
-    VisualMediaRow, VisualPreparationTerminalCounts,
+    AnalysisInputCandidate, CameraClockOffsetDiagnosticRecord, CaptureIntelligenceTerminalCounts,
+    CaptureTimeObservationRecord, CatalogCounts, CatalogRepository, CoverageChecklistItemRecord,
+    CoverageChecklistItemView as PersistedCoverageChecklistItemView, CullingDecisionUpdate,
+    CullingDecisionView, CullingProgress, CullingQuery, CullingReportRow, CullingWorkspaceView,
+    FaceAnalysisProviderConfig, IndexedMediaRow, IngestAuditEvent, IngestItemRecord, IngestReport,
+    MagicSearchHistoryEntry as PersistedMagicSearchHistoryEntry, MediaAssetDetail,
+    MediaBrowserFilter, MediaMetadataRecord, MomentAnalysisInput, MomentAnalysisRunRecord,
+    MomentBoundaryEvidenceRecord, MomentIncrementalAnalysisWindow, MomentMembershipRecord,
+    MomentOverrideOperation, MomentRecord, MomentTimelineStatusRecord, PersistenceError,
+    PreviewArtifactRecord, ProjectIndexSummary, ProjectLibraryItem as PersistedProjectLibraryItem,
+    Result as PersistenceResult, ReviewSessionView, SemanticEmbeddingRecord, SemanticIndexVersion,
+    SemanticInputCandidate, SemanticMetadataQuery, SemanticMetadataSort, SemanticModelConfig,
+    SemanticSearchCandidate, SimilarityGroupView, TimelineSegmentRecord, VisualMediaPage,
+    VisualMediaQuery, VisualMediaRow, VisualPreparationTerminalCounts,
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::Write,
     panic::AssertUnwindSafe,
     path::{Component, Path, PathBuf},
+    sync::Arc,
     thread,
     time::Instant,
 };
@@ -164,6 +178,24 @@ pub struct MediaPreparationProgress {
     pub message: Option<String>,
 }
 
+/// Progress for an explicit, metadata-only refresh. It never creates previews, opens a semantic
+/// model, or alters customer media; the desktop runs it on a dedicated background connection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataRefreshProgress {
+    pub state: String,
+    pub items_completed: u64,
+    pub items_total: u64,
+    pub error_count: u64,
+    pub resolved_capture_time_count: u64,
+    pub high_confidence_capture_time_count: u64,
+    pub copy_conflict_count: u64,
+    pub current_asset_id: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureIntelligenceProgress {
@@ -202,6 +234,27 @@ pub struct SemanticIndexCounts {
     pub stale: u64,
 }
 
+/// UI-safe metadata for the one validated local image/text provider. Raw model paths, weights,
+/// checksums, embeddings, and source paths remain backend-only derived data.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticModelIdentityView {
+    pub model_id: String,
+    pub model_version: String,
+    pub provider: String,
+    pub license_url: Option<String>,
+    pub embedding_dimension: Option<usize>,
+    pub installed_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticModelStatus {
+    pub installed: bool,
+    pub message: Option<String>,
+    pub identity: Option<SemanticModelIdentityView>,
+}
+
 /// Project-scoped, local Magic Search indexing state. The model capability is explicit so the
 /// UI can offer honest structured-filter fallback rather than fabricated semantic matches.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -210,14 +263,13 @@ pub struct SemanticIndexProgress {
     pub state: String,
     pub stage: String,
     pub resource_mode: String,
-    pub items_completed: u64,
-    pub items_total: u64,
+    pub completed: u64,
+    pub total: u64,
     pub error_count: u64,
     pub counts: SemanticIndexCounts,
-    pub model: LocalModelCapability,
+    pub model: SemanticModelStatus,
     pub active: bool,
     pub paused: bool,
-    pub completed: bool,
     pub index_ready: bool,
     pub index_embedding_count: u64,
     pub last_error: Option<String>,
@@ -226,6 +278,195 @@ pub struct SemanticIndexProgress {
     pub finished_at: Option<String>,
     pub message: Option<String>,
 }
+
+/// Durable, UI-safe status for M7 structural analysis. This deliberately omits raw embeddings,
+/// model paths, source paths, boundary scores, and any person/identity interpretation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentAnalysisProgress {
+    pub state: String,
+    pub active: bool,
+    pub paused: bool,
+    pub stage: String,
+    /// The existing local scheduler mode selected for this explicitly requested analysis.
+    /// Project loading never creates an M7 job merely to obtain this value.
+    pub resource_mode: String,
+    pub completed: u64,
+    pub total: u64,
+    pub error_count: u64,
+    pub timeline_ready: bool,
+    pub moment_count: u64,
+    pub ungrouped_asset_count: u64,
+    pub last_error: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentBoundaryEvidenceView {
+    pub strength: String,
+    pub summary: String,
+    pub signals: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentLabelView {
+    pub display_label: String,
+    pub ai_suggested_label: Option<String>,
+    pub human_label: Option<String>,
+    pub source: String,
+    pub strength: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentRepresentativeView {
+    pub asset_id: String,
+    pub filename: String,
+    pub thumbnail_preview_url: Option<String>,
+    pub source: String,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentSummaryView {
+    pub id: String,
+    pub ordinal: u64,
+    pub label: MomentLabelView,
+    pub captured_from: Option<String>,
+    pub captured_to: Option<String>,
+    pub capture_time_state: String,
+    pub asset_count: u64,
+    /// Factual project-local summaries only. These values do not change culling, Similar Set
+    /// membership, or any human decision; they make a Moment card useful for review context.
+    pub similar_set_count: u64,
+    pub keep_count: u64,
+    pub reject_count: u64,
+    pub review_count: u64,
+    pub unreviewed_count: u64,
+    pub starred_count: u64,
+    pub technical_issue_count: u64,
+    pub representative: Option<MomentRepresentativeView>,
+    pub boundary_before: Option<MomentBoundaryEvidenceView>,
+    pub has_human_structure_override: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentClockDiagnosticView {
+    pub camera_label: String,
+    pub summary: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentTimelineGapView {
+    pub started_at: String,
+    pub ended_at: String,
+    pub duration_seconds: u64,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentTimelineView {
+    pub progress: Option<MomentAnalysisProgress>,
+    pub moments: Vec<MomentSummaryView>,
+    pub has_more: bool,
+    pub total_moments: u64,
+    pub ungrouped_asset_count: u64,
+    pub clock_diagnostics: Vec<MomentClockDiagnosticView>,
+    pub timeline_gaps: Vec<MomentTimelineGapView>,
+}
+
+/// A bounded text request for current-project Moment cards. Unlike Magic Search asset retrieval,
+/// this ranks only durable Moment centroids built from compatible locally persisted embeddings.
+/// It neither reads original media nor makes a semantic result stand in for a factual detection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentSearchRequest {
+    pub query: String,
+    #[serde(default = "default_moment_search_limit")]
+    pub limit: u32,
+}
+
+const fn default_moment_search_limit() -> u32 {
+    24
+}
+
+impl Default for MomentSearchRequest {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            limit: default_moment_search_limit(),
+        }
+    }
+}
+
+/// UI-safe Moment-card semantic retrieval. Numeric similarity values, centroids, source paths,
+/// and raw label evidence remain local implementation details.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentSearchResponse {
+    pub query: String,
+    pub results: Vec<MomentSummaryView>,
+    pub has_more: bool,
+    pub total_results: u64,
+    pub semantic_available: bool,
+    pub semantic_applied: bool,
+    pub semantic_unavailable_reason: Option<String>,
+    pub identity_search_blocked: bool,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentDetailView {
+    pub moment: MomentSummaryView,
+    pub boundary_evidence: Vec<MomentBoundaryEvidenceView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageChecklistItem {
+    pub id: String,
+    pub phrase: String,
+    pub state: String,
+    pub confirmed_moment_id: Option<String>,
+    pub confirmed_asset_id: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MomentChecklistView {
+    pub id: String,
+    pub name: String,
+    pub items: Vec<CoverageChecklistItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCoverageChecklistItemInput {
+    pub checklist_id: Option<String>,
+    pub phrase: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCoverageConfirmationInput {
+    pub checklist_item_id: String,
+    pub state: String,
+    pub moment_id: Option<String>,
+    pub asset_id: Option<String>,
+}
+
+const MOMENT_ANALYZER_ID: &str = "captureos-moment-brain";
+const MOMENT_BOUNDARY_ALGORITHM_VERSION: &str = moment_brain::MOMENT_BRAIN_ALGORITHM_VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -239,6 +480,10 @@ pub struct MagicSearchRequest {
     pub limit: u32,
     #[serde(default)]
     pub offset: u32,
+    /// Optional M7 current-Moment scope. Core validates project ownership before every semantic
+    /// or deterministic retrieval path; this is never a browser-provided asset collection.
+    #[serde(default)]
+    pub moment_id: Option<String>,
 }
 
 fn default_magic_search_sort() -> String {
@@ -257,6 +502,7 @@ impl Default for MagicSearchRequest {
             descending: false,
             limit: default_magic_search_limit(),
             offset: 0,
+            moment_id: None,
         }
     }
 }
@@ -267,14 +513,15 @@ pub struct MagicSearchFilterView {
     pub chips: Vec<String>,
 }
 
-/// A result card stays a logical MediaAsset card. The score and explanation are M6 search
-/// projections only; no raw embedding is sent to the frontend or written into a human decision.
+/// A result card stays a logical MediaAsset card. The optional score is a local normalized-dot
+/// ranking signal only, never a confidence, object/identity assertion, or human decision.
+/// Raw embeddings are never sent to the frontend or written into a human decision.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MagicSearchResult {
     pub item: VisualMediaRow,
-    pub semantic_score: Option<f64>,
     pub score_label: Option<String>,
+    pub semantic_score: Option<f32>,
     pub explanation: String,
     pub matched_evidence: Vec<String>,
 }
@@ -292,6 +539,3397 @@ pub struct MagicSearchResponse {
     pub total_results: u64,
     pub identity_search_blocked: bool,
     pub message: Option<String>,
+}
+
+/// A local history entry intentionally keeps a query and its displayed deterministic chips, but
+/// never exposes raw vector data, model filesystem paths, or another project's history.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagicSearchHistoryEntry {
+    pub id: String,
+    pub query: String,
+    pub created_at: String,
+    pub parsed_filters: MagicSearchFilterView,
+}
+
+const SEMANTIC_INDEX_FORMAT: &str = "captureos-m6-lsh.v1";
+const MAGIC_SEARCH_PAGE_LIMIT: u32 = 120;
+
+/// Roots owned by CaptureOS for managed semantic artifacts. These paths deliberately exclude
+/// customer originals: image analysis receives only a cache preview, while model packs and the
+/// derived vector index have their own local roots.
+#[derive(Debug, Clone, Copy)]
+pub struct SemanticStorageRoots<'a> {
+    pub preview_cache_root: &'a Path,
+    pub index_root: &'a Path,
+}
+
+/// A Find Similar request stays separate from a Magic Search text request because it has no
+/// prompt and uses a persisted image embedding from one project-owned MediaAsset.
+#[derive(Debug, Clone, Copy)]
+pub struct FindSimilarRequest<'a> {
+    pub asset_id: &'a MediaAssetId,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+struct SemanticProgressDetails {
+    counts: SemanticIndexCounts,
+    model: SemanticModelStatus,
+    index_ready: bool,
+    index_embedding_count: u64,
+    resource_mode: AnalysisResourceMode,
+    current_asset_id: Option<String>,
+    message: Option<String>,
+}
+
+struct SemanticIndexExecution<'a> {
+    resource_mode: AnalysisResourceMode,
+    provider: &'a dyn SemanticEmbeddingProvider,
+    model_status: SemanticModelStatus,
+    should_pause: &'a dyn Fn() -> bool,
+    on_progress: &'a mut dyn FnMut(&SemanticIndexProgress),
+}
+
+struct SemanticPauseDetails {
+    counts: SemanticIndexCounts,
+    current_asset_id: Option<String>,
+    message: String,
+}
+
+struct SemanticResponseContext<'a> {
+    request: &'a MagicSearchRequest,
+    plan: &'a magic_search::QueryPlan,
+    preview_cache_root: &'a Path,
+    semantic_available: bool,
+    semantic_applied: bool,
+    semantic_unavailable_reason: Option<String>,
+    explanation: &'a str,
+}
+
+struct MagicResultContext<'a> {
+    project_id: &'a ProjectId,
+    preview_cache_root: &'a Path,
+    plan: &'a magic_search::QueryPlan,
+    semantic_applied: bool,
+    explanation: &'a str,
+}
+
+struct FindSimilarExecution<'a> {
+    provider: &'a dyn SemanticEmbeddingProvider,
+    index_root: &'a Path,
+    preview_cache_root: &'a Path,
+}
+
+fn semantic_model_config(identity: &SemanticProviderIdentity) -> SemanticModelConfig {
+    // The database schema predates M6 and its natural unique tuple does not have a dimensions
+    // column. Include dimensions in the versioned embedding identity as well as in the derived
+    // index cache key, so a provider cannot silently compare or overwrite a differently-sized
+    // space under the same revision label.
+    SemanticModelConfig {
+        model_id: identity.model_id.clone(),
+        provider: identity.provider.clone(),
+        model_version: identity.model_version.clone(),
+        embedding_version: format!(
+            "{};dimensions={}",
+            identity.embedding_version, identity.dimensions
+        ),
+        preprocessing_version: identity.preprocessing_version.clone(),
+        metric: identity.metric.clone(),
+        dimensions: identity.dimensions,
+    }
+}
+
+fn semantic_model_status_for_provider(provider: &SiglipOnnxProvider) -> SemanticModelStatus {
+    let identity = provider.identity();
+    let metadata = provider.pack_metadata();
+    SemanticModelStatus {
+        installed: true,
+        message: Some("Local semantic search model is ready.".into()),
+        identity: Some(SemanticModelIdentityView {
+            model_id: identity.model_id.clone(),
+            model_version: identity.model_version.clone(),
+            provider: identity.provider.clone(),
+            license_url: Some(metadata.license_url),
+            embedding_dimension: Some(identity.dimensions),
+            installed_bytes: Some(metadata.installed_bytes),
+        }),
+    }
+}
+
+fn unavailable_semantic_model_status(message: impl Into<String>) -> SemanticModelStatus {
+    SemanticModelStatus {
+        installed: false,
+        message: Some(message.into()),
+        identity: None,
+    }
+}
+
+/// Acquires only the fixed, static M6 pack and mirrors a successfully reference-validated pack
+/// into the local model registry. This is not a downloader, installer, or generic model loader:
+/// a missing, invalid, or unreviewed pack remains unavailable. The supplied cache revalidates a
+/// closed lightweight pack stamp before reuse and performs full admission on a changed pack.
+fn inspect_semantic_provider(
+    repository: &impl CatalogRepository,
+    provider_cache: &SiglipProviderCache,
+) -> PersistenceResult<(SemanticModelStatus, Option<Arc<SiglipOnnxProvider>>)> {
+    match provider_cache.acquire() {
+        Ok(Some(provider)) => {
+            register_validated_semantic_model(repository, &provider)?;
+            let status = semantic_model_status_for_provider(&provider);
+            Ok((status, Some(provider)))
+        }
+        Ok(None) => Ok((
+            unavailable_semantic_model_status(
+                "Semantic model not installed. Metadata and technical filters remain available.",
+            ),
+            None,
+        )),
+        Err(error) => Ok((
+            unavailable_semantic_model_status(format!("Semantic model unavailable: {error}")),
+            None,
+        )),
+    }
+}
+
+fn register_validated_semantic_model(
+    repository: &impl CatalogRepository,
+    provider: &SiglipOnnxProvider,
+) -> PersistenceResult<()> {
+    let identity = provider.identity();
+    let metadata = provider.pack_metadata();
+    repository.upsert_local_model(&LocalModelRecord {
+        id: LocalModelId::new(),
+        model_id: identity.model_id.clone(),
+        model_family: Some(identity.model_family.clone()),
+        provider: identity.provider.clone(),
+        version: identity.model_version.clone(),
+        local_relative_path: Some(SUPPORTED_SIGLIP_PACK_DIRECTORY.into()),
+        checksum: Some(metadata.source_weights_sha256),
+        capability: "shared_image_text_embedding".into(),
+        input_size: Some(metadata.input_size),
+        embedding_dimension: Some(metadata.embedding_dimension as u32),
+        status: "available".into(),
+        license: metadata.license,
+        license_url: Some(metadata.license_url),
+        source_url: Some("https://huggingface.co/google/siglip-base-patch16-224".into()),
+        file_size_bytes: Some(metadata.installed_bytes),
+        hardware_requirements: Some("Local CPU via tract-onnx; no network service".into()),
+        registered_at: Utc::now(),
+    })
+}
+
+fn semantic_counts(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    model: &SemanticModelConfig,
+    pending: u64,
+) -> PersistenceResult<SemanticIndexCounts> {
+    let terminal = repository.semantic_index_terminal_counts(project_id, model)?;
+    Ok(SemanticIndexCounts {
+        total: terminal.total.saturating_add(pending),
+        ready: terminal.ready,
+        unsupported: terminal.unsupported,
+        corrupt: terminal.corrupt,
+        needs_original: terminal.needs_original,
+        failed: terminal.failed,
+        pending,
+        stale: terminal.stale,
+    })
+}
+
+fn semantic_resource_mode_from_job(job: Option<&BackgroundJob>) -> AnalysisResourceMode {
+    match job
+        .and_then(|job| job.resume_metadata.as_ref())
+        .and_then(|metadata| metadata.get("resource_mode"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("eco") => AnalysisResourceMode::Eco,
+        Some("fast") => AnalysisResourceMode::Fast,
+        _ => AnalysisResourceMode::Balanced,
+    }
+}
+
+fn semantic_progress(
+    job: Option<&BackgroundJob>,
+    details: SemanticProgressDetails,
+) -> SemanticIndexProgress {
+    let state = job
+        .map(|job| workflow_state_label(&job.state))
+        .unwrap_or_else(|| "idle".into());
+    let stage = job
+        .map(|job| job_stage_label(&job.stage))
+        .unwrap_or_else(|| "semantic_index".into());
+    SemanticIndexProgress {
+        state: state.clone(),
+        stage,
+        resource_mode: details.resource_mode.as_str().into(),
+        completed: job
+            .map(|job| job.items_completed)
+            .unwrap_or(details.counts.total),
+        total: job
+            .and_then(|job| job.items_total)
+            .unwrap_or(details.counts.total),
+        error_count: job
+            .map(|job| job.error_count)
+            .unwrap_or(details.counts.failed),
+        counts: details.counts,
+        model: details.model,
+        active: state == "running",
+        paused: state == "paused",
+        index_ready: details.index_ready,
+        index_embedding_count: details.index_embedding_count,
+        last_error: job.and_then(|job| job.error_message.clone()),
+        current_asset_id: details.current_asset_id,
+        started_at: job
+            .map(|job| job.created_at.to_rfc3339())
+            .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        finished_at: job.and_then(|job| job.finished_at.map(|value| value.to_rfc3339())),
+        message: details.message,
+    }
+}
+
+fn load_active_semantic_index(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    model: &SemanticModelConfig,
+    model_cache_key: &str,
+    index_root: &Path,
+) -> PersistenceResult<Option<(PersistentVectorIndex, u64)>> {
+    let Some(version) = repository.active_semantic_index_version(project_id, model)? else {
+        return Ok(None);
+    };
+    let index = PersistentVectorIndex::load(
+        index_root,
+        &version.index_relative_path,
+        &project_id.to_string(),
+        model_cache_key,
+        model.dimensions,
+    )
+    .map_err(|error| {
+        PersistenceError::InvalidData(format!("local semantic index requires rebuild: {error}"))
+    })?;
+    Ok(index.map(|index| (index, version.embedding_count)))
+}
+
+/// Returns a durable, project-scoped M6 status. It never starts a model download or a scan; a
+/// corrupt/missing derived index simply reports not-ready so the next local rebuild can replace it.
+pub fn load_semantic_index_status(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    provider_cache: &SiglipProviderCache,
+    index_root: &Path,
+) -> PersistenceResult<SemanticIndexProgress> {
+    let (model_status, provider) = inspect_semantic_provider(repository, provider_cache)?;
+    let Some(provider) = provider else {
+        return Ok(semantic_progress(
+            None,
+            SemanticProgressDetails {
+                counts: SemanticIndexCounts::default(),
+                model: model_status,
+                index_ready: false,
+                index_embedding_count: 0,
+                resource_mode: AnalysisResourceMode::Balanced,
+                current_asset_id: None,
+                message: None,
+            },
+        ));
+    };
+    let model = semantic_model_config(provider.identity());
+    let model_cache_key = provider.identity().cache_key();
+    let job = repository.latest_semantic_indexing_job(project_id)?;
+    let mode = semantic_resource_mode_from_job(job.as_ref());
+    let counts = semantic_counts(repository, project_id, &model, 0)?;
+    let (index_ready, index_embedding_count) = match load_active_semantic_index(
+        repository,
+        project_id,
+        &model,
+        &model_cache_key,
+        index_root,
+    ) {
+        Ok(Some((_, count))) => (true, count),
+        Ok(None) | Err(_) => (false, 0),
+    };
+    Ok(semantic_progress(
+        job.as_ref(),
+        SemanticProgressDetails {
+            counts,
+            model: model_status,
+            index_ready,
+            index_embedding_count,
+            resource_mode: mode,
+            current_asset_id: None,
+            message: job.as_ref().and_then(|job| job.error_message.clone()),
+        },
+    ))
+}
+
+pub fn recover_interrupted_semantic_indexing(
+    repository: &impl CatalogRepository,
+) -> PersistenceResult<u64> {
+    repository.recover_interrupted_semantic_indexing()
+}
+
+pub fn load_magic_search_history(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    limit: u32,
+) -> PersistenceResult<Vec<MagicSearchHistoryEntry>> {
+    repository
+        .magic_search_history(project_id, limit)
+        .map(|entries| entries.into_iter().map(magic_search_history_view).collect())
+}
+
+pub fn clear_magic_search_history(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+) -> PersistenceResult<u64> {
+    repository.clear_magic_search_history(project_id)
+}
+
+/// Reads a compact, durable M7 status. It intentionally does not acquire a model, scan media,
+/// or start analysis, so Project Home and the timeline remain responsive on startup.
+pub fn load_moment_timeline_status(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+) -> PersistenceResult<Option<MomentAnalysisProgress>> {
+    let timeline = repository.moment_timeline_status(project_id)?;
+    let job = repository.latest_moment_analysis_job(project_id)?;
+    if timeline.is_none() && job.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(moment_progress(job.as_ref(), timeline.as_ref(), None)))
+}
+
+/// Loads only one bounded Moment-card page. No original paths, raw embeddings, or numeric
+/// boundary/semantic scores leave this application-service layer.
+pub fn load_moment_timeline(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    limit: u32,
+    offset: u32,
+    preview_cache_root: &Path,
+) -> PersistenceResult<MomentTimelineView> {
+    let page = repository.moment_timeline_page(project_id, limit, offset)?;
+    let progress = load_moment_timeline_status(repository, project_id)?;
+    let total_moments = page
+        .timeline
+        .as_ref()
+        .map(|timeline| timeline.moment_count)
+        .unwrap_or(0);
+    let ungrouped_asset_count = page
+        .timeline
+        .as_ref()
+        .map(|timeline| timeline.ungrouped_count)
+        .unwrap_or(0);
+    let moments = page
+        .moments
+        .iter()
+        .map(|row| moment_summary_view(repository, project_id, row, preview_cache_root))
+        .collect::<PersistenceResult<Vec<_>>>()?;
+    let clock_diagnostics = repository
+        .latest_camera_clock_offset_diagnostics(project_id)?
+        .into_iter()
+        .filter_map(moment_clock_diagnostic_view)
+        .collect();
+    Ok(MomentTimelineView {
+        progress,
+        moments,
+        has_more: page.has_more,
+        total_moments,
+        ungrouped_asset_count,
+        // Only completed-run diagnostics satisfying Moment Brain's strict local evidence rule
+        // are shown. This stays advisory: CaptureOS never writes a timestamp correction.
+        clock_diagnostics,
+        timeline_gaps: page
+            .gaps
+            .into_iter()
+            .map(|gap| MomentTimelineGapView {
+                started_at: gap.started_at,
+                ended_at: gap.ended_at,
+                duration_seconds: gap.duration_seconds,
+                explanation: gap.explanation,
+            })
+            .collect(),
+    })
+}
+
+/// Searches current-project Moment cards with the same explicit, locally installed M6 text
+/// provider used by Magic Search. Retrieval is available only when the active Moment timeline
+/// declares the exact same embedding-space cache key as the provider; a matching dimensionality
+/// alone is never enough to mix model revisions or preprocessing schemes.
+pub fn search_moments(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    request: &MomentSearchRequest,
+    provider_cache: &SiglipProviderCache,
+    preview_cache_root: &Path,
+) -> PersistenceResult<MomentSearchResponse> {
+    let plan = plan_query(&request.query)
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    if plan.identity_search_blocked {
+        return Ok(MomentSearchResponse {
+            query: plan.normalized_query,
+            results: Vec::new(),
+            has_more: false,
+            total_results: 0,
+            semantic_available: false,
+            semantic_applied: false,
+            semantic_unavailable_reason: Some(
+                "Identity recognition and person search are not available in Moment search."
+                    .into(),
+            ),
+            identity_search_blocked: true,
+            message: Some(
+                "Moment search does not identify or match people. Use a neutral visual description instead."
+                    .into(),
+            ),
+        });
+    }
+
+    let (model_status, provider) = inspect_semantic_provider(repository, provider_cache)?;
+    let Some(provider) = provider else {
+        return Ok(moment_search_unavailable(
+            plan.normalized_query,
+            model_status.message,
+        ));
+    };
+    let Some(semantic_query) = plan.semantic_query.as_deref() else {
+        return Ok(MomentSearchResponse {
+            query: plan.normalized_query,
+            results: Vec::new(),
+            has_more: false,
+            total_results: 0,
+            semantic_available: true,
+            semantic_applied: false,
+            semantic_unavailable_reason: None,
+            identity_search_blocked: false,
+            message: Some(
+                "Use a concise local visual description to search Moment cards. Deterministic photo filters remain available in Magic Search."
+                    .into(),
+            ),
+        });
+    };
+
+    search_moments_with_provider(
+        repository,
+        project_id,
+        request,
+        &plan.normalized_query,
+        semantic_query,
+        provider.as_ref(),
+        preview_cache_root,
+    )
+}
+
+fn moment_search_unavailable(query: String, reason: Option<String>) -> MomentSearchResponse {
+    MomentSearchResponse {
+        query,
+        results: Vec::new(),
+        has_more: false,
+        total_results: 0,
+        semantic_available: false,
+        semantic_applied: false,
+        semantic_unavailable_reason: reason.or_else(|| {
+            Some("A locally installed semantic model is required to search Moment cards.".into())
+        }),
+        identity_search_blocked: false,
+        message: Some(
+            "Moment-card semantic retrieval is unavailable until an approved local semantic model is installed and compatible local embeddings exist."
+                .into(),
+        ),
+    }
+}
+
+fn search_moments_with_provider(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    request: &MomentSearchRequest,
+    normalized_query: &str,
+    semantic_query: &str,
+    provider: &dyn SemanticEmbeddingProvider,
+    preview_cache_root: &Path,
+) -> PersistenceResult<MomentSearchResponse> {
+    let provider_model_key = provider.identity().cache_key();
+    let Some(timeline) = repository.moment_timeline_status(project_id)? else {
+        return Ok(MomentSearchResponse {
+            query: normalized_query.into(),
+            results: Vec::new(),
+            has_more: false,
+            total_results: 0,
+            semantic_available: true,
+            semantic_applied: false,
+            semantic_unavailable_reason: Some(
+                "No local Moment timeline is ready for this project. Analyze the timeline after local embeddings are indexed."
+                    .into(),
+            ),
+            identity_search_blocked: false,
+            message: Some(
+                "Moment-card retrieval has no compatible local timeline evidence to rank yet."
+                    .into(),
+            ),
+        });
+    };
+    if timeline.state != "ready"
+        || timeline.semantic_model_key.as_deref() != Some(provider_model_key.as_str())
+    {
+        return Ok(MomentSearchResponse {
+            query: normalized_query.into(),
+            results: Vec::new(),
+            has_more: false,
+            total_results: 0,
+            semantic_available: true,
+            semantic_applied: false,
+            semantic_unavailable_reason: Some(
+                "The active Moment timeline has no centroids compatible with the installed local semantic model. Update or rebuild the timeline after indexing compatible local embeddings."
+                    .into(),
+            ),
+            identity_search_blocked: false,
+            message: Some(
+                "Moment-card retrieval is paused rather than comparing incompatible local embedding spaces."
+                    .into(),
+            ),
+        });
+    }
+
+    let query = match provider
+        .embed_text(semantic_query)
+        .and_then(normalize_embedding)
+    {
+        Ok(query) => query,
+        Err(error) => {
+            return Ok(MomentSearchResponse {
+                query: normalized_query.into(),
+                results: Vec::new(),
+                has_more: false,
+                total_results: 0,
+                semantic_available: false,
+                semantic_applied: false,
+                semantic_unavailable_reason: Some(format!(
+                    "Local Moment text embedding is unavailable: {error}"
+                )),
+                identity_search_blocked: false,
+                message: Some(
+                    "No Moment cards were ranked because the local text embedding could not be produced."
+                        .into(),
+                ),
+            });
+        }
+    };
+    let model = semantic_model_config(provider.identity());
+    if query.len() != model.dimensions {
+        return Ok(MomentSearchResponse {
+            query: normalized_query.into(),
+            results: Vec::new(),
+            has_more: false,
+            total_results: 0,
+            semantic_available: false,
+            semantic_applied: false,
+            semantic_unavailable_reason: Some(
+                "Local Moment text embedding dimensions do not match the installed model.".into(),
+            ),
+            identity_search_blocked: false,
+            message: Some(
+                "No Moment cards were ranked from an incompatible local text embedding.".into(),
+            ),
+        });
+    }
+
+    let candidates = repository.moment_search_candidates(project_id, &model)?;
+    if candidates.is_empty() {
+        return Ok(MomentSearchResponse {
+            query: normalized_query.into(),
+            results: Vec::new(),
+            has_more: false,
+            total_results: 0,
+            semantic_available: true,
+            semantic_applied: false,
+            semantic_unavailable_reason: Some(
+                "No compatible local Moment centroids are stored for this project."
+                    .into(),
+            ),
+            identity_search_blocked: false,
+            message: Some(
+                "No Moment cards were ranked because this timeline has no compatible locally derived centroid evidence."
+                    .into(),
+            ),
+        });
+    }
+
+    let mut candidates_by_id = candidates
+        .into_iter()
+        .map(|candidate| (candidate.moment_id.clone(), candidate))
+        .collect::<HashMap<_, _>>();
+    let ranked = rank_normalized_vectors(
+        &query,
+        candidates_by_id
+            .values()
+            .map(|candidate| (candidate.moment_id.clone(), candidate.centroid.clone())),
+        candidates_by_id.len(),
+    )
+    .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    let total_results = ranked.len() as u64;
+    let limit = request.limit.clamp(1, 60) as usize;
+    let has_more = ranked.len() > limit;
+    let results = ranked
+        .into_iter()
+        .take(limit)
+        .filter_map(|ranked| candidates_by_id.remove(&ranked.asset_id))
+        .map(|candidate| {
+            moment_summary_view(repository, project_id, &candidate.row, preview_cache_root)
+        })
+        .collect::<PersistenceResult<Vec<_>>>()?;
+    Ok(MomentSearchResponse {
+        query: normalized_query.into(),
+        results,
+        has_more,
+        total_results,
+        semantic_available: true,
+        semantic_applied: true,
+        semantic_unavailable_reason: None,
+        identity_search_blocked: false,
+        message: Some(
+            "Moment cards are ranked only by local image/text embedding similarity of compatible stored centroids. This is retrieval, not proof of an object, identity, relationship, or event."
+                .into(),
+        ),
+    })
+}
+
+/// Loads a selected Moment summary plus qualitative local boundary explanations. Its member
+/// photos stay on the existing bounded `visual_media_page` endpoint with a validated `moment_id`.
+pub fn load_moment_detail(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    moment_id: &str,
+    preview_cache_root: &Path,
+) -> PersistenceResult<Option<MomentDetailView>> {
+    let Some(detail) = repository.moment_detail(project_id, moment_id)? else {
+        return Ok(None);
+    };
+    let mut summary =
+        moment_summary_view(repository, project_id, &detail.moment, preview_cache_root)?;
+    summary.label.evidence = detail.label_evidence;
+    let boundaries = summary
+        .boundary_before
+        .clone()
+        .into_iter()
+        .collect::<Vec<_>>();
+    Ok(Some(MomentDetailView {
+        moment: summary,
+        boundary_evidence: boundaries,
+    }))
+}
+
+pub fn rename_moment(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    moment_id: &str,
+    label: &str,
+) -> PersistenceResult<()> {
+    repository.rename_moment(project_id, moment_id, label)
+}
+
+pub fn set_moment_human_representative(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    moment_id: &str,
+    asset_id: &MediaAssetId,
+) -> PersistenceResult<()> {
+    ensure_asset_project(repository, project_id, asset_id)?;
+    repository.set_moment_human_representative(project_id, moment_id, &asset_id.to_string())
+}
+
+pub fn merge_adjacent_moments(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    left_moment_id: &str,
+    right_moment_id: &str,
+) -> PersistenceResult<()> {
+    repository.merge_adjacent_moments(project_id, left_moment_id, right_moment_id)
+}
+
+pub fn split_moment(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    moment_id: &str,
+    after_asset_id: &MediaAssetId,
+) -> PersistenceResult<()> {
+    ensure_asset_project(repository, project_id, after_asset_id)?;
+    repository.split_moment(project_id, moment_id, &after_asset_id.to_string())
+}
+
+pub fn load_moment_checklists(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+) -> PersistenceResult<Vec<MomentChecklistView>> {
+    let items = repository
+        .coverage_checklist_items(project_id)?
+        .into_iter()
+        .map(coverage_checklist_item_view)
+        .collect::<Vec<_>>();
+    // M7 I has a single optional project-local checklist. The explicit stable projection leaves
+    // room for later user-managed checklist collections without assigning hidden categories.
+    Ok(vec![MomentChecklistView {
+        id: format!("project:{}:coverage", project_id),
+        name: "Project checklist".into(),
+        items,
+    }])
+}
+
+pub fn create_coverage_checklist_item(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    input: &CreateCoverageChecklistItemInput,
+) -> PersistenceResult<()> {
+    let phrase = input.phrase.trim();
+    if phrase.is_empty() {
+        return Err(PersistenceError::InvalidData(
+            "checklist phrase cannot be empty".into(),
+        ));
+    }
+    repository.create_coverage_checklist_item(&CoverageChecklistItemRecord {
+        id: Uuid::new_v4().to_string(),
+        project_id: project_id.to_string(),
+        text: phrase.into(),
+        created_at: Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn update_coverage_confirmation(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    input: &UpdateCoverageConfirmationInput,
+) -> PersistenceResult<()> {
+    repository.update_coverage_confirmation(
+        project_id,
+        &input.checklist_item_id,
+        &input.state,
+        input.moment_id.as_deref(),
+        input.asset_id.as_deref(),
+    )
+}
+
+/// Runs an explicitly requested, local Moment Brain analysis. This is deliberately separate
+/// from project loading: it reads only durable catalog evidence and M6 embeddings, and it never
+/// opens originals, mutates decisions, rewrites Similar Sets, or requires a network service.
+pub fn start_moment_analysis(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    provider_cache: &SiglipProviderCache,
+    resource_mode: AnalysisResourceMode,
+    rebuild: bool,
+    should_pause: impl Fn() -> bool,
+    on_progress: impl FnMut(&MomentAnalysisProgress),
+) -> PersistenceResult<MomentAnalysisProgress> {
+    let mut on_progress = on_progress;
+    let existing_timeline = repository.moment_timeline_status(project_id)?;
+    // Model inspection is permitted here because the photographer explicitly started analysis.
+    // A missing pack is not a structural-analysis failure: stored compatible vectors may still
+    // support boundaries, while labels correctly abstain without a local text embedder.
+    let (model_status, provider) = inspect_semantic_provider(repository, provider_cache)?;
+    let provider_identity = provider
+        .as_deref()
+        .map(|provider| provider.identity().clone());
+    let persisted_model = existing_timeline
+        .as_ref()
+        .and_then(|timeline| timeline.semantic_model_key.as_deref())
+        .and_then(semantic_model_config_from_cache_key);
+    let model = provider_identity
+        .as_ref()
+        .map(semantic_model_config)
+        .or(persisted_model);
+    let semantic_model_key = provider_identity
+        .as_ref()
+        .map(SemanticProviderIdentity::cache_key)
+        .or_else(|| {
+            existing_timeline
+                .as_ref()
+                .and_then(|timeline| timeline.semantic_model_key.clone())
+        });
+    let model_changed = existing_timeline
+        .as_ref()
+        .and_then(|timeline| timeline.semantic_model_key.as_deref())
+        .zip(semantic_model_key.as_deref())
+        .is_some_and(|(previous, current)| previous != current);
+    // A normal update asks persistence for just two whole trailing Moments plus new/unresolved
+    // stills. A model/version change or explicit rebuild deliberately falls back to a full
+    // projection because semantic spaces must never be mixed silently.
+    let mut incremental_window = if !rebuild && !model_changed {
+        repository.moment_incremental_analysis_window(project_id, model.as_ref())?
+    } else {
+        None
+    }
+    .filter(|window| window.active_semantic_model_key == semantic_model_key);
+    let mut inputs = if let Some(window) = incremental_window.as_ref() {
+        let mut inputs = window.preceding_context.clone();
+        inputs.extend(window.pending_inputs.clone());
+        inputs
+    } else {
+        repository.moment_analysis_inputs(project_id, model.as_ref())?
+    };
+    let now = Utc::now();
+    let timeline_id = existing_timeline
+        .as_ref()
+        .map(|timeline| timeline.timeline_id.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let mut job = BackgroundJob {
+        id: JobId::new(),
+        state: WorkflowRunState::Running,
+        stage: JobStage::MomentAnalysis,
+        items_completed: 0,
+        items_total: Some(inputs.len() as u64),
+        files_discovered: inputs.len() as u64,
+        files_processed: 0,
+        error_count: 0,
+        project_id: Some(project_id.clone()),
+        index_root_id: None,
+        error_message: None,
+        resume_metadata: Some(serde_json::json!({
+            "pipeline": "moment-analysis",
+            "resource_mode": resource_mode.as_str(),
+            "requested_rebuild": rebuild,
+            "semantic_model_key": semantic_model_key.clone(),
+        })),
+        created_at: now,
+        updated_at: now,
+        finished_at: None,
+    };
+    repository.insert_background_job(&job)?;
+    let initial_message = if rebuild || model_changed {
+        "Rebuilding the local Moment timeline. AI-derived boundaries and suggestions may change; human labels, representatives, merges, and splits remain separate."
+    } else {
+        "Analyzing local shoot structure from durable timestamps, existing evidence, and compatible cached embeddings."
+    };
+    let initial_progress = moment_progress(
+        Some(&job),
+        existing_timeline.as_ref(),
+        Some(initial_message.into()),
+    );
+    on_progress(&initial_progress);
+    if should_pause() {
+        return pause_moment_analysis(
+            repository,
+            &mut job,
+            existing_timeline.as_ref(),
+            &mut on_progress,
+            "Moment analysis paused before any local projection was replaced.",
+        );
+    }
+
+    let checklist_items = repository.coverage_checklist_items(project_id)?;
+    let label_candidates = moment_label_candidates(
+        provider.as_deref(),
+        provider_identity.as_ref(),
+        &checklist_items,
+    );
+    let mut timeline_assets =
+        materialize_moment_timeline_assets(&inputs, semantic_model_key.as_deref(), resource_mode);
+    let config = TimelineAnalysisConfig::default();
+    let mut tail_window = None::<MomentIncrementalAnalysisWindow>;
+    let mut incremental_fallback_reason = None::<String>;
+    let analysis = if let Some(window) = incremental_window.take() {
+        let previous_latest = window
+            .previous_latest_captured_at
+            .as_deref()
+            .and_then(moment_unix_millis);
+        if let Some(previous_latest) = previous_latest {
+            let context_length = window.preceding_context.len();
+            match analyze_append_only_tail(&AppendOnlyTailAnalysisRequest {
+                previous_latest_captured_at_unix_ms: previous_latest,
+                preceding_context_assets: timeline_assets[..context_length].to_vec(),
+                appended_assets: timeline_assets[context_length..].to_vec(),
+                label_candidates: label_candidates.clone(),
+                config: config.clone(),
+            }) {
+                Ok(result)
+                    if matches!(
+                        result.disposition,
+                        IncrementalDisposition::TailReanalyzed
+                            | IncrementalDisposition::UngroupedAssetsUpdated
+                    ) =>
+                {
+                    let Some(analysis) = result.analysis else {
+                        return fail_moment_analysis(
+                            repository,
+                            &mut job,
+                            existing_timeline.as_ref(),
+                            &mut on_progress,
+                            "Bounded Moment update returned no analysis projection.".into(),
+                        );
+                    };
+                    tail_window = Some(window);
+                    analysis
+                }
+                Ok(result) if matches!(result.disposition, IncrementalDisposition::NoChanges) => {
+                    job.state = WorkflowRunState::Completed;
+                    job.updated_at = Utc::now();
+                    job.finished_at = Some(job.updated_at);
+                    let progress = moment_progress(
+                        Some(&job),
+                        existing_timeline.as_ref(),
+                        Some("No new local still-photo timeline evidence was found; the existing Moment projection remains unchanged.".into()),
+                    );
+                    job.resume_metadata = Some(serde_json::json!({
+                        "pipeline": "moment-analysis",
+                        "resource_mode": resource_mode.as_str(),
+                        "incremental": true,
+                        "summary": &progress,
+                    }));
+                    repository.update_background_job(&job)?;
+                    on_progress(&progress);
+                    return Ok(progress);
+                }
+                Ok(result) => {
+                    incremental_fallback_reason = Some(result.reason);
+                    inputs = repository.moment_analysis_inputs(project_id, model.as_ref())?;
+                    timeline_assets = materialize_moment_timeline_assets(
+                        &inputs,
+                        semantic_model_key.as_deref(),
+                        resource_mode,
+                    );
+                    job.items_total = Some(inputs.len() as u64);
+                    job.files_discovered = inputs.len() as u64;
+                    job.updated_at = Utc::now();
+                    repository.update_background_job(&job)?;
+                    analyze_timeline(&TimelineAnalysisRequest {
+                        assets: timeline_assets.clone(),
+                        label_candidates,
+                        config,
+                    })
+                    .map_err(|error| {
+                        PersistenceError::InvalidData(format!(
+                            "Local Moment full rebuild could not safely process the project: {error}"
+                        ))
+                    })?
+                }
+                Err(error) => {
+                    return fail_moment_analysis(
+                        repository,
+                        &mut job,
+                        existing_timeline.as_ref(),
+                        &mut on_progress,
+                        format!("Bounded local Moment update could not safely run: {error}"),
+                    )
+                }
+            }
+        } else {
+            incremental_fallback_reason = Some(
+                "The prior Moment tail has no valid capture timestamp, so CaptureOS conservatively rebuilt the local projection.".into(),
+            );
+            inputs = repository.moment_analysis_inputs(project_id, model.as_ref())?;
+            timeline_assets = materialize_moment_timeline_assets(
+                &inputs,
+                semantic_model_key.as_deref(),
+                resource_mode,
+            );
+            job.items_total = Some(inputs.len() as u64);
+            job.files_discovered = inputs.len() as u64;
+            job.updated_at = Utc::now();
+            repository.update_background_job(&job)?;
+            analyze_timeline(&TimelineAnalysisRequest {
+                assets: timeline_assets.clone(),
+                label_candidates,
+                config,
+            })
+            .map_err(|error| {
+                PersistenceError::InvalidData(format!(
+                    "Local Moment full rebuild could not safely process the project: {error}"
+                ))
+            })?
+        }
+    } else {
+        analyze_timeline(&TimelineAnalysisRequest {
+            assets: timeline_assets.clone(),
+            label_candidates,
+            config,
+        })
+        .map_err(|error| {
+            PersistenceError::InvalidData(format!(
+                "Local Moment analysis could not safely process the project: {error}"
+            ))
+        })?
+    };
+    if should_pause() {
+        return pause_moment_analysis(
+            repository,
+            &mut job,
+            existing_timeline.as_ref(),
+            &mut on_progress,
+            "Moment analysis paused before its new local projection was committed.",
+        );
+    }
+
+    let overrides = repository.active_moment_override_operations(project_id)?;
+    let run_id = Uuid::new_v4().to_string();
+    let finished_at = Utc::now();
+    let moment_ordinal_offset = tail_window
+        .as_ref()
+        .map(|window| window.moment_ordinal_base)
+        .unwrap_or(0);
+    let membership_ordinal_offset = tail_window
+        .as_ref()
+        .map(|window| window.affected_tail_start_ordinal)
+        .unwrap_or(0);
+    let capture_time_by_asset = inputs
+        .iter()
+        .filter_map(|input| {
+            input
+                .captured_at
+                .as_ref()
+                .map(|captured_at| (input.asset_id.clone(), captured_at.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let projection = materialize_moment_projection(MomentProjectionRequest {
+        project_id,
+        timeline_id: &timeline_id,
+        run_id: &run_id,
+        analysis: &analysis,
+        assets: &timeline_assets,
+        capture_time_by_asset: &capture_time_by_asset,
+        overrides: &overrides,
+        created_at: &finished_at,
+        moment_ordinal_offset,
+        membership_ordinal_offset,
+    })?;
+    let input_catalog_version = tail_window.as_ref().map_or_else(
+        || moment_input_catalog_version(&inputs, semantic_model_key.as_deref()),
+        |window| {
+            moment_incremental_catalog_version(
+                existing_timeline
+                    .as_ref()
+                    .map(|timeline| timeline.input_catalog_version.as_str()),
+                window,
+                &inputs,
+                semantic_model_key.as_deref(),
+            )
+        },
+    );
+    let timeline = MomentTimelineStatusRecord {
+        timeline_id: timeline_id.clone(),
+        project_id: project_id.to_string(),
+        state: "ready".into(),
+        analyzer_id: MOMENT_ANALYZER_ID.into(),
+        analyzer_version: analysis.algorithm_version.clone(),
+        boundary_algorithm_version: MOMENT_BOUNDARY_ALGORITHM_VERSION.into(),
+        semantic_model_key: semantic_model_key.clone(),
+        input_catalog_version,
+        active_run_id: Some(run_id.clone()),
+        moment_count: projection.moments.len() as u64,
+        eligible_count: inputs.len() as u64,
+        ungrouped_count: projection
+            .memberships
+            .iter()
+            .filter(|membership| membership.membership_state == "ungrouped")
+            .count() as u64,
+        updated_at: finished_at.to_rfc3339(),
+    };
+    let run = MomentAnalysisRunRecord {
+        id: run_id,
+        timeline_id,
+        project_id: project_id.to_string(),
+        state: "completed".into(),
+        analyzer_id: MOMENT_ANALYZER_ID.into(),
+        analyzer_version: analysis.algorithm_version.clone(),
+        boundary_algorithm_version: MOMENT_BOUNDARY_ALGORITHM_VERSION.into(),
+        semantic_model_key,
+        input_catalog_version: timeline.input_catalog_version.clone(),
+        items_total: inputs.len() as u64,
+        items_completed: inputs.len() as u64,
+        // Diagnostics retain individual unavailable/invalid evidence without pretending every
+        // non-fatal diagnostic was a failed asset.
+        error_count: 0,
+        started_at: job.created_at.to_rfc3339(),
+        finished_at: Some(finished_at.to_rfc3339()),
+    };
+    let persisted = if let Some(window) = tail_window.as_ref() {
+        // The tail writer uses the `active_run_id` carried by this record as an optimistic
+        // concurrency guard for the *previous* durable projection. The new run is carried by
+        // `run` and becomes active atomically inside the repository. Passing the planned new
+        // run here would make a valid append-only update look like an in-place rewrite.
+        let mut tail_timeline = timeline.clone();
+        tail_timeline.active_run_id = Some(window.active_run_id.clone());
+        repository.replace_active_moment_analysis_tail(
+            &tail_timeline,
+            &run,
+            window.affected_tail_start_ordinal,
+            &projection.segments,
+            &projection.moments,
+            &projection.memberships,
+            &projection.boundaries,
+        )
+    } else {
+        repository.replace_active_moment_analysis(
+            &timeline,
+            &run,
+            &projection.segments,
+            &projection.moments,
+            &projection.memberships,
+            &projection.boundaries,
+        )
+    };
+    if let Err(error) = persisted {
+        return fail_moment_analysis(
+            repository,
+            &mut job,
+            existing_timeline.as_ref(),
+            &mut on_progress,
+            format!("Local Moment projection could not be saved: {error}"),
+        );
+    }
+
+    // A full local projection may derive a narrow camera-time advisory from existing Similar
+    // Set co-membership. A bounded tail update intentionally abstains instead of carrying a
+    // prior full-run advisory into a new run: newly appended related frames could conflict with
+    // it, and Moment Brain must never imply that an unexamined diagnostic remains current.
+    let mut clock_diagnostic_persistence_failed = false;
+    let clock_diagnostic_count = if tail_window.is_none() {
+        let diagnostics =
+            moment_clock_diagnostic_records(project_id, &run.id, &timeline_assets, finished_at);
+        let count = diagnostics.len();
+        if !diagnostics.is_empty()
+            && repository
+                .record_camera_clock_offset_diagnostics(&diagnostics)
+                .is_err()
+        {
+            // The timeline is already durable and must remain usable. A clock observation is
+            // optional advisory evidence, so a storage failure never rolls back, blocks, or
+            // converts the structural analysis into a fabricated successful diagnostic.
+            clock_diagnostic_persistence_failed = true;
+            job.error_count = job.error_count.saturating_add(1);
+        }
+        count
+    } else {
+        0
+    };
+
+    job.state = WorkflowRunState::Completed;
+    job.stage = JobStage::MomentAnalysis;
+    job.items_completed = inputs.len() as u64;
+    job.files_processed = inputs.len() as u64;
+    job.updated_at = finished_at;
+    job.finished_at = Some(finished_at);
+    let persisted_timeline = repository.moment_timeline_status(project_id)?;
+    let mut completed_message = if provider.is_some() {
+        "Local Moment timeline is ready. Suggested labels use only the reviewed vocabulary or exact photographer checklist phrases; uncertain labels remain Untitled Moment."
+    } else {
+        model_status.message.as_deref().unwrap_or(
+            "Local structural timeline is ready; semantic label suggestions were unavailable.",
+        )
+    }
+    .to_owned();
+    if clock_diagnostic_persistence_failed {
+        completed_message.push_str(
+            " A possible camera-time advisory could not be saved; no timestamps were changed.",
+        );
+        job.error_message = Some(
+            "A local camera-time advisory could not be saved; the Moment timeline remains ready and no timestamps were changed."
+                .into(),
+        );
+    }
+    let completed_progress = moment_progress(
+        Some(&job),
+        persisted_timeline.as_ref(),
+        Some(completed_message),
+    );
+    job.resume_metadata = Some(serde_json::json!({
+        "pipeline": "moment-analysis",
+        "resource_mode": resource_mode.as_str(),
+        "requested_rebuild": rebuild,
+        "incremental": tail_window.is_some(),
+        "incremental_fallback_reason": incremental_fallback_reason,
+        "clock_offset_diagnostic_count": clock_diagnostic_count,
+        "summary": &completed_progress,
+        "diagnostic_count": analysis.diagnostics.len(),
+    }));
+    repository.update_background_job(&job)?;
+    on_progress(&completed_progress);
+    Ok(completed_progress)
+}
+
+/// Marks interrupted local Moment jobs safely at desktop startup. It does not start analysis,
+/// load a model, or change the last durable timeline projection.
+pub fn recover_interrupted_moment_analysis(
+    repository: &impl CatalogRepository,
+) -> PersistenceResult<u64> {
+    repository.recover_interrupted_moment_analysis()
+}
+
+fn pause_moment_analysis(
+    repository: &impl CatalogRepository,
+    job: &mut BackgroundJob,
+    timeline: Option<&MomentTimelineStatusRecord>,
+    on_progress: &mut impl FnMut(&MomentAnalysisProgress),
+    message: &str,
+) -> PersistenceResult<MomentAnalysisProgress> {
+    job.state = WorkflowRunState::Paused;
+    job.updated_at = Utc::now();
+    let progress = moment_progress(Some(job), timeline, Some(message.into()));
+    job.resume_metadata = Some(serde_json::json!({
+        "pipeline": "moment-analysis",
+        "summary": &progress,
+    }));
+    repository.update_background_job(job)?;
+    on_progress(&progress);
+    Ok(progress)
+}
+
+fn fail_moment_analysis(
+    repository: &impl CatalogRepository,
+    job: &mut BackgroundJob,
+    timeline: Option<&MomentTimelineStatusRecord>,
+    on_progress: &mut impl FnMut(&MomentAnalysisProgress),
+    message: String,
+) -> PersistenceResult<MomentAnalysisProgress> {
+    job.state = WorkflowRunState::Failed;
+    job.error_count = job.error_count.saturating_add(1);
+    job.error_message = Some(message.clone());
+    job.updated_at = Utc::now();
+    job.finished_at = Some(job.updated_at);
+    let progress = moment_progress(Some(job), timeline, Some(message));
+    job.resume_metadata = Some(serde_json::json!({
+        "pipeline": "moment-analysis",
+        "summary": &progress,
+    }));
+    repository.update_background_job(job)?;
+    on_progress(&progress);
+    Ok(progress)
+}
+
+fn semantic_model_config_from_cache_key(value: &str) -> Option<SemanticModelConfig> {
+    let parts = value.split('|').collect::<Vec<_>>();
+    let [model_id, provider, model_version, embedding_version, preprocessing_version, metric, dimensions] =
+        parts.as_slice()
+    else {
+        return None;
+    };
+    let dimensions = dimensions.parse::<usize>().ok()?;
+    if dimensions == 0
+        || [
+            *model_id,
+            *provider,
+            *model_version,
+            *embedding_version,
+            *preprocessing_version,
+            *metric,
+        ]
+        .iter()
+        .any(|part| part.trim().is_empty())
+    {
+        return None;
+    }
+    Some(SemanticModelConfig {
+        model_id: (*model_id).into(),
+        provider: (*provider).into(),
+        model_version: (*model_version).into(),
+        // Persisted M6 rows use the full embedding-version tuple including dimensions. Rebuild
+        // the exact tuple from the cache key so an installed provider can reuse durable local
+        // embeddings offline instead of treating its own compatible vectors as unavailable.
+        embedding_version: format!("{embedding_version};dimensions={dimensions}"),
+        preprocessing_version: (*preprocessing_version).into(),
+        metric: (*metric).into(),
+        dimensions,
+    })
+}
+
+fn moment_input_catalog_version(
+    inputs: &[MomentAnalysisInput],
+    semantic_model_key: Option<&str>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"captureos-m7-moment-inputs-v1\0");
+    hasher.update(
+        semantic_model_key
+            .unwrap_or("no-compatible-semantic-model")
+            .as_bytes(),
+    );
+    for input in inputs {
+        for value in [
+            input.asset_id.as_str(),
+            input.captured_at.as_deref().unwrap_or(""),
+            input.capture_time_source.as_deref().unwrap_or(""),
+            input.camera_model.as_deref().unwrap_or(""),
+            input.lens_model.as_deref().unwrap_or(""),
+            input.orientation.as_deref().unwrap_or(""),
+            input.technical_quality_band.as_deref().unwrap_or(""),
+            input.decision.as_deref().unwrap_or(""),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update(&[0]);
+        }
+        hasher.update(&input.face_count.unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(
+            &input
+                .technical_quality_score
+                .unwrap_or(f64::NAN)
+                .to_le_bytes(),
+        );
+        hasher.update(&[input.rating, u8::from(input.starred)]);
+        for group_id in &input.similar_set_ids {
+            hasher.update(group_id.as_bytes());
+            hasher.update(&[0]);
+        }
+        if let Some(embedding) = &input.embedding {
+            for value in embedding {
+                hasher.update(&value.to_le_bytes());
+            }
+        }
+        hasher.update(&[0xff]);
+    }
+    format!("m7:{}", hasher.finalize().to_hex())
+}
+
+/// A durable lineage version for a bounded append-only replacement. It records the previous
+/// full/tail version plus the exact bounded evidence handed to the analyzer; callers do not
+/// misrepresent it as a fresh all-catalog checksum.
+fn moment_incremental_catalog_version(
+    previous_version: Option<&str>,
+    window: &MomentIncrementalAnalysisWindow,
+    inputs: &[MomentAnalysisInput],
+    semantic_model_key: Option<&str>,
+) -> String {
+    let bounded = moment_input_catalog_version(inputs, semantic_model_key);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"captureos-m7-moment-incremental-lineage-v1\0");
+    hasher.update(previous_version.unwrap_or("no-prior-version").as_bytes());
+    hasher.update(&[0]);
+    hasher.update(window.timeline_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(window.active_run_id.as_bytes());
+    hasher.update(&window.affected_tail_start_ordinal.to_le_bytes());
+    hasher.update(&window.moment_ordinal_base.to_le_bytes());
+    hasher.update(bounded.as_bytes());
+    format!("m7-incremental:{}", hasher.finalize().to_hex())
+}
+
+fn moment_unix_millis(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc).timestamp_millis())
+        .or_else(|| {
+            // Unknown-offset EXIF values remain local wall-clock strings in persistence and UI.
+            // Moment Brain needs only a stable within-project ordering coordinate, so map the
+            // naive value onto an internal epoch without ever serializing it as claimed UTC.
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S"))
+                .ok()
+                .map(|value| Utc.from_utc_datetime(&value).timestamp_millis())
+        })
+}
+
+fn moment_label_candidates(
+    provider: Option<&SiglipOnnxProvider>,
+    identity: Option<&SemanticProviderIdentity>,
+    checklist_items: &[PersistedCoverageChecklistItemView],
+) -> Vec<LabelCandidate> {
+    let mut candidates = GenericLabelConcept::REVIEWED
+        .into_iter()
+        .map(|concept| LabelCandidate {
+            candidate_id: format!("reviewed-generic:{}", concept.display_name()),
+            kind: LabelCandidateKind::ReviewedGeneric { concept },
+            semantic_embedding: moment_label_embedding(provider, identity, concept.display_name()),
+        })
+        .collect::<Vec<_>>();
+    candidates.extend(checklist_items.iter().filter_map(|item| {
+        let phrase = item.text.trim();
+        (!phrase.is_empty()).then(|| LabelCandidate {
+            candidate_id: format!("project-checklist:{}", item.id),
+            kind: LabelCandidateKind::HumanProjectPhrase {
+                phrase: phrase.into(),
+            },
+            semantic_embedding: moment_label_embedding(provider, identity, phrase),
+        })
+    }));
+    candidates
+}
+
+fn moment_label_embedding(
+    provider: Option<&SiglipOnnxProvider>,
+    identity: Option<&SemanticProviderIdentity>,
+    phrase: &str,
+) -> Option<SemanticVector> {
+    let provider = provider?;
+    let identity = identity?;
+    let values = provider.embed_text(phrase).ok()?;
+    let values = normalize_embedding(values).ok()?;
+    (values.len() == identity.dimensions).then(|| SemanticVector {
+        compatibility_key: identity.cache_key(),
+        values,
+    })
+}
+
+// Moment Brain remains a deterministic sequential structural analyzer, but transforming a large
+// durable input page into its pure engine form must not monopolize the background worker. These
+// modes alter only batch/yield cadence; they never change evidence inputs, ordering, thresholds,
+// candidate vocabulary, or labels.
+const MOMENT_ECO_TRANSFORM_BATCH_SIZE: usize = 16;
+const MOMENT_BALANCED_TRANSFORM_BATCH_SIZE: usize = 64;
+const MOMENT_FAST_TRANSFORM_BATCH_SIZE: usize = 256;
+
+fn moment_transform_batch_size(resource_mode: AnalysisResourceMode) -> usize {
+    match resource_mode {
+        AnalysisResourceMode::Eco => MOMENT_ECO_TRANSFORM_BATCH_SIZE,
+        AnalysisResourceMode::Balanced => MOMENT_BALANCED_TRANSFORM_BATCH_SIZE,
+        AnalysisResourceMode::Fast => MOMENT_FAST_TRANSFORM_BATCH_SIZE,
+    }
+}
+
+fn materialize_moment_timeline_assets(
+    inputs: &[MomentAnalysisInput],
+    semantic_model_key: Option<&str>,
+    resource_mode: AnalysisResourceMode,
+) -> Vec<TimelineAssetInput> {
+    let batch_size = moment_transform_batch_size(resource_mode);
+    let batch_count = (inputs.len().saturating_add(batch_size - 1)) / batch_size;
+    let mut assets = Vec::with_capacity(inputs.len());
+    for (batch_index, batch) in inputs.chunks(batch_size).enumerate() {
+        assets.extend(
+            batch
+                .iter()
+                .map(|input| moment_timeline_asset(input, semantic_model_key)),
+        );
+        // `yield_now` is intentionally the only mode-dependent behavior: the same vector of
+        // inputs is passed to the analyzer in the same chronological/catalog order in all modes.
+        if batch_index.saturating_add(1) < batch_count {
+            thread::yield_now();
+        }
+    }
+    assets
+}
+
+fn moment_timeline_asset(
+    input: &MomentAnalysisInput,
+    semantic_model_key: Option<&str>,
+) -> TimelineAssetInput {
+    let orientation = input.orientation.as_deref().and_then(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "landscape" | "horizontal" => Some(MomentOrientation::Landscape),
+            "portrait" | "vertical" => Some(MomentOrientation::Portrait),
+            "square" => Some(MomentOrientation::Square),
+            _ => None,
+        }
+    });
+    let decision = input.decision.as_deref().and_then(|value| match value {
+        "keep" => Some(ExistingHumanDecision::Keep),
+        "reject" => Some(ExistingHumanDecision::Reject),
+        "review" => Some(ExistingHumanDecision::Review),
+        _ => None,
+    });
+    let semantic_embedding = semantic_model_key.and_then(|compatibility_key| {
+        input
+            .embedding
+            .clone()
+            .and_then(|values| normalize_embedding(values).ok())
+            .map(|values| SemanticVector {
+                compatibility_key: compatibility_key.into(),
+                values,
+            })
+    });
+    TimelineAssetInput {
+        asset_id: input.asset_id.clone(),
+        captured_at_unix_ms: input.captured_at.as_deref().and_then(moment_unix_millis),
+        camera_model: input.camera_model.clone(),
+        lens_model: input.lens_model.clone(),
+        orientation,
+        anonymous_face_count: input.face_count.and_then(|count| u32::try_from(count).ok()),
+        similar_set_ids: Some(input.similar_set_ids.clone()),
+        // CaptureOS deliberately does not parse source filenames for Moment Brain. A future
+        // sequence field may be supplied by a dedicated, tested metadata adapter.
+        filename_sequence: None,
+        semantic_embedding,
+        technical_presentation_score: input
+            .technical_quality_score
+            .filter(|score| score.is_finite())
+            .map(|score| (score / 100.0).clamp(0.0, 1.0) as f32),
+        human_presentation: HumanPresentationSignals {
+            decision,
+            rating: (input.rating > 0).then_some(input.rating),
+            // A missing star and an explicit false star are both non-positive existing state;
+            // neither is used to downgrade a representative.
+            starred: input.starred.then_some(true),
+        },
+    }
+}
+
+/// Converts the pure, conservative Moment Brain result into a current-run local persistence
+/// record. The signed offset remains private evidence; normal UI presentation is intentionally
+/// direction-free because this is not a claim that either camera's timestamp is correct.
+fn moment_clock_diagnostic_records(
+    project_id: &ProjectId,
+    run_id: &str,
+    assets: &[TimelineAssetInput],
+    created_at: DateTime<Utc>,
+) -> Vec<CameraClockOffsetDiagnosticRecord> {
+    derive_clock_offset_diagnostics(assets)
+        .into_iter()
+        .map(|diagnostic| CameraClockOffsetDiagnosticRecord {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_string(),
+            run_id: run_id.into(),
+            camera_a: diagnostic.camera_a,
+            camera_b: diagnostic.camera_b,
+            possible_offset_seconds: Some(round_milliseconds_to_seconds(
+                diagnostic.median_offset_ms,
+            )),
+            evidence_json: serde_json::json!({
+                "state": "possible_offset",
+                "method": diagnostic.method,
+                "medianOffsetMilliseconds": diagnostic.median_offset_ms,
+                "medianAbsoluteDeviationMilliseconds": diagnostic.median_absolute_deviation_ms,
+                "independentSimilarSetComparisons": diagnostic.comparison_count,
+                "supportingSimilarSetIds": diagnostic.supporting_similar_set_ids,
+                "scope": "current_project_existing_similar_sets",
+            }),
+            created_at: created_at.to_rfc3339(),
+        })
+        .collect()
+}
+
+/// Round rather than truncate the signed local observation so a stored `possible_offset_seconds`
+/// remains a faithful, compact representation of its derived millisecond evidence.
+fn round_milliseconds_to_seconds(value: i64) -> i64 {
+    let seconds = value / 1_000;
+    let remainder = value % 1_000;
+    if remainder.unsigned_abs() >= 500 {
+        seconds.saturating_add(value.signum())
+    } else {
+        seconds
+    }
+}
+
+fn moment_clock_diagnostic_view(
+    diagnostic: CameraClockOffsetDiagnosticRecord,
+) -> Option<MomentClockDiagnosticView> {
+    let seconds = diagnostic.possible_offset_seconds?;
+    // A database row is not necessarily M7 engine output (for example, an interrupted or older
+    // implementation may have written incomplete evidence). Keep the normal UI stricter than
+    // storage and abstain unless it still meets the documented one-minute minimum.
+    if seconds.unsigned_abs() < 60 {
+        return None;
+    }
+    Some(MomentClockDiagnosticView {
+        camera_label: format!("{} ↔ {}", diagnostic.camera_a, diagnostic.camera_b),
+        summary: format!(
+            "Possible camera time offset: related local frames consistently differ by about {}. CaptureOS did not change any timestamps.",
+            concise_clock_offset_duration(seconds.unsigned_abs())
+        ),
+        state: "possible_offset".into(),
+    })
+}
+
+fn concise_clock_offset_duration(seconds: u64) -> String {
+    let minutes = (seconds.saturating_add(30) / 60).max(1);
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    match (hours, remaining_minutes) {
+        (0, minutes) => format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" }),
+        (hours, 0) => format!("{hours} hour{}", if hours == 1 { "" } else { "s" }),
+        (hours, minutes) => format!(
+            "{hours} hour{} {minutes} minute{}",
+            if hours == 1 { "" } else { "s" },
+            if minutes == 1 { "" } else { "s" },
+        ),
+    }
+}
+
+struct MaterializedMomentProjection {
+    segments: Vec<TimelineSegmentRecord>,
+    moments: Vec<MomentRecord>,
+    memberships: Vec<MomentMembershipRecord>,
+    boundaries: Vec<MomentBoundaryEvidenceRecord>,
+}
+
+/// All inputs necessary to materialize one derived Moment projection. Grouping them preserves a
+/// legible boundary between analysis and persistence without an error-prone positional argument
+/// list; no user-facing data or original-media reference crosses this boundary.
+struct MomentProjectionRequest<'a> {
+    project_id: &'a ProjectId,
+    timeline_id: &'a str,
+    run_id: &'a str,
+    analysis: &'a TimelineAnalysis,
+    assets: &'a [TimelineAssetInput],
+    /// Persist the original normalized capture string for presentation. This is especially
+    /// important for unknown-timezone camera clocks, whose internal ordering coordinate must
+    /// never be written back as an invented UTC value.
+    capture_time_by_asset: &'a HashMap<String, String>,
+    overrides: &'a [MomentOverrideOperation],
+    created_at: &'a DateTime<Utc>,
+    moment_ordinal_offset: u64,
+    membership_ordinal_offset: u64,
+}
+
+fn materialize_moment_projection(
+    request: MomentProjectionRequest<'_>,
+) -> PersistenceResult<MaterializedMomentProjection> {
+    let MomentProjectionRequest {
+        project_id,
+        timeline_id,
+        run_id,
+        analysis,
+        assets,
+        capture_time_by_asset,
+        overrides,
+        created_at,
+        moment_ordinal_offset,
+        membership_ordinal_offset,
+    } = request;
+    let assets_by_id = assets
+        .iter()
+        .map(|asset| (asset.asset_id.clone(), asset))
+        .collect::<HashMap<_, _>>();
+    let automatic_segments = analysis
+        .moments
+        .iter()
+        .map(|segment| (segment.asset_ids.clone(), segment))
+        .collect::<HashMap<_, _>>();
+    let automatic_boundaries = analysis
+        .boundaries
+        .iter()
+        .map(|boundary| (boundary.right_asset_id.clone(), boundary))
+        .collect::<HashMap<_, _>>();
+    let mut automatic_breaks = HashSet::new();
+    for boundary in &analysis.boundaries {
+        if matches!(
+            boundary.category,
+            moment_brain::BoundaryCategory::Moderate | moment_brain::BoundaryCategory::Strong
+        ) {
+            automatic_breaks.insert((
+                boundary.left_asset_id.clone(),
+                boundary.right_asset_id.clone(),
+            ));
+        }
+    }
+    // Later active events win deterministically if a user has explicitly changed the same
+    // boundary more than once. Both operations stay in durable history; only the current event
+    // is applied to the new AI projection.
+    let mut overrides_by_boundary = HashMap::new();
+    for operation in overrides.iter().filter(|operation| operation.active) {
+        overrides_by_boundary.insert(
+            (
+                operation.left_asset_id.clone(),
+                operation.right_asset_id.clone(),
+            ),
+            operation,
+        );
+    }
+    let mut groups = Vec::<Vec<String>>::new();
+    if let Some(first_asset_id) = analysis.ordered_asset_ids.first() {
+        let mut current = vec![first_asset_id.clone()];
+        for asset_id in analysis.ordered_asset_ids.iter().skip(1) {
+            let left_asset_id = current
+                .last()
+                .expect("a non-empty local Moment group has a last asset")
+                .clone();
+            let boundary = (left_asset_id.clone(), asset_id.clone());
+            let mut split = automatic_breaks.contains(&boundary);
+            if let Some(operation) = overrides_by_boundary.get(&boundary) {
+                split = match operation.operation.as_str() {
+                    "split" => true,
+                    "merge" => false,
+                    _ => split,
+                };
+            }
+            if split {
+                groups.push(current);
+                current = vec![asset_id.clone()];
+            } else {
+                current.push(asset_id.clone());
+            }
+        }
+        groups.push(current);
+    }
+
+    let created_at_text = created_at.to_rfc3339();
+    let mut segments = Vec::with_capacity(groups.len());
+    let mut moments = Vec::with_capacity(groups.len());
+    let mut membership_to_moment = HashMap::<String, String>::new();
+    for (relative_ordinal, group) in groups.iter().enumerate() {
+        let ordinal = moment_ordinal_offset.saturating_add(relative_ordinal as u64);
+        let automatic = automatic_segments.get(group).copied();
+        let segment_id = Uuid::new_v4().to_string();
+        let moment_id = Uuid::new_v4().to_string();
+        let first = assets_by_id.get(&group[0]).copied().ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "Moment output referenced an unknown timeline asset".into(),
+            )
+        })?;
+        let last = assets_by_id
+            .get(group.last().expect("non-empty Moment group"))
+            .copied()
+            .ok_or_else(|| {
+                PersistenceError::InvalidData(
+                    "Moment output referenced an unknown timeline asset".into(),
+                )
+            })?;
+        let boundary_before = automatic_boundaries.get(&group[0]).copied();
+        let (suggested_label, label_confidence, label_state, label_evidence, ai_representative) =
+            if let Some(segment) = automatic {
+                let state = moment_enum_label(&segment.ai_label.state);
+                let source = segment.ai_label.source.as_ref().map(moment_enum_label);
+                let label_state = match (state.as_str(), source.as_deref()) {
+                    ("suggested", Some("human_project_phrase")) => {
+                        "project_checklist_semantic_candidate"
+                    }
+                    ("suggested", Some("reviewed_generic_concepts")) => "generic_visual_vocabulary",
+                    ("semantic_evidence_unavailable", _) => "semantic_evidence_unavailable",
+                    _ => "abstained",
+                }
+                .to_owned();
+                let representative = if group.contains(&segment.ai_representative.asset_id) {
+                    segment.ai_representative.asset_id.clone()
+                } else {
+                    group[0].clone()
+                };
+                (
+                    (state == "suggested").then(|| segment.ai_label.display_label.clone()),
+                    segment.ai_label.semantic_similarity.map(f64::from),
+                    label_state,
+                    serde_json::json!({
+                        "state": state,
+                        "source": source,
+                        "concepts": segment.ai_label.supporting_generic_concepts.iter().map(|concept| concept.display_name()).collect::<Vec<_>>(),
+                        "evidence": segment.ai_label.evidence,
+                        "compatibilityKey": segment.ai_label.compatibility_key,
+                        "supportingVectorCount": segment.ai_label.supporting_vector_count,
+                        "representativeEvidence": segment.ai_representative.explanation,
+                    }),
+                    representative,
+                )
+            } else {
+                (
+                    None,
+                    None,
+                    "abstained_human_structure_override".into(),
+                    serde_json::json!({
+                        "state": "abstained",
+                        "evidence": ["The photographer's protected merge or split changed this automatic segment. CaptureOS abstained from remapping a semantic label across the revised human structure."],
+                        "concepts": [],
+                    }),
+                    group[0].clone(),
+                )
+            };
+        let compatible_key =
+            automatic.and_then(|segment| segment.semantic_summary.compatibility_key.as_deref());
+        let centroid = moment_centroid(group, &assets_by_id, compatible_key);
+        let boundary_evidence = boundary_before.map_or_else(
+            || serde_json::json!({"automaticBoundary": false}),
+            |boundary| {
+                serde_json::json!({
+                    "automaticBoundary": true,
+                    "category": moment_enum_label(&boundary.category),
+                    "explanation": boundary.explanation,
+                })
+            },
+        );
+        segments.push(TimelineSegmentRecord {
+            id: segment_id.clone(),
+            project_id: project_id.to_string(),
+            run_id: run_id.into(),
+            ordinal,
+            started_at: materialized_moment_capture_time(
+                &first.asset_id,
+                first.captured_at_unix_ms,
+                capture_time_by_asset,
+            ),
+            ended_at: materialized_moment_capture_time(
+                &last.asset_id,
+                last.captured_at_unix_ms,
+                capture_time_by_asset,
+            ),
+            asset_count: group.len() as u64,
+            boundary_category: boundary_before
+                .map(|boundary| moment_enum_label(&boundary.category)),
+            boundary_evidence,
+            created_at: created_at_text.clone(),
+            stale: false,
+        });
+        moments.push(MomentRecord {
+            id: moment_id.clone(),
+            project_id: project_id.to_string(),
+            timeline_id: timeline_id.into(),
+            run_id: run_id.into(),
+            segment_id,
+            anchor_asset_id: group[0].clone(),
+            ordinal,
+            started_at: materialized_moment_capture_time(
+                &first.asset_id,
+                first.captured_at_unix_ms,
+                capture_time_by_asset,
+            ),
+            ended_at: materialized_moment_capture_time(
+                &last.asset_id,
+                last.captured_at_unix_ms,
+                capture_time_by_asset,
+            ),
+            asset_count: group.len() as u64,
+            ai_representative_asset_id: Some(ai_representative),
+            centroid_dimensions: centroid.as_ref().map(Vec::len),
+            centroid,
+            suggested_label,
+            label_confidence,
+            label_evidence,
+            label_state,
+            created_at: created_at_text.clone(),
+            stale: false,
+        });
+        for asset_id in group {
+            membership_to_moment.insert(asset_id.clone(), moment_id.clone());
+        }
+    }
+
+    let mut memberships =
+        Vec::with_capacity(analysis.ordered_asset_ids.len() + analysis.ungrouped_assets.len());
+    for (relative_ordinal, asset_id) in analysis.ordered_asset_ids.iter().enumerate() {
+        memberships.push(MomentMembershipRecord {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_string(),
+            run_id: run_id.into(),
+            moment_id: membership_to_moment.get(asset_id).cloned(),
+            media_asset_id: asset_id.clone(),
+            ordinal: membership_ordinal_offset.saturating_add(relative_ordinal as u64),
+            membership_state: "member".into(),
+            created_at: created_at_text.clone(),
+            active: true,
+        });
+    }
+    for (offset, asset) in analysis.ungrouped_assets.iter().enumerate() {
+        memberships.push(MomentMembershipRecord {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_string(),
+            run_id: run_id.into(),
+            moment_id: None,
+            media_asset_id: asset.asset_id.clone(),
+            ordinal: membership_ordinal_offset
+                .saturating_add((analysis.ordered_asset_ids.len() + offset) as u64),
+            membership_state: "ungrouped".into(),
+            created_at: created_at_text.clone(),
+            active: true,
+        });
+    }
+    let boundaries = analysis
+        .boundaries
+        .iter()
+        .enumerate()
+        .map(|(ordinal, boundary)| MomentBoundaryEvidenceRecord {
+            id: Uuid::new_v4().to_string(),
+            project_id: project_id.to_string(),
+            run_id: run_id.into(),
+            left_asset_id: boundary.left_asset_id.clone(),
+            right_asset_id: boundary.right_asset_id.clone(),
+            ordinal: ordinal as u64,
+            category: moment_enum_label(&boundary.category),
+            components: serde_json::to_value(boundary).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "availability": "unavailable",
+                    "detail": "Local boundary evidence could not be serialized.",
+                })
+            }),
+            explanation: boundary.explanation.clone(),
+            created_at: created_at_text.clone(),
+        })
+        .collect();
+    Ok(MaterializedMomentProjection {
+        segments,
+        moments,
+        memberships,
+        boundaries,
+    })
+}
+
+fn moment_centroid(
+    asset_ids: &[String],
+    assets_by_id: &HashMap<String, &TimelineAssetInput>,
+    compatibility_key: Option<&str>,
+) -> Option<Vec<f32>> {
+    let compatibility_key = compatibility_key?;
+    let mut values: Option<Vec<f32>> = None;
+    let mut vector_count = 0usize;
+    for asset_id in asset_ids {
+        let Some(vector) = assets_by_id
+            .get(asset_id)
+            .and_then(|asset| asset.semantic_embedding.as_ref())
+        else {
+            continue;
+        };
+        if vector.compatibility_key != compatibility_key {
+            continue;
+        }
+        match &mut values {
+            Some(sum) if sum.len() == vector.values.len() => {
+                for (target, value) in sum.iter_mut().zip(&vector.values) {
+                    *target += *value;
+                }
+                vector_count += 1;
+            }
+            None => {
+                values = Some(vector.values.clone());
+                vector_count = 1;
+            }
+            Some(_) => {}
+        }
+    }
+    let mut values = values?;
+    if vector_count == 0 {
+        return None;
+    }
+    for value in &mut values {
+        *value /= vector_count as f32;
+    }
+    normalize_embedding(values).ok()
+}
+
+fn moment_timestamp(value: Option<i64>) -> Option<String> {
+    value
+        .and_then(|value| Utc.timestamp_millis_opt(value).single())
+        .map(|value| value.to_rfc3339())
+}
+
+fn materialized_moment_capture_time(
+    asset_id: &str,
+    fallback_timestamp: Option<i64>,
+    capture_time_by_asset: &HashMap<String, String>,
+) -> Option<String> {
+    capture_time_by_asset
+        .get(asset_id)
+        .cloned()
+        .or_else(|| moment_timestamp(fallback_timestamp))
+}
+
+fn moment_enum_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unavailable".into())
+}
+
+fn coverage_checklist_item_view(item: PersistedCoverageChecklistItemView) -> CoverageChecklistItem {
+    CoverageChecklistItem {
+        id: item.id,
+        phrase: item.text,
+        state: item
+            .confirmation_state
+            .unwrap_or_else(|| "unreviewed".into()),
+        confirmed_moment_id: item.moment_id,
+        confirmed_asset_id: item.media_asset_id,
+        updated_at: item.confirmed_at,
+    }
+}
+
+fn moment_progress(
+    job: Option<&BackgroundJob>,
+    timeline: Option<&MomentTimelineStatusRecord>,
+    message: Option<String>,
+) -> MomentAnalysisProgress {
+    let state = job
+        .map(|job| workflow_state_label(&job.state))
+        .unwrap_or_else(|| {
+            timeline
+                .map(|timeline| timeline.state.clone())
+                .unwrap_or_else(|| "idle".into())
+        });
+    let stage = job
+        .map(|job| job_stage_label(&job.stage))
+        .unwrap_or_else(|| "moment_analysis".into());
+    let resource_mode = job
+        .and_then(|job| job.resume_metadata.as_ref())
+        .and_then(|metadata| metadata.get("resource_mode"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|mode| matches!(*mode, "eco" | "balanced" | "fast"))
+        .unwrap_or("balanced")
+        .to_owned();
+    let timeline_ready = timeline.is_some_and(|timeline| timeline.state == "ready");
+    MomentAnalysisProgress {
+        active: state == "running" || state == "queued",
+        paused: state == "paused",
+        resource_mode,
+        completed: job.map(|job| job.items_completed).unwrap_or(0),
+        total: job.and_then(|job| job.items_total).unwrap_or(0),
+        error_count: job.map(|job| job.error_count).unwrap_or(0),
+        moment_count: timeline.map(|timeline| timeline.moment_count).unwrap_or(0),
+        ungrouped_asset_count: timeline.map(|timeline| timeline.ungrouped_count).unwrap_or(0),
+        last_error: job.and_then(|job| job.error_message.clone()),
+        message: message.or_else(|| {
+            if timeline_ready {
+                Some("Local structural timeline is ready. Human overrides remain separate and protected.".into())
+            } else if state == "idle" {
+                Some("No local Moment timeline has been analyzed yet.".into())
+            } else {
+                None
+            }
+        }),
+        state,
+        stage,
+        timeline_ready,
+    }
+}
+
+fn moment_summary_view(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    row: &persistence::MomentTimelineRow,
+    preview_cache_root: &Path,
+) -> PersistenceResult<MomentSummaryView> {
+    let (source, strength) = if row.human_label.is_some() {
+        ("human".into(), "strong".into())
+    } else if row.suggested_label.is_some() {
+        let source = if row.label_state.contains("project") {
+            "project_checklist"
+        } else {
+            "generic_visual_vocabulary"
+        };
+        (source.into(), "moderate".into())
+    } else {
+        ("none".into(), "unavailable".into())
+    };
+    let representative_asset = row
+        .human_representative_asset_id
+        .as_ref()
+        .map(|id| (id, "human"))
+        .or_else(|| {
+            row.ai_representative_asset_id
+                .as_ref()
+                .map(|id| (id, "ai_suggested"))
+        });
+    let representative = representative_asset
+        .map(|(raw_id, source)| {
+            let asset_id = MediaAssetId::try_from(raw_id.as_str())
+                .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+            let detail = load_media_asset_detail(repository, project_id, &asset_id, preview_cache_root)?;
+            let item = detail.ok_or_else(|| PersistenceError::InvalidData("moment representative does not belong to the selected project".into()))?.item;
+            Ok::<MomentRepresentativeView, PersistenceError>(MomentRepresentativeView {
+                asset_id: raw_id.clone(),
+                filename: item.filename,
+                thumbnail_preview_url: item.thumbnail_preview_url,
+                source: source.into(),
+                evidence: if source == "human" {
+                    vec!["Photographer-selected representative.".into()]
+                } else {
+                    vec!["Local structural representative using available centrality and technical presentation evidence; not a creative-quality claim.".into()]
+                },
+            })
+        })
+        .transpose()?;
+    let boundary_before =
+        row.boundary_category
+            .as_ref()
+            .map(|category| MomentBoundaryEvidenceView {
+                strength: boundary_strength(category).into(),
+                summary: row
+                    .boundary_explanation
+                    .clone()
+                    .unwrap_or_else(|| "Local structural boundary evidence is available.".into()),
+                signals: vec![
+                    "Only locally available capture, visual, and metadata evidence is considered."
+                        .into(),
+                ],
+            });
+    Ok(MomentSummaryView {
+        id: row.id.clone(),
+        ordinal: row.ordinal,
+        label: MomentLabelView {
+            display_label: row.display_label.clone(),
+            ai_suggested_label: row.suggested_label.clone(),
+            human_label: row.human_label.clone(),
+            source,
+            strength,
+            evidence: Vec::new(),
+        },
+        captured_from: row.started_at.clone(),
+        captured_to: row.ended_at.clone(),
+        capture_time_state: match (&row.started_at, &row.ended_at) {
+            (Some(_), Some(_)) => "observed".into(),
+            (Some(_), None) | (None, Some(_)) => "partially_observed".into(),
+            (None, None) => "unavailable".into(),
+        },
+        asset_count: row.asset_count,
+        similar_set_count: row.similar_set_count,
+        keep_count: row.keep_count,
+        reject_count: row.reject_count,
+        review_count: row.review_count,
+        unreviewed_count: row.unreviewed_count,
+        starred_count: row.starred_count,
+        technical_issue_count: row.technical_issue_count,
+        representative,
+        boundary_before,
+        has_human_structure_override: row.human_override_present,
+    })
+}
+
+fn boundary_strength(category: &str) -> &str {
+    match category {
+        "strong" => "strong",
+        "moderate" => "moderate",
+        "continuous" => "continuous",
+        _ => "unavailable",
+    }
+}
+
+fn magic_search_history_view(entry: PersistedMagicSearchHistoryEntry) -> MagicSearchHistoryEntry {
+    let chips = entry
+        .plan
+        .get("chips")
+        .and_then(serde_json::Value::as_array)
+        .map(|chips| {
+            chips
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    MagicSearchHistoryEntry {
+        id: entry.id,
+        query: entry.query_text,
+        created_at: entry.used_at,
+        parsed_filters: MagicSearchFilterView { chips },
+    }
+}
+
+#[derive(Debug)]
+struct ComputedSemanticCandidate {
+    candidate: SemanticInputCandidate,
+    status: AnalysisStatus,
+    embedding: Option<Vec<f32>>,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ScoredSemanticCandidate {
+    candidate: SemanticSearchCandidate,
+    score: f32,
+}
+
+/// Builds or refreshes a project-owned, local semantic index. The provider receives only
+/// CaptureOS-managed preview pixels; source originals are read only when a preview must first be
+/// prepared. Every embedding result is durable before the derived index is atomically replaced.
+pub fn index_semantic_embeddings(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    roots: SemanticStorageRoots<'_>,
+    provider_cache: &SiglipProviderCache,
+    resource_mode: AnalysisResourceMode,
+    should_pause: impl Fn() -> bool,
+    on_progress: impl FnMut(&SemanticIndexProgress),
+) -> PersistenceResult<SemanticIndexProgress> {
+    let (model_status, provider) = inspect_semantic_provider(repository, provider_cache)?;
+    let provider = provider.ok_or_else(|| {
+        PersistenceError::InvalidData(
+            model_status
+                .message
+                .clone()
+                .unwrap_or_else(|| "Semantic search model is unavailable".into()),
+        )
+    })?;
+    let mut on_progress = on_progress;
+    let mut execution = SemanticIndexExecution {
+        resource_mode,
+        provider: provider.as_ref(),
+        model_status,
+        should_pause: &should_pause,
+        on_progress: &mut on_progress,
+    };
+    index_semantic_embeddings_with_provider(repository, project_id, roots, &mut execution)
+}
+
+fn index_semantic_embeddings_with_provider(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    roots: SemanticStorageRoots<'_>,
+    execution: &mut SemanticIndexExecution<'_>,
+) -> PersistenceResult<SemanticIndexProgress> {
+    let identity = execution.provider.identity().clone();
+    let model = semantic_model_config(&identity);
+    // Version replacement preserves previous vectors and indexes as stale audit/cache records.
+    // A current model revision never silently mixes incomparable vector spaces.
+    repository.mark_other_semantic_embeddings_stale(project_id, &model)?;
+    repository.mark_other_semantic_index_versions_stale(project_id, &model)?;
+    let candidates = repository.semantic_embedding_candidates(project_id, &model)?;
+    let now = Utc::now();
+    let mut job = BackgroundJob {
+        id: JobId::new(),
+        state: WorkflowRunState::Running,
+        stage: JobStage::SemanticEmbedding,
+        items_completed: 0,
+        items_total: Some(candidates.len() as u64),
+        files_discovered: candidates.len() as u64,
+        files_processed: 0,
+        error_count: 0,
+        project_id: Some(project_id.clone()),
+        index_root_id: None,
+        error_message: None,
+        resume_metadata: Some(serde_json::json!({
+            "pipeline": "semantic-indexing",
+            "resource_mode": execution.resource_mode.as_str(),
+            "model_cache_key": identity.cache_key(),
+        })),
+        created_at: now,
+        updated_at: now,
+        finished_at: None,
+    };
+    repository.insert_background_job(&job)?;
+    let mut counts = semantic_counts(repository, project_id, &model, candidates.len() as u64)?;
+    let mut progress = semantic_progress(
+        Some(&job),
+        SemanticProgressDetails {
+            counts: counts.clone(),
+            model: execution.model_status.clone(),
+            index_ready: false,
+            index_embedding_count: 0,
+            resource_mode: execution.resource_mode,
+            current_asset_id: None,
+            message: Some(
+                "Preparing local still-photo embeddings from CaptureOS-managed previews.".into(),
+            ),
+        },
+    );
+    (execution.on_progress)(&progress);
+
+    let worker_count = analysis_worker_count(execution.resource_mode);
+    for batch in candidates.chunks(worker_count) {
+        if (execution.should_pause)() {
+            return pause_semantic_indexing(
+                repository,
+                &mut job,
+                execution,
+                SemanticPauseDetails {
+                    counts,
+                    current_asset_id: None,
+                    message: "Indexing paused. Completed local embeddings are durable; resume continues remaining photos."
+                        .into(),
+                },
+            );
+        }
+        job.stage = JobStage::SemanticEmbedding;
+        job.updated_at = Utc::now();
+        repository.update_background_job(&job)?;
+        progress = semantic_progress(
+            Some(&job),
+            SemanticProgressDetails {
+                counts: counts.clone(),
+                model: execution.model_status.clone(),
+                index_ready: false,
+                index_embedding_count: 0,
+                resource_mode: execution.resource_mode,
+                current_asset_id: batch.first().map(|candidate| candidate.asset_id.clone()),
+                message: Some(format!(
+                    "Embedding up to {} local preview{} at a time ({}).",
+                    worker_count,
+                    if worker_count == 1 { "" } else { "s" },
+                    execution.resource_mode.as_str(),
+                )),
+            },
+        );
+        (execution.on_progress)(&progress);
+
+        let resolved = batch
+            .iter()
+            .cloned()
+            .map(|candidate| {
+                let fallback = candidate.clone();
+                resolve_semantic_input(repository, roots.preview_cache_root, candidate)
+                    .unwrap_or_else(|error| {
+                        failed_semantic_input_candidate(fallback, error.to_string())
+                    })
+            })
+            .collect::<Vec<_>>();
+        for computed in
+            compute_semantic_batch(&resolved, roots.preview_cache_root, execution.provider)
+        {
+            let current_asset_id = Some(computed.candidate.asset_id.clone());
+            persist_semantic_embedding(repository, project_id, &model, computed)?;
+            job.files_processed += 1;
+            job.items_completed = job.files_processed;
+            // Only provider/internal failures contribute to the job error count. Unsupported,
+            // corrupt, and offline originals are truthful terminal states, not fake successes.
+            counts = semantic_counts(
+                repository,
+                project_id,
+                &model,
+                candidates.len() as u64 - job.files_processed,
+            )?;
+            job.error_count = counts.failed;
+            job.updated_at = Utc::now();
+            repository.update_background_job(&job)?;
+            progress = semantic_progress(
+                Some(&job),
+                SemanticProgressDetails {
+                    counts: counts.clone(),
+                    model: execution.model_status.clone(),
+                    index_ready: false,
+                    index_embedding_count: 0,
+                    resource_mode: execution.resource_mode,
+                    current_asset_id,
+                    message: None,
+                },
+            );
+            (execution.on_progress)(&progress);
+        }
+    }
+
+    if (execution.should_pause)() {
+        return pause_semantic_indexing(
+            repository,
+            &mut job,
+            execution,
+            SemanticPauseDetails {
+                counts: semantic_counts(repository, project_id, &model, 0)?,
+                current_asset_id: None,
+                message: "Embedding is complete; local index rebuild is paused before replacing the derived index."
+                    .into(),
+            },
+        );
+    }
+
+    job.stage = JobStage::SemanticIndex;
+    job.updated_at = Utc::now();
+    repository.update_background_job(&job)?;
+    let rebuilding_message = "Rebuilding the local, replaceable semantic index.".to_owned();
+    progress = semantic_progress(
+        Some(&job),
+        SemanticProgressDetails {
+            counts: semantic_counts(repository, project_id, &model, 0)?,
+            model: execution.model_status.clone(),
+            index_ready: false,
+            index_embedding_count: 0,
+            resource_mode: execution.resource_mode,
+            current_asset_id: None,
+            message: Some(rebuilding_message),
+        },
+    );
+    (execution.on_progress)(&progress);
+
+    let vectors = repository.semantic_embeddings_for_index(project_id, &model)?;
+    let build = match PersistentVectorIndex::build_and_store(
+        roots.index_root,
+        &project_id.to_string(),
+        &identity.cache_key(),
+        model.dimensions,
+        vectors
+            .into_iter()
+            .map(|vector| (vector.asset_id, vector.vector)),
+    ) {
+        Ok(build) => build,
+        Err(error) => {
+            let message = format!("Local semantic index rebuild failed: {error}");
+            job.state = WorkflowRunState::Failed;
+            job.error_message = Some(message.clone());
+            job.updated_at = Utc::now();
+            job.finished_at = Some(job.updated_at);
+            let failed_progress = semantic_progress(
+                Some(&job),
+                SemanticProgressDetails {
+                    counts: semantic_counts(repository, project_id, &model, 0)?,
+                    model: execution.model_status.clone(),
+                    index_ready: false,
+                    index_embedding_count: 0,
+                    resource_mode: execution.resource_mode,
+                    current_asset_id: None,
+                    message: Some(message),
+                },
+            );
+            job.resume_metadata = Some(serde_json::json!({
+                "pipeline": "semantic-indexing",
+                "resource_mode": execution.resource_mode.as_str(),
+                "summary": &failed_progress,
+            }));
+            repository.update_background_job(&job)?;
+            (execution.on_progress)(&failed_progress);
+            return Err(PersistenceError::InvalidData(error.to_string()));
+        }
+    };
+    let rebuilt_at = Utc::now();
+    repository.upsert_semantic_index_version(&SemanticIndexVersion {
+        id: SemanticIndexVersionId::new(),
+        project_id: project_id.clone(),
+        model: model.clone(),
+        index_format: SEMANTIC_INDEX_FORMAT.into(),
+        index_relative_path: build.relative_path,
+        index_checksum: build.checksum,
+        embedding_count: build.vector_count as u64,
+        status: "ready".into(),
+        stale: false,
+        created_at: rebuilt_at,
+        rebuilt_at,
+    })?;
+    let final_counts = semantic_counts(repository, project_id, &model, 0)?;
+    job.state = WorkflowRunState::Completed;
+    job.stage = JobStage::SemanticIndex;
+    job.items_completed = job.items_total.unwrap_or(0);
+    job.files_processed = job.items_completed;
+    job.error_count = final_counts.failed;
+    job.updated_at = Utc::now();
+    job.finished_at = Some(job.updated_at);
+    let final_progress = semantic_progress(
+        Some(&job),
+        SemanticProgressDetails {
+            counts: final_counts,
+            model: execution.model_status.clone(),
+            index_ready: true,
+            index_embedding_count: build.vector_count as u64,
+            resource_mode: execution.resource_mode,
+            current_asset_id: None,
+            message: Some(
+                "Local semantic index rebuilt. Search remains project-scoped and offline-capable from cached embeddings."
+                    .into(),
+            ),
+        },
+    );
+    job.resume_metadata = Some(serde_json::json!({
+        "pipeline": "semantic-indexing",
+        "resource_mode": execution.resource_mode.as_str(),
+        "summary": &final_progress,
+    }));
+    repository.update_background_job(&job)?;
+    (execution.on_progress)(&final_progress);
+    Ok(final_progress)
+}
+
+fn pause_semantic_indexing(
+    repository: &impl CatalogRepository,
+    job: &mut BackgroundJob,
+    execution: &mut SemanticIndexExecution<'_>,
+    details: SemanticPauseDetails,
+) -> PersistenceResult<SemanticIndexProgress> {
+    job.state = WorkflowRunState::Paused;
+    job.updated_at = Utc::now();
+    let progress = semantic_progress(
+        Some(job),
+        SemanticProgressDetails {
+            counts: details.counts,
+            model: execution.model_status.clone(),
+            index_ready: false,
+            index_embedding_count: 0,
+            resource_mode: execution.resource_mode,
+            current_asset_id: details.current_asset_id,
+            message: Some(details.message),
+        },
+    );
+    job.resume_metadata = Some(serde_json::json!({
+        "pipeline": "semantic-indexing",
+        "resource_mode": execution.resource_mode.as_str(),
+        "summary": &progress,
+    }));
+    repository.update_background_job(job)?;
+    (execution.on_progress)(&progress);
+    Ok(progress)
+}
+
+/// Resolves a preview for M6 without widening the source-media boundary. Existing managed
+/// previews remain usable while an original is offline; an available source is read only to make
+/// a new managed preview, never passed to a model or modified in place.
+fn resolve_semantic_input(
+    repository: &impl CatalogRepository,
+    cache_root: &Path,
+    candidate: SemanticInputCandidate,
+) -> PersistenceResult<SemanticInputCandidate> {
+    if candidate.preview_status == "ready"
+        && candidate
+            .preview_relative_path
+            .as_deref()
+            .and_then(|relative| resolve_analysis_preview_path(cache_root, relative))
+            .is_some()
+    {
+        return Ok(candidate);
+    }
+    if matches!(candidate.preview_status.as_str(), "corrupt" | "unsupported") {
+        return Ok(candidate);
+    }
+    let copies = repository.preparation_file_instance_candidates(&candidate.asset_id)?;
+    let mut terminal_failure: Option<(ArtifactStatus, String, SemanticInputCandidate)> = None;
+    for copy in copies {
+        if !copy.is_available {
+            continue;
+        }
+        let media_type = match media_type_from_label(&copy.media_type) {
+            Ok(media_type) => media_type,
+            Err(error) => {
+                return Ok(failed_semantic_input_candidate(
+                    candidate,
+                    error.to_string(),
+                ));
+            }
+        };
+        let Some(source) = source_path(copy.selected_root.as_deref(), &copy.relative_path) else {
+            continue;
+        };
+        let generated = prepare_analysis_preview(
+            &LocalVisualAdapters,
+            cache_root,
+            &copy.asset_id,
+            &copy.file_instance_id,
+            &source,
+            &media_type,
+            &copy.source_fingerprint,
+        )
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+        repository.upsert_preview_artifact(&PreviewArtifactRecord {
+            id: Uuid::new_v4().to_string(),
+            media_asset_id: copy.asset_id.clone(),
+            source_file_instance_id: copy.file_instance_id.clone(),
+            artifact_type: generated.artifact_type.clone(),
+            size_class: generated.size.as_str().into(),
+            cache_relative_path: generated.cache_relative_path.clone(),
+            provider: generated.provider.clone(),
+            generator_version: ANALYSIS_PREVIEW_GENERATOR_VERSION.into(),
+            source_fingerprint: generated.source_fingerprint.clone(),
+            created_at: Utc::now().to_rfc3339(),
+            status: generated.status.as_str().into(),
+            failure_reason: generated.failure_reason.clone(),
+        })?;
+        let resolved = resolved_semantic_candidate(&candidate, &copy, &generated);
+        if generated.status == ArtifactStatus::Ready
+            && resolved
+                .preview_relative_path
+                .as_deref()
+                .and_then(|relative| resolve_analysis_preview_path(cache_root, relative))
+                .is_some()
+        {
+            return Ok(resolved);
+        }
+        if generated.status != ArtifactStatus::Offline {
+            let message = generated.failure_reason.unwrap_or_else(|| {
+                "CaptureOS could not prepare a local semantic-search preview".into()
+            });
+            if terminal_failure.as_ref().is_none_or(|(status, _, _)| {
+                analysis_input_failure_rank(&generated.status) > analysis_input_failure_rank(status)
+            }) {
+                terminal_failure = Some((generated.status, message, resolved));
+            }
+        }
+    }
+    if let Some((status, message, candidate)) = terminal_failure {
+        return Ok(resolved_terminal_semantic_candidate(
+            candidate, status, message,
+        ));
+    }
+    Ok(resolved_terminal_semantic_candidate(
+        candidate,
+        ArtifactStatus::Offline,
+        "No sufficient cached semantic preview exists and no usable local FileInstance is currently available".into(),
+    ))
+}
+
+fn resolved_semantic_candidate(
+    base: &SemanticInputCandidate,
+    copy: &persistence::MediaPreparationCandidate,
+    generated: &media_visual::GeneratedPreview,
+) -> SemanticInputCandidate {
+    let mut resolved = base.clone();
+    resolved.file_instance_id = copy.file_instance_id.clone();
+    resolved.filename = copy.filename.clone();
+    resolved.media_type = copy.media_type.clone();
+    resolved.input_fingerprint = analysis_input_fingerprint(
+        &generated.source_fingerprint,
+        &generated.artifact_type,
+        ANALYSIS_PREVIEW_GENERATOR_VERSION,
+        generated.size.as_str(),
+    );
+    resolved.preview_relative_path =
+        (generated.status == ArtifactStatus::Ready).then(|| generated.cache_relative_path.clone());
+    resolved.preview_status = generated.status.as_str().into();
+    resolved.preview_failure_reason = generated.failure_reason.clone();
+    resolved.is_available = copy.is_available;
+    resolved
+}
+
+fn resolved_terminal_semantic_candidate(
+    mut candidate: SemanticInputCandidate,
+    status: ArtifactStatus,
+    message: String,
+) -> SemanticInputCandidate {
+    candidate.preview_relative_path = None;
+    candidate.preview_status = match status {
+        ArtifactStatus::Corrupt => "corrupt",
+        ArtifactStatus::Unsupported => "unsupported",
+        ArtifactStatus::Offline => "needs_original",
+        _ => "failed",
+    }
+    .into();
+    candidate.preview_failure_reason = Some(message);
+    candidate
+}
+
+fn failed_semantic_input_candidate(
+    candidate: SemanticInputCandidate,
+    message: String,
+) -> SemanticInputCandidate {
+    resolved_terminal_semantic_candidate(candidate, ArtifactStatus::Failed, message)
+}
+
+fn compute_semantic_batch<P: SemanticEmbeddingProvider + ?Sized>(
+    batch: &[SemanticInputCandidate],
+    cache_root: &Path,
+    provider: &P,
+) -> Vec<ComputedSemanticCandidate> {
+    let cache_root = cache_root.to_path_buf();
+    thread::scope(|scope| {
+        let workers = batch
+            .iter()
+            .cloned()
+            .map(|candidate| {
+                let fallback = candidate.clone();
+                let cache_root = cache_root.clone();
+                let worker = scope.spawn(move || {
+                    let fallback_after_panic = candidate.clone();
+                    std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        compute_semantic_candidate(candidate, &cache_root, provider)
+                    }))
+                    .unwrap_or_else(|_| {
+                        ComputedSemanticCandidate {
+                        candidate: fallback_after_panic,
+                        status: AnalysisStatus::Failed,
+                        embedding: None,
+                        error_message: Some(
+                            "A local semantic worker stopped unexpectedly; no embedding was stored."
+                                .into(),
+                        ),
+                    }
+                    })
+                });
+                (fallback, worker)
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|(fallback, worker)| {
+                worker.join().unwrap_or_else(|_| ComputedSemanticCandidate {
+                    candidate: fallback,
+                    status: AnalysisStatus::Failed,
+                    embedding: None,
+                    error_message: Some(
+                        "A local semantic worker could not be joined; no embedding was stored."
+                            .into(),
+                    ),
+                })
+            })
+            .collect()
+    })
+}
+
+fn compute_semantic_candidate<P: SemanticEmbeddingProvider + ?Sized>(
+    candidate: SemanticInputCandidate,
+    cache_root: &Path,
+    provider: &P,
+) -> ComputedSemanticCandidate {
+    if candidate.preview_status == "ready" {
+        let Some(path) = candidate
+            .preview_relative_path
+            .as_deref()
+            .and_then(|relative| resolve_analysis_preview_path(cache_root, relative))
+        else {
+            return ComputedSemanticCandidate {
+                candidate,
+                status: AnalysisStatus::NeedsOriginal,
+                embedding: None,
+                error_message: Some(
+                    "Cached semantic preview is no longer safely available.".into(),
+                ),
+            };
+        };
+        let image = match LocalPreviewDecoder.decode(&path) {
+            Ok(image) => image,
+            Err(error) => {
+                return ComputedSemanticCandidate {
+                    candidate,
+                    status: error.status(),
+                    embedding: None,
+                    error_message: Some(error.to_string()),
+                };
+            }
+        };
+        return match provider.embed_image(&image).and_then(normalize_embedding) {
+            Ok(embedding) if embedding.len() == provider.identity().dimensions => {
+                ComputedSemanticCandidate {
+                    candidate,
+                    status: AnalysisStatus::Ready,
+                    embedding: Some(embedding),
+                    error_message: None,
+                }
+            }
+            Ok(_) => ComputedSemanticCandidate {
+                candidate,
+                status: AnalysisStatus::Failed,
+                embedding: None,
+                error_message: Some(
+                    "Local semantic provider returned an unexpected embedding dimension.".into(),
+                ),
+            },
+            Err(error) => ComputedSemanticCandidate {
+                candidate,
+                status: AnalysisStatus::Failed,
+                embedding: None,
+                error_message: Some(error.to_string()),
+            },
+        };
+    }
+    let (status, message) = match candidate.preview_status.as_str() {
+        "corrupt" => (
+            AnalysisStatus::Corrupt,
+            candidate
+                .preview_failure_reason
+                .clone()
+                .unwrap_or_else(|| "The local semantic input is corrupt".into()),
+        ),
+        "unsupported" => (
+            AnalysisStatus::Unsupported,
+            candidate.preview_failure_reason.clone().unwrap_or_else(|| {
+                "The available local source is unsupported by the current preview provider".into()
+            }),
+        ),
+        "needs_original" => (
+            AnalysisStatus::NeedsOriginal,
+            candidate
+                .preview_failure_reason
+                .clone()
+                .unwrap_or_else(|| "No usable local FileInstance is currently available".into()),
+        ),
+        _ => (
+            AnalysisStatus::Failed,
+            candidate.preview_failure_reason.clone().unwrap_or_else(|| {
+                "The semantic input resolver did not produce a usable local preview".into()
+            }),
+        ),
+    };
+    ComputedSemanticCandidate {
+        candidate,
+        status,
+        embedding: None,
+        error_message: Some(message),
+    }
+}
+
+fn persist_semantic_embedding(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    model: &SemanticModelConfig,
+    computed: ComputedSemanticCandidate,
+) -> PersistenceResult<()> {
+    if computed.candidate.project_id != project_id.to_string() {
+        return Err(PersistenceError::InvalidData(
+            "semantic embedding candidate did not belong to the selected project".into(),
+        ));
+    }
+    let media_asset_id = MediaAssetId::try_from(computed.candidate.asset_id.as_str())
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    repository.upsert_semantic_embedding(&SemanticEmbeddingRecord {
+        media_asset_id,
+        project_id: project_id.clone(),
+        input_fingerprint: computed.candidate.input_fingerprint,
+        model: model.clone(),
+        embedding: computed.embedding,
+        generated_at: Utc::now(),
+        status: computed.status,
+        error_message: computed.error_message,
+    })
+}
+
+/// Runs a text search entirely through the selected local provider and a project-owned derived
+/// index. When the provider/index is unavailable, only explicit deterministic filters run; text
+/// is never substituted with filename, tag, or cloud lookup behavior.
+pub fn search_magic(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    request: &MagicSearchRequest,
+    provider_cache: &SiglipProviderCache,
+    index_root: &Path,
+    preview_cache_root: &Path,
+) -> PersistenceResult<MagicSearchResponse> {
+    if let Some(moment_id) = request.moment_id.as_deref() {
+        if !repository.moment_belongs_to_project(project_id, moment_id)? {
+            return Err(PersistenceError::InvalidData(
+                "moment does not belong to the selected project".into(),
+            ));
+        }
+    }
+    let plan = plan_query(&request.query)
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    repository.record_magic_search_history(
+        project_id,
+        &plan.normalized_query,
+        &plan.normalized_query.to_lowercase(),
+        &serde_json::json!({
+            "chips": &plan.chips,
+            "identitySearchBlocked": plan.identity_search_blocked,
+        }),
+    )?;
+    if plan.identity_search_blocked {
+        return Ok(MagicSearchResponse {
+            query: plan.normalized_query,
+            results: Vec::new(),
+            semantic_available: false,
+            semantic_applied: false,
+            semantic_unavailable_reason: Some(
+                "Identity recognition and person search are not available in Magic Search.".into(),
+            ),
+            parsed_filters: MagicSearchFilterView { chips: plan.chips },
+            has_more: false,
+            total_results: 0,
+            identity_search_blocked: true,
+            message: Some(
+                "Magic Search does not perform person identity recognition or matching.".into(),
+            ),
+        });
+    }
+    let (model_status, provider) = inspect_semantic_provider(repository, provider_cache)?;
+    let filters_only = plan.semantic_query.is_none();
+    let Some(provider) = provider else {
+        return deterministic_magic_search(
+            repository,
+            project_id,
+            request,
+            &plan,
+            preview_cache_root,
+            false,
+            model_status.message,
+        );
+    };
+    let model = semantic_model_config(provider.identity());
+    let index = match load_active_semantic_index(
+        repository,
+        project_id,
+        &model,
+        &provider.identity().cache_key(),
+        index_root,
+    ) {
+        Ok(index) => index,
+        Err(error) => {
+            return deterministic_magic_search(
+                repository,
+                project_id,
+                request,
+                &plan,
+                preview_cache_root,
+                false,
+                Some(format!(
+                    "Semantic index unavailable and needs a local rebuild: {error}"
+                )),
+            );
+        }
+    };
+    if filters_only {
+        return deterministic_magic_search(
+            repository,
+            project_id,
+            request,
+            &plan,
+            preview_cache_root,
+            index.is_some(),
+            (!index.is_some()).then_some(
+                "Semantic index is not ready. Deterministic local filters remain available.".into(),
+            ),
+        );
+    }
+    let Some((index, _)) = index else {
+        return deterministic_magic_search(
+            repository,
+            project_id,
+            request,
+            &plan,
+            preview_cache_root,
+            false,
+            Some("Semantic index is not ready. Index local photos to enable local image/text matching.".into()),
+        );
+    };
+    let query = match provider
+        .embed_text(
+            plan.semantic_query
+                .as_deref()
+                .expect("checked semantic query"),
+        )
+        .and_then(normalize_embedding)
+    {
+        Ok(query) => query,
+        Err(error) => {
+            return deterministic_magic_search(
+                repository,
+                project_id,
+                request,
+                &plan,
+                preview_cache_root,
+                false,
+                Some(format!("Local text embedding unavailable: {error}")),
+            );
+        }
+    };
+    if query.len() != model.dimensions {
+        return deterministic_magic_search(
+            repository,
+            project_id,
+            request,
+            &plan,
+            preview_cache_root,
+            false,
+            Some("Local text provider returned an unexpected embedding dimension.".into()),
+        );
+    }
+    let candidates = semantic_index_candidates(
+        repository,
+        project_id,
+        &model,
+        &index,
+        &query,
+        request.moment_id.as_deref(),
+    )?;
+    let scored =
+        score_semantic_candidates(candidates, &plan, &query, &request.sort, request.descending)?;
+    semantic_response(
+        repository,
+        project_id,
+        scored,
+        SemanticResponseContext {
+            request,
+            plan: &plan,
+            preview_cache_root,
+            semantic_available: true,
+            semantic_applied: true,
+            semantic_unavailable_reason: None,
+            explanation:
+                "Results are ranked by local image/text embedding similarity; this is not an object, identity, or localized-detection claim.",
+        },
+    )
+}
+
+/// Finds related still photos from the same project using the already persisted local embedding.
+/// It never updates Similar Sets, decisions, ratings, notes, representatives, or review state.
+pub fn find_similar(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    request: FindSimilarRequest<'_>,
+    roots: SemanticStorageRoots<'_>,
+    provider_cache: &SiglipProviderCache,
+) -> PersistenceResult<MagicSearchResponse> {
+    ensure_asset_project(repository, project_id, request.asset_id)?;
+    let (model_status, provider) = inspect_semantic_provider(repository, provider_cache)?;
+    let provider =
+        provider.ok_or_else(|| {
+            PersistenceError::InvalidData(model_status.message.unwrap_or_else(|| {
+                "Find Similar requires an available local semantic model.".into()
+            }))
+        })?;
+    find_similar_with_provider(
+        repository,
+        project_id,
+        request,
+        FindSimilarExecution {
+            provider: provider.as_ref(),
+            index_root: roots.index_root,
+            preview_cache_root: roots.preview_cache_root,
+        },
+    )
+}
+
+fn find_similar_with_provider(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    request: FindSimilarRequest<'_>,
+    execution: FindSimilarExecution<'_>,
+) -> PersistenceResult<MagicSearchResponse> {
+    let model = semantic_model_config(execution.provider.identity());
+    let index = load_active_semantic_index(
+        repository,
+        project_id,
+        &model,
+        &execution.provider.identity().cache_key(),
+        execution.index_root,
+    )?
+    .ok_or_else(|| {
+        PersistenceError::InvalidData(
+            "Find Similar requires a ready local semantic index for this project.".into(),
+        )
+    })?
+    .0;
+    let source = repository.semantic_search_candidates_for_assets(
+        project_id,
+        Some(&model),
+        &[request.asset_id.to_string()],
+    )?;
+    let source_vector = source
+        .into_iter()
+        .next()
+        .and_then(|candidate| candidate.vector)
+        .ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "This photo has no current local semantic embedding. Index local photos first."
+                    .into(),
+            )
+        })?;
+    let candidates =
+        semantic_index_candidates(repository, project_id, &model, &index, &source_vector, None)?
+            .into_iter()
+            .filter(|candidate| candidate.asset_id != request.asset_id.to_string())
+            .collect();
+    let plan = magic_search::QueryPlan {
+        normalized_query: format!("Find Similar: {}", request.asset_id),
+        semantic_query: None,
+        filters: magic_search::StructuredFilters::default(),
+        chips: vec!["Find Similar".into()],
+        identity_search_blocked: false,
+    };
+    let request = MagicSearchRequest {
+        query: plan.normalized_query.clone(),
+        sort: "relevance".into(),
+        descending: true,
+        limit: request.limit,
+        offset: request.offset,
+        moment_id: None,
+    };
+    let scored = score_semantic_candidates(candidates, &plan, &source_vector, "relevance", true)?;
+    semantic_response(
+        repository,
+        project_id,
+        scored,
+        SemanticResponseContext {
+            request: &request,
+            plan: &plan,
+            preview_cache_root: execution.preview_cache_root,
+            semantic_available: true,
+            semantic_applied: true,
+            semantic_unavailable_reason: None,
+            explanation:
+                "Results are related local visual embeddings. Find Similar does not create or alter Similar Sets.",
+        },
+    )
+}
+
+fn deterministic_magic_search(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    request: &MagicSearchRequest,
+    plan: &magic_search::QueryPlan,
+    preview_cache_root: &Path,
+    semantic_available: bool,
+    unavailable_reason: Option<String>,
+) -> PersistenceResult<MagicSearchResponse> {
+    let limit = request.limit.clamp(1, MAGIC_SEARCH_PAGE_LIMIT);
+    let semantic_requested = plan.semantic_query.is_some();
+    let candidates = if semantic_requested && !has_structured_filters(&plan.filters) {
+        // A natural-language-only query cannot honestly fall back to “all photos” when local
+        // image/text matching is unavailable. Return no semantic result rather than fabricate
+        // relevance from filename or catalog order.
+        Vec::new()
+    } else {
+        repository.semantic_metadata_candidates(
+            project_id,
+            &SemanticMetadataQuery {
+                face_count: plan.filters.face_count,
+                rating_exact: plan.filters.rating_exact,
+                rating_minimum: plan.filters.rating_minimum,
+                decision: plan.filters.decision.clone(),
+                require_sharp: plan.filters.require_sharp,
+                require_blurry: plan.filters.require_blurry,
+                require_technical_issue: plan.filters.require_technical_issue,
+                camera_model: plan.filters.camera_model.clone(),
+                moment_id: request.moment_id.clone(),
+                sort: metadata_sort(&request.sort),
+                descending: request.descending,
+                limit: limit.saturating_add(1),
+                offset: request.offset,
+            },
+        )?
+    };
+    let has_more = candidates.len() > limit as usize;
+    let visible = candidates
+        .into_iter()
+        .take(limit as usize)
+        .collect::<Vec<_>>();
+    let results = visible
+        .iter()
+        .filter_map(|candidate| {
+            magic_result(
+                repository,
+                candidate,
+                None,
+                MagicResultContext {
+                    project_id,
+                    preview_cache_root,
+                    plan,
+                    semantic_applied: false,
+                    explanation: "Matched explicit local metadata or technical evidence.",
+                },
+            )
+            .transpose()
+        })
+        .collect::<PersistenceResult<Vec<_>>>()?;
+    Ok(MagicSearchResponse {
+        query: plan.normalized_query.clone(),
+        total_results: results.len() as u64,
+        results,
+        semantic_available,
+        semantic_applied: false,
+        semantic_unavailable_reason: unavailable_reason,
+        parsed_filters: MagicSearchFilterView {
+            chips: plan.chips.clone(),
+        },
+        has_more,
+        identity_search_blocked: false,
+        message: semantic_requested.then_some(
+            "Text semantics were not applied because the local provider or project index is unavailable; only explicit local filters can return results.".into(),
+        ),
+    })
+}
+
+fn has_structured_filters(filters: &magic_search::StructuredFilters) -> bool {
+    filters.face_count.is_some()
+        || filters.rating_exact.is_some()
+        || filters.rating_minimum.is_some()
+        || filters.decision.is_some()
+        || filters.require_sharp
+        || filters.require_blurry
+        || filters.require_technical_issue
+        || filters.camera_model.is_some()
+}
+
+fn metadata_sort(sort: &str) -> SemanticMetadataSort {
+    match sort {
+        "technicalQuality" => SemanticMetadataSort::TechnicalQuality,
+        "rating" => SemanticMetadataSort::Rating,
+        _ => SemanticMetadataSort::CaptureTime,
+    }
+}
+
+fn semantic_index_candidates(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    model: &SemanticModelConfig,
+    index: &PersistentVectorIndex,
+    query: &[f32],
+    moment_id: Option<&str>,
+) -> PersistenceResult<Vec<SemanticSearchCandidate>> {
+    let mut asset_ids = match index
+        .candidates(query)
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?
+    {
+        IndexCandidates::AllStoredVectors => repository
+            .semantic_embeddings_for_index(project_id, model)?
+            .into_iter()
+            .map(|vector| vector.asset_id)
+            .collect::<Vec<_>>(),
+        IndexCandidates::AssetIds(asset_ids) => asset_ids,
+    };
+    if let Some(moment_id) = moment_id {
+        let allowed = repository
+            .filter_active_moment_assets(project_id, moment_id, &asset_ids)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        asset_ids.retain(|asset_id| allowed.contains(asset_id));
+    }
+    repository.semantic_search_candidates_for_assets(project_id, Some(model), &asset_ids)
+}
+
+fn score_semantic_candidates(
+    candidates: Vec<SemanticSearchCandidate>,
+    plan: &magic_search::QueryPlan,
+    query: &[f32],
+    sort: &str,
+    descending: bool,
+) -> PersistenceResult<Vec<ScoredSemanticCandidate>> {
+    let filtered = candidates
+        .into_iter()
+        .filter(|candidate| semantic_candidate_matches_filters(candidate, &plan.filters))
+        .collect::<Vec<_>>();
+    let ranked = rank_normalized_vectors(
+        query,
+        filtered.iter().filter_map(|candidate| {
+            candidate
+                .vector
+                .clone()
+                .map(|vector| (candidate.asset_id.clone(), vector))
+        }),
+        filtered.len(),
+    )
+    .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    let scores = ranked
+        .into_iter()
+        .map(|score| (score.asset_id, score.score))
+        .collect::<HashMap<_, _>>();
+    let mut scored = filtered
+        .into_iter()
+        .filter_map(|candidate| {
+            scores
+                .get(&candidate.asset_id)
+                .copied()
+                .map(|score| ScoredSemanticCandidate { candidate, score })
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        let order = match sort {
+            "captureTime" => left.candidate.captured_at.cmp(&right.candidate.captured_at),
+            "technicalQuality" => left
+                .candidate
+                .technical_quality_score
+                .unwrap_or(f64::NEG_INFINITY)
+                .total_cmp(
+                    &right
+                        .candidate
+                        .technical_quality_score
+                        .unwrap_or(f64::NEG_INFINITY),
+                ),
+            "rating" => left.candidate.rating.cmp(&right.candidate.rating),
+            _ => left.score.total_cmp(&right.score),
+        };
+        let order = if descending { order.reverse() } else { order };
+        order.then_with(|| left.candidate.asset_id.cmp(&right.candidate.asset_id))
+    });
+    Ok(scored)
+}
+
+fn semantic_candidate_matches_filters(
+    candidate: &SemanticSearchCandidate,
+    filters: &magic_search::StructuredFilters,
+) -> bool {
+    filters
+        .face_count
+        .is_none_or(|value| candidate.face_count == Some(value))
+        && filters
+            .rating_exact
+            .is_none_or(|value| candidate.rating == value)
+        && filters
+            .rating_minimum
+            .is_none_or(|value| candidate.rating >= value)
+        && filters
+            .decision
+            .as_deref()
+            .is_none_or(|value| candidate.decision.as_deref() == Some(value))
+        && (!filters.require_sharp
+            || matches!(
+                candidate.sharpness_band.as_deref(),
+                Some("excellent" | "good")
+            ))
+        && (!filters.require_blurry
+            || matches!(candidate.blur_level.as_deref(), Some("moderate" | "high")))
+        && (!filters.require_technical_issue
+            || candidate.technical_quality_band.as_deref() == Some("technical_issue"))
+        && filters.camera_model.as_deref().is_none_or(|camera| {
+            candidate
+                .camera_model
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(camera))
+        })
+}
+
+fn semantic_response(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    scored: Vec<ScoredSemanticCandidate>,
+    context: SemanticResponseContext<'_>,
+) -> PersistenceResult<MagicSearchResponse> {
+    let limit = context.request.limit.clamp(1, MAGIC_SEARCH_PAGE_LIMIT) as usize;
+    let start = context.request.offset as usize;
+    let total_results = scored.len() as u64;
+    let has_more = start.saturating_add(limit) < scored.len();
+    let results = scored
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .filter_map(|scored| {
+            magic_result(
+                repository,
+                &scored.candidate,
+                Some(scored.score),
+                MagicResultContext {
+                    project_id,
+                    preview_cache_root: context.preview_cache_root,
+                    plan: context.plan,
+                    semantic_applied: context.semantic_applied,
+                    explanation: context.explanation,
+                },
+            )
+            .transpose()
+        })
+        .collect::<PersistenceResult<Vec<_>>>()?;
+    Ok(MagicSearchResponse {
+        query: context.plan.normalized_query.clone(),
+        results,
+        semantic_available: context.semantic_available,
+        semantic_applied: context.semantic_applied,
+        semantic_unavailable_reason: context.semantic_unavailable_reason,
+        parsed_filters: MagicSearchFilterView {
+            chips: context.plan.chips.clone(),
+        },
+        has_more,
+        total_results,
+        identity_search_blocked: context.plan.identity_search_blocked,
+        message: None,
+    })
+}
+
+fn magic_result(
+    repository: &impl CatalogRepository,
+    candidate: &SemanticSearchCandidate,
+    semantic_score: Option<f32>,
+    context: MagicResultContext<'_>,
+) -> PersistenceResult<Option<MagicSearchResult>> {
+    let asset_id = MediaAssetId::try_from(candidate.asset_id.as_str())
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    let Some(detail) = load_media_asset_detail(
+        repository,
+        context.project_id,
+        &asset_id,
+        context.preview_cache_root,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut matched_evidence = matched_filter_evidence(candidate, &context.plan.filters);
+    if context.semantic_applied {
+        matched_evidence.insert(
+            0,
+            if context.plan.chips.as_slice() == ["Find Similar"] {
+                "Local visual embedding similarity"
+            } else {
+                "Local image/text embedding similarity"
+            }
+            .into(),
+        );
+    }
+    Ok(Some(MagicSearchResult {
+        item: detail.item,
+        // A deliberately non-calibrated provenance label. `semantic_score` remains a local
+        // ranking signal and the UI must not turn it into an object/identity/quality claim.
+        score_label: semantic_score.map(|_| "Local".into()),
+        semantic_score,
+        explanation: context.explanation.into(),
+        matched_evidence,
+    }))
+}
+
+fn matched_filter_evidence(
+    candidate: &SemanticSearchCandidate,
+    filters: &magic_search::StructuredFilters,
+) -> Vec<String> {
+    let mut evidence = Vec::new();
+    if filters.face_count.is_some() {
+        if let Some(count) = candidate.face_count {
+            evidence.push(format!("Anonymous face count: {count}"));
+        }
+    }
+    if filters.rating_exact.is_some() || filters.rating_minimum.is_some() {
+        evidence.push(format!("Rating: {}★", candidate.rating));
+    }
+    if filters.decision.is_some() {
+        if let Some(decision) = &candidate.decision {
+            evidence.push(format!("Decision: {decision}"));
+        }
+    }
+    if filters.require_sharp {
+        if let Some(sharpness) = &candidate.sharpness_band {
+            evidence.push(format!("Sharpness: {sharpness}"));
+        }
+    }
+    if filters.require_blurry {
+        if let Some(blur) = &candidate.blur_level {
+            evidence.push(format!("Blur evidence: {blur}"));
+        }
+    }
+    if filters.require_technical_issue {
+        evidence.push("Technical quality: issue".into());
+    }
+    if filters.camera_model.is_some() {
+        if let Some(camera) = &candidate.camera_model {
+            evidence.push(format!("Camera: {camera}"));
+        }
+    }
+    evidence
 }
 
 pub fn create_local_project(
@@ -529,6 +4167,108 @@ pub fn retry_failed_visual_media(
         &LocalVisualAdapters,
         on_progress,
     )
+}
+
+const METADATA_REFRESH_ASSET_BATCH_SIZE: u32 = 64;
+
+/// Re-reads locally available source metadata for an already indexed project without creating
+/// previews, loading a semantic model, or changing any analysis or human decision. It is an
+/// explicit worker operation because opening a project must remain nonblocking.
+pub fn refresh_capture_metadata(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    mut on_progress: impl FnMut(&MetadataRefreshProgress),
+) -> PersistenceResult<MetadataRefreshProgress> {
+    let started_at = Utc::now().to_rfc3339();
+    let total = repository.capture_time_refresh_asset_count(project_id)?;
+    let mut progress = MetadataRefreshProgress {
+        state: "running".into(),
+        items_completed: 0,
+        items_total: total,
+        error_count: 0,
+        resolved_capture_time_count: 0,
+        high_confidence_capture_time_count: 0,
+        copy_conflict_count: 0,
+        current_asset_id: None,
+        started_at: started_at.clone(),
+        finished_at: None,
+        message: Some(
+            "Refreshing local capture-time metadata only. Existing previews, semantic embeddings, Similar Sets, and human decisions are unchanged.".into(),
+        ),
+    };
+    on_progress(&progress);
+
+    let mut after_asset_id = None::<String>;
+    loop {
+        let candidates = repository.capture_time_refresh_candidates(
+            project_id,
+            after_asset_id.as_deref(),
+            METADATA_REFRESH_ASSET_BATCH_SIZE,
+        )?;
+        if candidates.is_empty() {
+            break;
+        }
+        let mut candidate_groups = Vec::<Vec<persistence::MediaPreparationCandidate>>::new();
+        for candidate in candidates {
+            if candidate_groups
+                .last()
+                .and_then(|group| group.first())
+                .is_some_and(|first| first.asset_id == candidate.asset_id)
+            {
+                candidate_groups
+                    .last_mut()
+                    .expect("the last metadata refresh candidate group exists")
+                    .push(candidate);
+            } else {
+                candidate_groups.push(vec![candidate]);
+            }
+        }
+        for group in candidate_groups {
+            let Some(first) = group.first() else {
+                continue;
+            };
+            let asset_id = first.asset_id.clone();
+            progress.current_asset_id = Some(asset_id.clone());
+            let result = media_type_from_label(&first.media_type).and_then(|media_type| {
+                let inspections = inspect_metadata_candidates(group, &media_type);
+                resolve_asset_metadata(inspections)
+            });
+            match result {
+                Ok(resolved) => {
+                    for observation in &resolved.observations {
+                        repository.upsert_capture_time_observation(observation)?;
+                    }
+                    let record = metadata_record(&resolved.selected.candidate, resolved.metadata);
+                    let has_capture_time = record.captured_at_local.is_some();
+                    let high_confidence = record.capture_time_confidence.as_deref() == Some("high");
+                    repository.upsert_media_metadata(&record)?;
+                    progress.resolved_capture_time_count += u64::from(has_capture_time);
+                    progress.high_confidence_capture_time_count += u64::from(high_confidence);
+                    progress.copy_conflict_count += u64::from(resolved.copy_conflict);
+                }
+                Err(error) => {
+                    // One unreadable/unsupported source must not prevent a project's other
+                    // files from gaining their independently observed chronology.
+                    progress.error_count += 1;
+                    progress.message = Some(format!(
+                        "Capture-time metadata refresh continued after one asset could not be resolved: {error}"
+                    ));
+                }
+            }
+            progress.items_completed += 1;
+            after_asset_id = Some(asset_id);
+            on_progress(&progress);
+        }
+    }
+    progress.state = "completed".into();
+    progress.current_asset_id = None;
+    progress.finished_at = Some(Utc::now().to_rfc3339());
+    progress.message = Some(
+        "Capture-time metadata refresh completed. Rebuild Moments to use the refreshed chronology; no source media, previews, semantic embeddings, Similar Sets, or human decisions were changed."
+            .into(),
+    );
+    on_progress(&progress);
+    Ok(progress)
 }
 
 /// Runs the first local intelligence baseline over a resolved CaptureOS-managed analysis image.
@@ -2091,8 +5831,14 @@ fn prepare_visual_candidates(
         for (index, initial_candidate) in candidates.into_iter().enumerate() {
             let asset_started = Instant::now();
             let media_type = media_type_from_label(&initial_candidate.media_type)?;
-            let (candidate, source, metadata) =
-                select_preparation_source(repository, initial_candidate, &media_type)?;
+            let resolved = resolve_asset_metadata(select_preparation_source(
+                repository,
+                initial_candidate,
+                &media_type,
+            )?)?;
+            let candidate = resolved.selected.candidate.clone();
+            let source = resolved.selected.source.clone();
+            let metadata = resolved.metadata.clone();
             counts.current_asset_id = Some(candidate.asset_id.clone());
             counts.current_file_instance_id = Some(candidate.file_instance_id.clone());
             counts.current_provider = Some("local-metadata".into());
@@ -2104,6 +5850,9 @@ fn prepare_visual_candidates(
                 index + 1,
                 job.items_total.unwrap_or(0)
             );
+            for observation in &resolved.observations {
+                repository.upsert_capture_time_observation(observation)?;
+            }
             repository.upsert_media_metadata(&metadata_record(&candidate, metadata.clone()))?;
 
             job.stage = JobStage::Thumbnail;
@@ -2297,43 +6046,249 @@ fn source_path(selected_root: Option<&str>, relative_path: &str) -> Option<PathB
         .filter(|path| path.starts_with(&root))
 }
 
+#[derive(Debug, Clone)]
+struct MetadataSourceInspection {
+    candidate: persistence::MediaPreparationCandidate,
+    source: Option<PathBuf>,
+    metadata: media_visual::ExtractedMetadata,
+}
+
+fn inspect_metadata_candidates(
+    candidates: Vec<persistence::MediaPreparationCandidate>,
+    media_type: &MediaType,
+) -> Vec<MetadataSourceInspection> {
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            let source = source_path(candidate.selected_root.as_deref(), &candidate.relative_path);
+            let metadata = source
+                .as_deref()
+                .map(|path| extract_metadata(path, media_type))
+                .unwrap_or_else(|| media_visual::ExtractedMetadata {
+                    status: ArtifactStatus::Offline,
+                    failure_reason: Some(
+                        "The file instance has no safely resolvable index root or is offline"
+                            .into(),
+                    ),
+                    ..Default::default()
+                });
+            MetadataSourceInspection {
+                candidate,
+                source,
+                metadata,
+            }
+        })
+        .collect()
+}
+
 fn select_preparation_source(
     repository: &impl CatalogRepository,
     initial: persistence::MediaPreparationCandidate,
     media_type: &MediaType,
-) -> PersistenceResult<(
-    persistence::MediaPreparationCandidate,
-    Option<PathBuf>,
-    media_visual::ExtractedMetadata,
-)> {
+) -> PersistenceResult<Vec<MetadataSourceInspection>> {
     let copies = repository.preparation_file_instance_candidates(&initial.asset_id)?;
     let candidates = if copies.is_empty() {
         vec![initial]
     } else {
         copies
     };
-    let mut last = None;
-    for candidate in candidates {
-        let source = source_path(candidate.selected_root.as_deref(), &candidate.relative_path);
-        let metadata = source
-            .as_deref()
-            .map(|path| extract_metadata(path, media_type))
-            .unwrap_or_else(|| media_visual::ExtractedMetadata {
-                status: ArtifactStatus::Offline,
-                failure_reason: Some(
-                    "The file instance has no safely resolvable index root or is offline".into(),
-                ),
-                ..Default::default()
-            });
-        if matches!(
-            metadata.status,
-            ArtifactStatus::Ready | ArtifactStatus::Unsupported
-        ) {
-            return Ok((candidate, source, metadata));
-        }
-        last = Some((candidate, source, metadata));
+    let inspections = inspect_metadata_candidates(candidates, media_type);
+    (!inspections.is_empty())
+        .then_some(inspections)
+        .ok_or_else(|| PersistenceError::InvalidData("media asset has no file instances".into()))
+}
+
+fn preferred_metadata_source(
+    inspections: &[MetadataSourceInspection],
+) -> PersistenceResult<&MetadataSourceInspection> {
+    inspections
+        .iter()
+        .find(|inspection| {
+            matches!(
+                inspection.metadata.status,
+                ArtifactStatus::Ready | ArtifactStatus::Unsupported
+            )
+        })
+        .or_else(|| inspections.last())
+        .ok_or_else(|| PersistenceError::InvalidData("media asset has no metadata sources".into()))
+}
+
+#[derive(Debug, Clone)]
+struct CaptureTimeObservationCandidate {
+    source_file_instance_id: String,
+    candidate: CaptureTimeCandidate,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedAssetMetadata {
+    /// The physical copy selected for normal visual metadata and preview work. Capture-time
+    /// evidence can intentionally come from another equivalent copy; its file-instance ID is
+    /// retained only in the local developer diagnostic below.
+    selected: MetadataSourceInspection,
+    metadata: media_visual::ExtractedMetadata,
+    observations: Vec<CaptureTimeObservationRecord>,
+    copy_conflict: bool,
+}
+
+fn capture_time_candidate(inspection: &MetadataSourceInspection) -> Option<CaptureTimeCandidate> {
+    Some(CaptureTimeCandidate {
+        raw: inspection.metadata.captured_at_raw.clone()?,
+        local: inspection.metadata.captured_at_local.clone()?,
+        timezone: inspection.metadata.capture_timezone.clone()?,
+        source: inspection.metadata.capture_time_source.clone()?,
+        confidence: inspection.metadata.capture_time_confidence.clone()?,
+    })
+}
+
+fn capture_time_observation_record(
+    inspection: &MetadataSourceInspection,
+    extracted_at: &str,
+) -> CaptureTimeObservationRecord {
+    CaptureTimeObservationRecord {
+        media_asset_id: inspection.candidate.asset_id.clone(),
+        source_file_instance_id: inspection.candidate.file_instance_id.clone(),
+        source_fingerprint: inspection.candidate.source_fingerprint.clone(),
+        extractor: "local-platform-metadata".into(),
+        extractor_version: METADATA_EXTRACTOR_VERSION.into(),
+        status: inspection.metadata.status.as_str().into(),
+        failure_reason: inspection.metadata.failure_reason.clone(),
+        extracted_at: extracted_at.into(),
+        captured_at_raw: inspection.metadata.captured_at_raw.clone(),
+        captured_at_local: inspection.metadata.captured_at_local.clone(),
+        capture_timezone: inspection.metadata.capture_timezone.clone(),
+        capture_time_source: inspection.metadata.capture_time_source.clone(),
+        capture_time_confidence: inspection.metadata.capture_time_confidence.clone(),
     }
-    last.ok_or_else(|| PersistenceError::InvalidData("media asset has no file instances".into()))
+}
+
+/// Resolves one logical asset from the local observations of all currently available physical
+/// copies. The selection is provenance first, then consensus, then a stable local ID tie-breaker;
+/// neither a filesystem timestamp nor a filename can win over embedded camera evidence.
+fn resolve_asset_metadata(
+    inspections: Vec<MetadataSourceInspection>,
+) -> PersistenceResult<ResolvedAssetMetadata> {
+    let selected = preferred_metadata_source(&inspections)?.clone();
+    let extracted_at = Utc::now().to_rfc3339();
+    let observations = inspections
+        .iter()
+        .map(|inspection| capture_time_observation_record(inspection, &extracted_at))
+        .collect::<Vec<_>>();
+    let candidates = inspections
+        .iter()
+        .filter_map(|inspection| {
+            capture_time_candidate(inspection).map(|candidate| CaptureTimeObservationCandidate {
+                source_file_instance_id: inspection.candidate.file_instance_id.clone(),
+                candidate,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let highest_priority = candidates
+        .iter()
+        .map(|candidate| capture_time_priority(Some(&candidate.candidate.source)))
+        .max();
+    let mut selected_capture_time = None;
+    let mut selected_capture_time_file_instance_id = None;
+    if let Some(highest_priority) = highest_priority {
+        let mut groups =
+            BTreeMap::<(String, String, String), Vec<&CaptureTimeObservationCandidate>>::new();
+        for candidate in candidates.iter().filter(|candidate| {
+            capture_time_priority(Some(&candidate.candidate.source)) == highest_priority
+        }) {
+            groups
+                .entry((
+                    candidate.candidate.local.clone(),
+                    candidate.candidate.timezone.clone(),
+                    candidate.candidate.source.clone(),
+                ))
+                .or_default()
+                .push(candidate);
+        }
+        // `BTreeMap` provides the stable lexical fallback; reverse count chooses the local
+        // consensus before that fallback. A copied file's observation order never changes this.
+        let mut groups = groups.into_iter().collect::<Vec<_>>();
+        groups.sort_by(|(left_key, left_values), (right_key, right_values)| {
+            right_values
+                .len()
+                .cmp(&left_values.len())
+                .then_with(|| left_key.cmp(right_key))
+        });
+        if let Some((_, mut values)) = groups.into_iter().next() {
+            values.sort_by(|left, right| {
+                left.source_file_instance_id
+                    .cmp(&right.source_file_instance_id)
+            });
+            if let Some(winner) = values.first() {
+                selected_capture_time = Some(winner.candidate.clone());
+                selected_capture_time_file_instance_id =
+                    Some(winner.source_file_instance_id.clone());
+            }
+        }
+    }
+
+    // Distinct embedded values on physical copies are a diagnostic even when the deterministic
+    // resolver can select one. Low-confidence filesystem observations deliberately do not
+    // create this warning: copies commonly have different filesystem dates.
+    let embedded_values = candidates
+        .iter()
+        .filter(|candidate| capture_time_priority(Some(&candidate.candidate.source)) >= 80)
+        .map(|candidate| {
+            (
+                candidate.candidate.local.clone(),
+                candidate.candidate.timezone.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let copy_conflict = embedded_values.len() > 1;
+
+    let mut metadata = selected.metadata.clone();
+    if let Some(candidate) = selected_capture_time.as_ref() {
+        metadata.captured_at_raw = Some(candidate.raw.clone());
+        metadata.captured_at_local = Some(candidate.local.clone());
+        metadata.capture_timezone = Some(candidate.timezone.clone());
+        metadata.capture_time_source = Some(candidate.source.clone());
+        metadata.capture_time_confidence = Some(candidate.confidence.clone());
+    }
+    let diagnostics = copy_conflict.then(|| {
+        serde_json::json!({
+            "kind": "embedded_capture_time_conflict",
+            "evidence": "Available physical copies reported different embedded camera capture times. CaptureOS selected the highest-provenance local consensus without changing customer media.",
+        })
+    });
+    let copy_observations = inspections
+        .iter()
+        .map(|inspection| {
+            serde_json::json!({
+                "sourceFileInstanceId": inspection.candidate.file_instance_id,
+                "status": inspection.metadata.status.as_str(),
+                "capturedAtLocal": inspection.metadata.captured_at_local,
+                "captureTimezone": inspection.metadata.capture_timezone,
+                "captureTimeSource": inspection.metadata.capture_time_source,
+                "captureTimeConfidence": inspection.metadata.capture_time_confidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    let resolution = serde_json::json!({
+        "version": METADATA_EXTRACTOR_VERSION,
+        "state": if selected_capture_time.is_some() { "resolved" } else { "unavailable" },
+        "selectedSourceFileInstanceId": selected_capture_time_file_instance_id,
+        "selected": selected_capture_time,
+        "observationCount": inspections.len(),
+        "diagnostics": diagnostics.into_iter().collect::<Vec<_>>(),
+        "observations": copy_observations,
+    });
+    if let Some(object) = metadata.raw.as_object_mut() {
+        object.insert("captureTimeResolution".into(), resolution);
+    } else {
+        metadata.raw = serde_json::json!({ "captureTimeResolution": resolution });
+    }
+
+    Ok(ResolvedAssetMetadata {
+        selected,
+        metadata,
+        observations,
+        copy_conflict,
+    })
 }
 
 fn terminal_status(
@@ -2414,7 +6369,7 @@ fn metadata_record(
         source_file_instance_id: candidate.file_instance_id.clone(),
         source_fingerprint: candidate.source_fingerprint.clone(),
         extractor: "local-platform-metadata".into(),
-        extractor_version: GENERATOR_VERSION.into(),
+        extractor_version: METADATA_EXTRACTOR_VERSION.into(),
         status: extracted.status.as_str().into(),
         failure_reason: extracted.failure_reason,
         extracted_at: Utc::now().to_rfc3339(),
@@ -2424,6 +6379,7 @@ fn metadata_record(
         captured_at_local: extracted.captured_at_local,
         capture_timezone: extracted.capture_timezone,
         capture_time_source: extracted.capture_time_source,
+        capture_time_confidence: extracted.capture_time_confidence,
         width: extracted.width,
         height: extracted.height,
         orientation: extracted.orientation,
@@ -4007,8 +7963,9 @@ fn relation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magic_search::FixtureSemanticProvider;
     use persistence::SqliteRepository;
-    use std::{fs, io, io::Write, process::Command};
+    use std::{collections::HashMap, fs, io, io::Write, process::Command};
     use storage::VolumeObservation;
     use tempfile::tempdir;
 
@@ -4157,6 +8114,298 @@ mod tests {
             load_project_home(&repository, &project_id, MediaBrowserFilter::All, 0, 50).unwrap();
         assert_eq!(after_reindex.media.len(), 4);
         assert_eq!(repository.counts().unwrap().file_instances, 4);
+    }
+
+    fn metadata_inspection_for_capture_time(
+        file_instance_id: &str,
+        local: &str,
+        source: &str,
+        file_modified_at: &str,
+    ) -> MetadataSourceInspection {
+        MetadataSourceInspection {
+            candidate: persistence::MediaPreparationCandidate {
+                asset_id: "asset-1".into(),
+                file_instance_id: file_instance_id.into(),
+                filename: "IMG_0001.JPG".into(),
+                media_type: "jpeg".into(),
+                selected_root: None,
+                relative_path: "IMG_0001.JPG".into(),
+                source_fingerprint: "fixture-fingerprint".into(),
+                is_available: true,
+            },
+            source: None,
+            metadata: media_visual::ExtractedMetadata {
+                status: ArtifactStatus::Ready,
+                captured_at_raw: Some(local.replace('T', " ")),
+                captured_at_local: Some(local.into()),
+                capture_timezone: Some("unknown".into()),
+                capture_time_source: Some(source.into()),
+                capture_time_confidence: Some("high".into()),
+                file_modified_at: Some(file_modified_at.into()),
+                raw: serde_json::json!({}),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn capture_time_resolution_uses_matching_embedded_time_not_copy_filesystem_dates() {
+        let resolved = resolve_asset_metadata(vec![
+            metadata_inspection_for_capture_time(
+                "copy-b",
+                "2025-10-14T15:42:18.120",
+                "exif_datetime_original",
+                "2026-01-02T03:04:05Z",
+            ),
+            metadata_inspection_for_capture_time(
+                "copy-a",
+                "2025-10-14T15:42:18.120",
+                "exif_datetime_original",
+                "2024-01-02T03:04:05Z",
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            resolved.metadata.captured_at_local.as_deref(),
+            Some("2025-10-14T15:42:18.120")
+        );
+        assert_eq!(
+            resolved.metadata.capture_time_source.as_deref(),
+            Some("exif_datetime_original")
+        );
+        assert_eq!(
+            resolved.metadata.capture_timezone.as_deref(),
+            Some("unknown")
+        );
+        assert!(!resolved.copy_conflict);
+        assert_eq!(resolved.observations.len(), 2);
+        assert_eq!(
+            resolved
+                .metadata
+                .raw
+                .pointer("/captureTimeResolution/selected/source")
+                .and_then(serde_json::Value::as_str),
+            Some("exif_datetime_original")
+        );
+    }
+
+    #[test]
+    fn capture_time_resolution_keeps_a_developer_conflict_diagnostic_for_copies() {
+        let resolved = resolve_asset_metadata(vec![
+            metadata_inspection_for_capture_time(
+                "copy-b",
+                "2025-10-14T15:42:19",
+                "exif_datetime_original",
+                "2026-01-02T03:04:05Z",
+            ),
+            metadata_inspection_for_capture_time(
+                "copy-a",
+                "2025-10-14T15:42:18",
+                "exif_datetime_original",
+                "2024-01-02T03:04:05Z",
+            ),
+        ])
+        .unwrap();
+
+        assert!(resolved.copy_conflict);
+        assert_eq!(
+            resolved.metadata.captured_at_local.as_deref(),
+            Some("2025-10-14T15:42:18")
+        );
+        assert_eq!(
+            resolved
+                .metadata
+                .raw
+                .pointer("/captureTimeResolution/diagnostics/0/kind")
+                .and_then(serde_json::Value::as_str),
+            Some("embedded_capture_time_conflict")
+        );
+    }
+
+    #[test]
+    fn unknown_timezone_moment_time_stays_a_local_wall_clock_value() {
+        let local = "2025-10-14T15:42:18.120";
+        assert!(moment_unix_millis(local).is_some());
+        let capture_time_by_asset = HashMap::from([("asset-1".into(), local.into())]);
+        assert_eq!(
+            materialized_moment_capture_time(
+                "asset-1",
+                moment_unix_millis(local),
+                &capture_time_by_asset
+            )
+            .as_deref(),
+            Some(local)
+        );
+    }
+
+    /// Deliberately pixel-free, synthetic EXIF fixture for the existing-catalog refresh test.
+    /// It must stay independent of the private AI Test photographs.
+    fn synthetic_exif_jpeg(datetime_original: &str) -> Vec<u8> {
+        let mut datetime = datetime_original.as_bytes().to_vec();
+        datetime.push(0);
+        let exif_ifd_offset = 26_u32;
+        let datetime_offset = 44_u32;
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42_u16.to_le_bytes());
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        tiff.extend_from_slice(&1_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x8769_u16.to_le_bytes()); // ExifIFDPointer
+        tiff.extend_from_slice(&4_u16.to_le_bytes()); // LONG
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&exif_ifd_offset.to_le_bytes());
+        tiff.extend_from_slice(&0_u32.to_le_bytes()); // no next IFD
+        assert_eq!(tiff.len(), exif_ifd_offset as usize);
+        tiff.extend_from_slice(&1_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x9003_u16.to_le_bytes()); // DateTimeOriginal
+        tiff.extend_from_slice(&2_u16.to_le_bytes()); // ASCII
+        tiff.extend_from_slice(&(datetime.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&datetime_offset.to_le_bytes());
+        tiff.extend_from_slice(&0_u32.to_le_bytes()); // no next Exif IFD
+        assert_eq!(tiff.len(), datetime_offset as usize);
+        tiff.extend_from_slice(&datetime);
+
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(&tiff);
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1];
+        jpeg.extend_from_slice(
+            &u16::try_from(app1.len() + 2)
+                .expect("synthetic EXIF app segment fits JPEG")
+                .to_be_bytes(),
+        );
+        jpeg.extend_from_slice(&app1);
+        jpeg.extend_from_slice(&[0xff, 0xd9]);
+        jpeg
+    }
+
+    #[test]
+    fn metadata_refresh_repairs_an_existing_catalog_without_mutating_human_or_preview_data() {
+        let directory = tempdir().unwrap();
+        let source_root = directory.path().join("already-indexed");
+        fs::create_dir_all(&source_root).unwrap();
+        let jpeg = synthetic_exif_jpeg("2025:10:14 15:42:18");
+        fs::write(source_root.join("IMG_0001.JPG"), &jpeg).unwrap();
+        fs::write(source_root.join("IMG_0001 copy.JPG"), &jpeg).unwrap();
+
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = create_local_project(&repository, "Metadata refresh fixture").unwrap();
+        let project_id = ProjectId::try_from(project.id.as_str()).unwrap();
+        index_local_folder(
+            &repository,
+            &project_id,
+            source_root.to_str().unwrap(),
+            |_| {},
+        )
+        .unwrap();
+        let item = repository
+            .visual_media_page(&project_id, &VisualMediaQuery::default())
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        let asset_id = MediaAssetId::try_from(item.asset_id.as_str()).unwrap();
+        save_human_intelligence_decision(
+            &repository,
+            &project_id,
+            &asset_id,
+            HumanDecisionValue::Keep,
+            Some("keep this local fixture"),
+        )
+        .unwrap();
+        let preview_id = Uuid::new_v4().to_string();
+        repository
+            .upsert_preview_artifact(&PreviewArtifactRecord {
+                id: preview_id.clone(),
+                media_asset_id: item.asset_id.clone(),
+                source_file_instance_id: item.file_instance_id.clone(),
+                artifact_type: "thumbnail".into(),
+                size_class: "small".into(),
+                cache_relative_path: "synthetic/thumbnail.jpg".into(),
+                provider: "fixture".into(),
+                generator_version: "fixture".into(),
+                source_fingerprint: "fixture".into(),
+                created_at: Utc::now().to_rfc3339(),
+                status: "ready".into(),
+                failure_reason: None,
+            })
+            .unwrap();
+        let culling_before = load_culling_progress(&repository, &project_id).unwrap();
+        assert!(repository
+            .media_asset_detail(&asset_id)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .is_none());
+
+        let mut updates = Vec::new();
+        let progress = refresh_capture_metadata(&repository, &project_id, |update| {
+            updates.push(update.clone());
+        })
+        .unwrap();
+
+        assert_eq!(progress.state, "completed");
+        assert_eq!(progress.items_total, 1);
+        assert_eq!(progress.resolved_capture_time_count, 1);
+        assert_eq!(progress.high_confidence_capture_time_count, 1);
+        assert!(updates.iter().any(|update| update.state == "running"));
+        let detail = repository.media_asset_detail(&asset_id).unwrap().unwrap();
+        let metadata = detail.metadata.unwrap();
+        assert_eq!(
+            metadata.captured_at_local.as_deref(),
+            Some("2025-10-14T15:42:18")
+        );
+        assert_eq!(
+            metadata.capture_time_source.as_deref(),
+            Some("exif_datetime_original")
+        );
+        assert_eq!(metadata.capture_timezone.as_deref(), Some("unknown"));
+        assert_eq!(metadata.capture_time_confidence.as_deref(), Some("high"));
+        assert_eq!(
+            metadata
+                .raw_metadata
+                .pointer("/captureTimeResolution/observationCount")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            load_culling_progress(&repository, &project_id).unwrap(),
+            culling_before
+        );
+        assert!(repository
+            .preview_render_artifact(&preview_id)
+            .unwrap()
+            .is_some());
+
+        let inputs = repository
+            .moment_analysis_inputs(&project_id, None)
+            .unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(
+            inputs[0].captured_at.as_deref(),
+            Some("2025-10-14T15:42:18")
+        );
+        let model_root = directory.path().join("no-semantic-model-installed");
+        let moment_progress = start_moment_analysis(
+            &repository,
+            &project_id,
+            &SiglipProviderCache::new(&model_root),
+            AnalysisResourceMode::Balanced,
+            true,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        assert!(moment_progress.timeline_ready);
+        assert!(
+            repository
+                .moment_timeline_status(&project_id)
+                .unwrap()
+                .unwrap()
+                .moment_count
+                > 0
+        );
     }
 
     #[test]
@@ -5343,6 +9592,71 @@ mod tests {
     }
 
     #[test]
+    fn moment_resource_modes_only_change_materialization_yield_cadence() {
+        assert_eq!(moment_transform_batch_size(AnalysisResourceMode::Eco), 16);
+        assert_eq!(
+            moment_transform_batch_size(AnalysisResourceMode::Balanced),
+            64
+        );
+        assert_eq!(moment_transform_batch_size(AnalysisResourceMode::Fast), 256);
+
+        // More than one Fast batch proves that all three modes traverse the exact same durable
+        // evidence, even though ECO yields more frequently while materializing it.
+        let captured_at = Utc.timestamp_opt(1_704_067_200, 0).single().unwrap();
+        let inputs = (0..257)
+            .map(|ordinal| MomentAnalysisInput {
+                asset_id: format!("moment-resource-fixture-{ordinal:03}"),
+                captured_at: Some(
+                    (captured_at + chrono::Duration::seconds(i64::from(ordinal))).to_rfc3339(),
+                ),
+                capture_time_source: Some("catalog".into()),
+                camera_model: Some("Fixture camera".into()),
+                lens_model: Some("Fixture lens".into()),
+                orientation: Some(
+                    match ordinal % 3 {
+                        0 => "landscape",
+                        1 => "portrait",
+                        _ => "square",
+                    }
+                    .into(),
+                ),
+                face_count: Some((ordinal % 4) as u64),
+                technical_quality_band: Some("good".into()),
+                technical_quality_score: Some(70.0 + f64::from(ordinal % 25)),
+                rating: (ordinal % 6) as u8,
+                starred: ordinal % 2 == 0,
+                decision: match ordinal % 3 {
+                    0 => Some("keep".into()),
+                    1 => Some("review".into()),
+                    _ => None,
+                },
+                similar_set_ids: vec![format!("similar-set-{}", ordinal % 5)],
+                embedding: Some(vec![1.0, ordinal as f32 + 1.0, 0.5]),
+            })
+            .collect::<Vec<_>>();
+
+        let eco = materialize_moment_timeline_assets(
+            &inputs,
+            Some("fixture-semantic-model"),
+            AnalysisResourceMode::Eco,
+        );
+        let balanced = materialize_moment_timeline_assets(
+            &inputs,
+            Some("fixture-semantic-model"),
+            AnalysisResourceMode::Balanced,
+        );
+        let fast = materialize_moment_timeline_assets(
+            &inputs,
+            Some("fixture-semantic-model"),
+            AnalysisResourceMode::Fast,
+        );
+
+        assert_eq!(eco.len(), inputs.len());
+        assert_eq!(eco, balanced);
+        assert_eq!(balanced, fast);
+    }
+
+    #[test]
     fn analysis_input_resolver_needs_original_only_when_every_file_instance_is_offline() {
         let directory = tempdir().unwrap();
         let source = directory.path().join("source");
@@ -6012,6 +10326,368 @@ mod tests {
     }
 
     #[test]
+    fn m6_indexing_uses_managed_cached_previews_and_remains_searchable_when_sources_are_offline() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("preview-cache");
+        let index_root = directory.path().join("semantic-index");
+        fs::create_dir_all(&cache).unwrap();
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let created_at = Utc.timestamp_opt(1_704_067_200, 0).single().unwrap();
+        let project = Project {
+            id: pid(960),
+            name: "M6 managed cache".into(),
+            created_at,
+        };
+        let storage = volume(
+            961,
+            "M6 source offline",
+            MountState::Offline,
+            None,
+            Some("m6-cache-test"),
+        );
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&storage).unwrap();
+        let first = asset(
+            962,
+            &project,
+            MediaType::Jpeg,
+            "FIRST.JPG",
+            created_at,
+            "m6-first",
+        );
+        let second = asset(
+            963,
+            &project,
+            MediaType::Jpeg,
+            "SECOND.JPG",
+            created_at,
+            "m6-second",
+        );
+        for (offset, asset) in [&first, &second].into_iter().enumerate() {
+            repository.insert_media_asset(asset).unwrap();
+            let instance = file(
+                964 + offset as u128,
+                asset,
+                &storage,
+                &format!("offline/{}", asset.display_name),
+                created_at,
+                false,
+            );
+            repository.insert_file_instance(&instance).unwrap();
+            let relative = format!("m6/{}/preview.ppm", asset.id);
+            let preview = cache.join(&relative);
+            fs::create_dir_all(preview.parent().unwrap()).unwrap();
+            fs::write(&preview, b"P3\n1 1\n255\n255 0 0\n").unwrap();
+            repository
+                .upsert_preview_artifact(&PreviewArtifactRecord {
+                    id: Uuid::new_v4().to_string(),
+                    media_asset_id: asset.id.to_string(),
+                    source_file_instance_id: instance.id.to_string(),
+                    artifact_type: "thumbnail".into(),
+                    size_class: "preview".into(),
+                    cache_relative_path: relative,
+                    provider: "test-managed-cache".into(),
+                    generator_version: "m6-test".into(),
+                    source_fingerprint: asset.fingerprint.fast_fingerprint.clone().unwrap(),
+                    created_at: Utc::now().to_rfc3339(),
+                    status: "ready".into(),
+                    failure_reason: None,
+                })
+                .unwrap();
+        }
+        let provider = FixtureSemanticProvider::new(
+            3,
+            vec![1.0, 0.0, 0.0],
+            HashMap::from([("red".into(), vec![1.0, 0.0, 0.0])]),
+        );
+        let should_not_pause = || false;
+        let mut ignore_progress: fn(&SemanticIndexProgress) = |_| {};
+        let progress = index_semantic_embeddings_with_provider(
+            &repository,
+            &project.id,
+            SemanticStorageRoots {
+                preview_cache_root: &cache,
+                index_root: &index_root,
+            },
+            &mut SemanticIndexExecution {
+                resource_mode: AnalysisResourceMode::Eco,
+                provider: &provider,
+                model_status: SemanticModelStatus {
+                    installed: true,
+                    message: Some("fixture only".into()),
+                    identity: None,
+                },
+                should_pause: &should_not_pause,
+                on_progress: &mut ignore_progress,
+            },
+        )
+        .unwrap();
+        assert_eq!(progress.state, "completed");
+        assert!(progress.index_ready);
+        assert_eq!(progress.counts.ready, 2);
+        let model = semantic_model_config(provider.identity());
+        assert!(load_active_semantic_index(
+            &repository,
+            &project.id,
+            &model,
+            &provider.identity().cache_key(),
+            &index_root,
+        )
+        .unwrap()
+        .is_some());
+
+        // The original FileInstances are already offline; remove the temporary cache previews
+        // too. Find Similar still operates from durable local embeddings and the derived index.
+        fs::remove_dir_all(cache.join("m6")).unwrap();
+        let result = find_similar_with_provider(
+            &repository,
+            &project.id,
+            FindSimilarRequest {
+                asset_id: &first.id,
+                limit: 10,
+                offset: 0,
+            },
+            FindSimilarExecution {
+                provider: &provider,
+                index_root: &index_root,
+                preview_cache_root: &cache,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].item.asset_id, second.id.to_string());
+    }
+
+    #[test]
+    fn m6_cached_embeddings_are_project_scoped_and_find_similar_never_touches_culling_or_sets() {
+        let directory = tempdir().unwrap();
+        let cache = directory.path().join("preview-cache");
+        let index_root = directory.path().join("semantic-index");
+        fs::create_dir_all(&cache).unwrap();
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let created_at = Utc.timestamp_opt(1_704_067_200, 0).single().unwrap();
+        let first_project = Project {
+            id: pid(950),
+            name: "M6 first".into(),
+            created_at,
+        };
+        let second_project = Project {
+            id: pid(951),
+            name: "M6 second".into(),
+            created_at,
+        };
+        let storage = volume(
+            952,
+            "M6 offline cache fixture",
+            MountState::Offline,
+            None,
+            Some("m6-offline-cache"),
+        );
+        repository.insert_project(&first_project).unwrap();
+        repository.insert_project(&second_project).unwrap();
+        repository.insert_storage_volume(&storage).unwrap();
+        let source = asset(
+            953,
+            &first_project,
+            MediaType::Jpeg,
+            "SOURCE.JPG",
+            created_at,
+            "m6-source",
+        );
+        let related = asset(
+            954,
+            &first_project,
+            MediaType::Jpeg,
+            "RELATED.JPG",
+            created_at,
+            "m6-related",
+        );
+        let other = asset(
+            955,
+            &first_project,
+            MediaType::Jpeg,
+            "OTHER.JPG",
+            created_at,
+            "m6-other",
+        );
+        let isolated = asset(
+            956,
+            &second_project,
+            MediaType::Jpeg,
+            "ISOLATED.JPG",
+            created_at,
+            "m6-isolated",
+        );
+        for (offset, asset) in [&source, &related, &other, &isolated]
+            .into_iter()
+            .enumerate()
+        {
+            repository.insert_media_asset(asset).unwrap();
+            // Simulate originals being offline after a prior local indexing pass. Search must
+            // use persisted local embeddings rather than reaching into a source path.
+            repository
+                .insert_file_instance(&file(
+                    1000 + offset as u128,
+                    asset,
+                    &storage,
+                    &format!("offline/{}", asset.display_name),
+                    created_at,
+                    false,
+                ))
+                .unwrap();
+        }
+        let provider = FixtureSemanticProvider::new(
+            3,
+            vec![1.0, 0.0, 0.0],
+            HashMap::from([("yellow boat".into(), vec![1.0, 0.0, 0.0])]),
+        );
+        let model = semantic_model_config(provider.identity());
+        for (asset, vector) in [
+            (&source, vec![1.0, 0.0, 0.0]),
+            (&related, vec![1.0, 0.0, 0.0]),
+            (&other, vec![0.0, 1.0, 0.0]),
+            (&isolated, vec![1.0, 0.0, 0.0]),
+        ] {
+            repository
+                .upsert_semantic_embedding(&SemanticEmbeddingRecord {
+                    media_asset_id: asset.id.clone(),
+                    project_id: asset.project_id.clone(),
+                    input_fingerprint: format!("{}-input", asset.id),
+                    model: model.clone(),
+                    embedding: Some(vector),
+                    generated_at: Utc::now(),
+                    status: AnalysisStatus::Ready,
+                    error_message: None,
+                })
+                .unwrap();
+        }
+        let build = PersistentVectorIndex::build_and_store(
+            &index_root,
+            &first_project.id.to_string(),
+            &provider.identity().cache_key(),
+            model.dimensions,
+            repository
+                .semantic_embeddings_for_index(&first_project.id, &model)
+                .unwrap()
+                .into_iter()
+                .map(|vector| (vector.asset_id, vector.vector)),
+        )
+        .unwrap();
+        let indexed_at = Utc::now();
+        repository
+            .upsert_semantic_index_version(&SemanticIndexVersion {
+                id: SemanticIndexVersionId::new(),
+                project_id: first_project.id.clone(),
+                model: model.clone(),
+                index_format: SEMANTIC_INDEX_FORMAT.into(),
+                index_relative_path: build.relative_path,
+                index_checksum: build.checksum,
+                embedding_count: build.vector_count as u64,
+                status: "ready".into(),
+                stale: false,
+                created_at: indexed_at,
+                rebuilt_at: indexed_at,
+            })
+            .unwrap();
+
+        let response = find_similar_with_provider(
+            &repository,
+            &first_project.id,
+            FindSimilarRequest {
+                asset_id: &source.id,
+                limit: 10,
+                offset: 0,
+            },
+            FindSimilarExecution {
+                provider: &provider,
+                index_root: &index_root,
+                preview_cache_root: &cache,
+            },
+        )
+        .unwrap();
+        assert!(response.semantic_available && response.semantic_applied);
+        assert_eq!(response.results[0].item.asset_id, related.id.to_string());
+        assert!(response
+            .results
+            .iter()
+            .all(|result| result.item.asset_id != source.id.to_string()));
+        assert!(response
+            .results
+            .iter()
+            .all(|result| result.item.asset_id != isolated.id.to_string()));
+        assert!(response.results[0]
+            .explanation
+            .contains("does not create or alter Similar Sets"));
+        assert!(repository
+            .similarity_group_for_asset(&source.id, 10, 0)
+            .unwrap()
+            .is_none());
+
+        // A missing static model pack must not turn language into a broad or fabricated match.
+        let unavailable_provider_cache =
+            SiglipProviderCache::new(directory.path().join("no-model-pack"));
+        let unavailable = search_magic(
+            &repository,
+            &first_project.id,
+            &MagicSearchRequest {
+                query: "yellow boat".into(),
+                ..MagicSearchRequest::default()
+            },
+            &unavailable_provider_cache,
+            &index_root,
+            &cache,
+        )
+        .unwrap();
+        assert!(!unavailable.semantic_available && !unavailable.semantic_applied);
+        assert!(unavailable.results.is_empty());
+        assert_eq!(
+            load_magic_search_history(&repository, &first_project.id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let hybrid_plan = plan_query("yellow boat with 2 faces").unwrap();
+        let hybrid = score_semantic_candidates(
+            vec![
+                SemanticSearchCandidate {
+                    asset_id: source.id.to_string(),
+                    vector: Some(vec![1.0, 0.0, 0.0]),
+                    face_count: Some(2),
+                    rating: 0,
+                    decision: None,
+                    sharpness_band: None,
+                    blur_level: None,
+                    technical_quality_band: None,
+                    technical_quality_score: None,
+                    camera_model: None,
+                    captured_at: None,
+                },
+                SemanticSearchCandidate {
+                    asset_id: related.id.to_string(),
+                    vector: Some(vec![1.0, 0.0, 0.0]),
+                    face_count: Some(1),
+                    rating: 0,
+                    decision: None,
+                    sharpness_band: None,
+                    blur_level: None,
+                    technical_quality_band: None,
+                    technical_quality_score: None,
+                    camera_model: None,
+                    captured_at: None,
+                },
+            ],
+            &hybrid_plan,
+            &[1.0, 0.0, 0.0],
+            "relevance",
+            true,
+        )
+        .unwrap();
+        assert_eq!(hybrid.len(), 1);
+        assert_eq!(hybrid[0].candidate.asset_id, source.id.to_string());
+    }
+
+    #[test]
     fn culling_report_is_explicit_non_destructive_and_never_overwrites() {
         let directory = tempdir().unwrap();
         let source = directory.path().join("source");
@@ -6056,5 +10732,442 @@ mod tests {
         assert_eq!(fs::read(&original).unwrap(), original_bytes);
         assert!(export_culling_report(&repository, &project_id, &report, "csv").is_err());
         assert_eq!(fs::read(&original).unwrap(), original_bytes);
+    }
+
+    #[test]
+    fn m7_local_timeline_persists_human_structure_and_uses_a_bounded_append_update() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let captured_at = Utc.timestamp_opt(1_704_067_200, 0).single().unwrap();
+        let project = Project {
+            id: pid(1_100),
+            name: "M7 local timeline".into(),
+            created_at: captured_at,
+        };
+        let storage = volume(
+            1_101,
+            "M7 fixture storage",
+            MountState::Offline,
+            None,
+            Some("m7-local-timeline"),
+        );
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&storage).unwrap();
+        let mut assets = Vec::new();
+        for ordinal in 0..8u128 {
+            let seconds = if ordinal < 4 {
+                ordinal as i64
+            } else {
+                600 + (ordinal as i64 - 4)
+            };
+            let asset = asset(
+                1_110 + ordinal,
+                &project,
+                MediaType::Jpeg,
+                &format!("M7_{ordinal:04}.JPG"),
+                captured_at + chrono::Duration::seconds(seconds),
+                &format!("m7-{ordinal}"),
+            );
+            repository.insert_media_asset(&asset).unwrap();
+            repository
+                .insert_file_instance(&file(
+                    1_130 + ordinal,
+                    &asset,
+                    &storage,
+                    &format!("offline/{}", asset.display_name),
+                    captured_at,
+                    false,
+                ))
+                .unwrap();
+            assets.push(asset);
+        }
+        let unavailable_model = SiglipProviderCache::new(directory.path().join("no-model-pack"));
+        let first = start_moment_analysis(
+            &repository,
+            &project.id,
+            &unavailable_model,
+            AnalysisResourceMode::Balanced,
+            false,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        assert!(first.timeline_ready);
+        let initial = repository.moment_timeline_page(&project.id, 20, 0).unwrap();
+        assert!(initial.moments.len() >= 2);
+        assert!(initial
+            .moments
+            .iter()
+            .all(|moment| moment.display_label == "Untitled Moment"));
+        let first_moment = initial.moments[0].clone();
+        let member_page = repository
+            .visual_media_page(
+                &project.id,
+                &VisualMediaQuery {
+                    moment_id: Some(first_moment.id.clone()),
+                    ..VisualMediaQuery::default()
+                },
+            )
+            .unwrap();
+        assert!(member_page.items.len() >= 2);
+
+        rename_moment(
+            &repository,
+            &project.id,
+            &first_moment.id,
+            "Photographer's timeline name",
+        )
+        .unwrap();
+        let representative_id =
+            MediaAssetId::try_from(member_page.items[0].asset_id.as_str()).unwrap();
+        set_moment_human_representative(
+            &repository,
+            &project.id,
+            &first_moment.id,
+            &representative_id,
+        )
+        .unwrap();
+        split_moment(
+            &repository,
+            &project.id,
+            &first_moment.id,
+            &representative_id,
+        )
+        .unwrap();
+        let after_split = repository.moment_timeline_page(&project.id, 20, 0).unwrap();
+        assert!(after_split.moments.len() > initial.moments.len());
+        let adjacent = after_split.moments[1].clone();
+        merge_adjacent_moments(
+            &repository,
+            &project.id,
+            &after_split.moments[0].id,
+            &adjacent.id,
+        )
+        .unwrap();
+
+        // An explicit rebuild reuses only durable local evidence, and must not erase the
+        // photographer's separate label/representative or protected split/merge intent.
+        let rebuilt_progress = start_moment_analysis(
+            &repository,
+            &project.id,
+            &unavailable_model,
+            AnalysisResourceMode::Eco,
+            true,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(rebuilt_progress.resource_mode, "eco");
+        let rebuilt = repository.moment_timeline_page(&project.id, 20, 0).unwrap();
+        assert!(rebuilt
+            .moments
+            .iter()
+            .any(|moment| moment.human_label.as_deref() == Some("Photographer's timeline name")));
+        assert!(rebuilt
+            .moments
+            .iter()
+            .any(|moment| moment.human_override_present));
+
+        let appended = asset(
+            1_150,
+            &project,
+            MediaType::Jpeg,
+            "M7_0008.JPG",
+            captured_at + chrono::Duration::seconds(1_300),
+            "m7-appended",
+        );
+        repository.insert_media_asset(&appended).unwrap();
+        repository
+            .insert_file_instance(&file(
+                1_151,
+                &appended,
+                &storage,
+                "offline/M7_0008.JPG",
+                captured_at,
+                false,
+            ))
+            .unwrap();
+        let incremental = start_moment_analysis(
+            &repository,
+            &project.id,
+            &unavailable_model,
+            AnalysisResourceMode::Balanced,
+            false,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        assert!(incremental.timeline_ready);
+        let latest_job = repository
+            .latest_moment_analysis_job(&project.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest_job
+                .resume_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("incremental"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "latest moment job: {latest_job:#?}"
+        );
+        let final_status = repository
+            .moment_timeline_status(&project.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_status.eligible_count, 9);
+        assert_eq!(final_status.ungrouped_count, 0);
+        assert_eq!(
+            repository
+                .visual_media_page(&project.id, &VisualMediaQuery::default())
+                .unwrap()
+                .items
+                .len(),
+            9
+        );
+    }
+
+    #[test]
+    fn m7_moment_card_search_requires_a_compatible_local_model_and_never_exposes_scores() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let captured_at = Utc.timestamp_opt(1_704_067_200, 0).single().unwrap();
+        let project = Project {
+            id: pid(1_200),
+            name: "M7 Moment card search".into(),
+            created_at: captured_at,
+        };
+        let storage = volume(
+            1_201,
+            "M7 local-only search fixture",
+            MountState::Offline,
+            None,
+            Some("m7-moment-card-search"),
+        );
+        let asset = asset(
+            1_202,
+            &project,
+            MediaType::Jpeg,
+            "M7_WATER.JPG",
+            captured_at,
+            "m7-moment-card-water",
+        );
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&storage).unwrap();
+        repository.insert_media_asset(&asset).unwrap();
+        repository
+            .insert_file_instance(&file(
+                1_203,
+                &asset,
+                &storage,
+                "offline/M7_WATER.JPG",
+                captured_at,
+                false,
+            ))
+            .unwrap();
+
+        let provider = FixtureSemanticProvider::new(
+            3,
+            vec![1.0, 0.0, 0.0],
+            HashMap::from([("water".into(), vec![1.0, 0.0, 0.0])]),
+        );
+        let model_key = provider.identity().cache_key();
+        let created_at = captured_at.to_rfc3339();
+        let timeline_id = "m7-search-timeline";
+        let run_id = "m7-search-run";
+        let segment_id = "m7-search-segment";
+        let moment_id = "m7-search-moment";
+        let timeline = MomentTimelineStatusRecord {
+            timeline_id: timeline_id.into(),
+            project_id: project.id.to_string(),
+            state: "ready".into(),
+            analyzer_id: MOMENT_ANALYZER_ID.into(),
+            analyzer_version: "test".into(),
+            boundary_algorithm_version: MOMENT_BOUNDARY_ALGORITHM_VERSION.into(),
+            semantic_model_key: Some(model_key.clone()),
+            input_catalog_version: "m7-search-test-inputs".into(),
+            active_run_id: Some(run_id.into()),
+            moment_count: 1,
+            eligible_count: 1,
+            ungrouped_count: 0,
+            updated_at: created_at.clone(),
+        };
+        let run = MomentAnalysisRunRecord {
+            id: run_id.into(),
+            timeline_id: timeline_id.into(),
+            project_id: project.id.to_string(),
+            state: "completed".into(),
+            analyzer_id: MOMENT_ANALYZER_ID.into(),
+            analyzer_version: "test".into(),
+            boundary_algorithm_version: MOMENT_BOUNDARY_ALGORITHM_VERSION.into(),
+            semantic_model_key: Some(model_key),
+            input_catalog_version: "m7-search-test-inputs".into(),
+            items_total: 1,
+            items_completed: 1,
+            error_count: 0,
+            started_at: created_at.clone(),
+            finished_at: Some(created_at.clone()),
+        };
+        repository
+            .replace_active_moment_analysis(
+                &timeline,
+                &run,
+                &[TimelineSegmentRecord {
+                    id: segment_id.into(),
+                    project_id: project.id.to_string(),
+                    run_id: run_id.into(),
+                    ordinal: 0,
+                    started_at: Some(created_at.clone()),
+                    ended_at: Some(created_at.clone()),
+                    asset_count: 1,
+                    boundary_category: None,
+                    boundary_evidence: serde_json::json!({"test": true}),
+                    created_at: created_at.clone(),
+                    stale: false,
+                }],
+                &[MomentRecord {
+                    id: moment_id.into(),
+                    project_id: project.id.to_string(),
+                    timeline_id: timeline_id.into(),
+                    run_id: run_id.into(),
+                    segment_id: segment_id.into(),
+                    anchor_asset_id: asset.id.to_string(),
+                    ordinal: 0,
+                    started_at: Some(created_at.clone()),
+                    ended_at: Some(created_at.clone()),
+                    asset_count: 1,
+                    ai_representative_asset_id: Some(asset.id.to_string()),
+                    centroid: Some(vec![1.0, 0.0, 0.0]),
+                    centroid_dimensions: Some(3),
+                    suggested_label: None,
+                    label_confidence: None,
+                    label_evidence: serde_json::json!({"state": "abstained"}),
+                    label_state: "abstained".into(),
+                    created_at: created_at.clone(),
+                    stale: false,
+                }],
+                &[MomentMembershipRecord {
+                    id: "m7-search-membership".into(),
+                    project_id: project.id.to_string(),
+                    run_id: run_id.into(),
+                    moment_id: Some(moment_id.into()),
+                    media_asset_id: asset.id.to_string(),
+                    ordinal: 0,
+                    membership_state: "member".into(),
+                    created_at: created_at.clone(),
+                    active: true,
+                }],
+                &[],
+            )
+            .unwrap();
+
+        let response = search_moments_with_provider(
+            &repository,
+            &project.id,
+            &MomentSearchRequest {
+                query: "water".into(),
+                limit: 24,
+            },
+            "water",
+            "water",
+            &provider,
+            directory.path(),
+        )
+        .unwrap();
+        assert!(response.semantic_available && response.semantic_applied);
+        assert_eq!(response.total_results, 1);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].id, moment_id);
+        assert_eq!(response.results[0].label.display_label, "Untitled Moment");
+        assert_eq!(response.results[0].asset_count, 1);
+
+        // A same-dimension fixture with a different embedding-space identity must not compare
+        // against the stored centroid. This also guards a future provider/model revision.
+        let incompatible_provider = FixtureSemanticProvider::new(
+            2,
+            vec![1.0, 0.0],
+            HashMap::from([("water".into(), vec![1.0, 0.0])]),
+        );
+        let incompatible = search_moments_with_provider(
+            &repository,
+            &project.id,
+            &MomentSearchRequest {
+                query: "water".into(),
+                limit: 24,
+            },
+            "water",
+            "water",
+            &incompatible_provider,
+            directory.path(),
+        )
+        .unwrap();
+        assert!(incompatible.semantic_available && !incompatible.semantic_applied);
+        assert!(incompatible.results.is_empty());
+        assert!(incompatible
+            .semantic_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("compatible")));
+
+        // No approved local provider yields no broad catalog fallback or fabricated card.
+        let unavailable_cache = SiglipProviderCache::new(directory.path().join("no-model-pack"));
+        let unavailable = search_moments(
+            &repository,
+            &project.id,
+            &MomentSearchRequest {
+                query: "water".into(),
+                limit: 24,
+            },
+            &unavailable_cache,
+            directory.path(),
+        )
+        .unwrap();
+        assert!(!unavailable.semantic_available && !unavailable.semantic_applied);
+        assert!(unavailable.results.is_empty());
+    }
+
+    #[test]
+    fn m7_clock_advisory_is_local_direction_free_and_never_mutates_timeline_inputs() {
+        let project_id = pid(1_300);
+        let mut inputs = Vec::new();
+        for index in 0..3_i64 {
+            let mut camera_a = TimelineAssetInput::minimal(
+                format!("clock-a-{index}"),
+                Some(1_000_000 + index * 120_000),
+            );
+            camera_a.camera_model = Some("Camera A".into());
+            camera_a.similar_set_ids = Some(vec![format!("related-{index}")]);
+            let mut camera_b = TimelineAssetInput::minimal(
+                format!("clock-b-{index}"),
+                Some(1_060_000 + index * 120_000),
+            );
+            camera_b.camera_model = Some("Camera B".into());
+            camera_b.similar_set_ids = Some(vec![format!("related-{index}")]);
+            inputs.extend([camera_a, camera_b]);
+        }
+        let before = inputs.clone();
+        let records = moment_clock_diagnostic_records(
+            &project_id,
+            "m7-clock-run",
+            &inputs,
+            Utc.timestamp_opt(1_704_067_200, 0).single().unwrap(),
+        );
+        assert_eq!(inputs, before, "clock observation must be read-only");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].possible_offset_seconds, Some(60));
+        assert_eq!(
+            records[0]
+                .evidence_json
+                .get("independentSimilarSetComparisons")
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        let view = moment_clock_diagnostic_view(records.into_iter().next().unwrap()).unwrap();
+        assert_eq!(view.camera_label, "Camera A ↔ Camera B");
+        assert_eq!(view.state, "possible_offset");
+        assert!(view.summary.contains("Possible camera time offset"));
+        assert!(view.summary.contains("about 1 minute"));
+        assert!(view.summary.contains("did not change any timestamps"));
+        assert!(!view.summary.contains("ahead"));
+        assert!(!view.summary.contains("behind"));
     }
 }

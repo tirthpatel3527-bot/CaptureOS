@@ -40,3 +40,32 @@ Magic Search is still-photo retrieval only. It reuses the same oriented, Capture
 | MOV / MP4 / WAV / MP3 / sidecars | Not eligible in M6 | Existing metadata and visual-engine behavior only | No video/audio semantic search or transcript inference |
 
 The candidate model family is a manual/developer-installed [`google/siglip-base-patch16-224`](https://huggingface.co/google/siglip-base-patch16-224) static ONNX pack, not a bundled CaptureOS asset. It must pass the local model registry’s path, checksum, license/provenance, and reference-vector checks before it is marked available. Without it, Magic Search supports only truthful deterministic metadata and technical filters and reports that semantic search is unavailable. See [Magic Search architecture](magic-search.md).
+
+## Capture-time metadata repair (Milestone 7.1)
+
+CaptureOS can explicitly refresh local capture-time metadata for an existing catalog without
+recreating the project. For JPEG, HEIF, and PNG it reads standard embedded EXIF fields locally
+through a bounded Rust container parser; valid original capture time, subsecond precision, and an
+observed offset take precedence over weaker values. An absent EXIF offset is represented as an
+unknown camera wall clock, not UTC. Platform metadata may contribute a lower-priority
+content-creation value where supported. Filesystem dates are last-resort, low-confidence
+provenance only.
+
+The current direct parser intentionally does not promise TIFF-based RAW or video embedded-time
+parsing. Those formats remain dependent on the existing local platform metadata adapter. There is
+no cloud request, source write, automatic model download, or filename/order inference. Available
+duplicate copies are observed separately; disagreement in embedded camera times is surfaced only
+as a local developer diagnostic.
+
+## Moment Brain eligibility (Milestone 7)
+
+Moment Brain uses existing local still-photo catalog evidence. It does not introduce another image decoder, require an original merely to open a timeline, or expand M6 support to video/audio. Timestamped eligible photo assets may participate in structural timeline analysis when durable metadata exists; compatible existing M6 embeddings are optional supporting evidence, not a prerequisite for a basic time/evidence projection. Assets without a trustworthy capture timestamp remain explicitly ungrouped/uncertain rather than being placed by filename or a guessed time.
+
+| Family | Structural Moment timeline | Label/representative evidence | Honest fallback |
+| --- | --- | --- | --- |
+| JPEG / PNG / TIFF | Eligible through local capture metadata and durable evidence | Compatible local embedding when admitted/available; existing technical and anonymous face-count evidence | Structural time-only/partial result or explicit unavailable evidence; never fabricated caption/detection |
+| HEIC / HEIF | Platform/catalog-metadata dependent | Same only when an existing managed preview-derived embedding/evidence exists | Ungrouped, partial, or unavailable state as evidenced |
+| RAW families | No new RAW decode in M7 | Existing catalog metadata only if already available; no implicit semantic input | No generated Moment visual claim from an unsupported RAW input |
+| MOV / MP4 / WAV / MP3 / sidecars | Not eligible for M7 timeline/semantic analysis | Not applicable | Existing Milestone 3 behavior remains unchanged |
+
+Moment Brain uses capture cadence, compatible visual continuity, and weak local metadata transitions to propose structural review units. It is not an event detector, person/relationship recognizer, emotion/creative model, or missing-shot checker. It never rewrites EXIF/source timestamps; a possible camera time offset is advisory local evidence only. See [Moment Brain architecture](moment-brain.md).
