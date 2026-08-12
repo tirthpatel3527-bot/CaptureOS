@@ -19,6 +19,7 @@ persistence = { path = "../persistence" }
 serde.workspace = true
 serde_json.workspace = true
 storage = { path = "../storage" }
+studio-brain = { path = "../studio-brain" }
 thiserror.workspace = true
 uuid.workspace = true
 

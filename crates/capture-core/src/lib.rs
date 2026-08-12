@@ -49,8 +49,11 @@ use persistence::{
     PreviewArtifactRecord, ProjectIndexSummary, ProjectLibraryItem as PersistedProjectLibraryItem,
     Result as PersistenceResult, ReviewSessionView, SemanticEmbeddingRecord, SemanticIndexVersion,
     SemanticInputCandidate, SemanticMetadataQuery, SemanticMetadataSort, SemanticModelConfig,
-    SemanticSearchCandidate, SimilarityGroupView, TimelineSegmentRecord, VisualMediaPage,
-    VisualMediaQuery, VisualMediaRow, VisualPreparationTerminalCounts,
+    SemanticSearchCandidate, SimilarityGroupView, StudioBrainProjectStatus,
+    StudioModelActivationOutcome, StudioModelRecord, StudioPairwisePreferenceRecord,
+    StudioRecommendationRecord, StudioTrainingExampleRecord, StudioTrainingRunRecord,
+    TimelineSegmentRecord, VisualMediaPage, VisualMediaQuery, VisualMediaRow,
+    VisualPreparationTerminalCounts,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -64,6 +67,14 @@ use std::{
     time::Instant,
 };
 use storage::{LocalVolumeInspector, VolumeInspector, VolumeObservation};
+use studio_brain::{
+    decode_verified_model_artifact, encode_verified_model_artifact,
+    evaluate_studio_model_on_observations, predict, rank_similar_set, train_studio_model,
+    AuxiliaryHumanSignals, ExplicitHumanActionKind, GenericAgreement, GenericRecommendation,
+    HumanDecision as StudioHumanDecision, PairwisePreference, SimilarSetCandidate,
+    StudioFeatureInput, StudioTrainingConfig, StudioTrainingStatus, TrainingObservation,
+    VerifiedModelArtifact, STUDIO_BRAIN_ALGORITHM_VERSION, STUDIO_BRAIN_FEATURE_SCHEMA_VERSION,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -301,6 +312,25 @@ pub struct MomentAnalysisProgress {
     pub message: Option<String>,
 }
 
+/// UI-safe progress for an explicitly requested, local Studio Brain training run. It contains no
+/// model coefficients, source paths, raw feature snapshots, notes, or probability values.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioBrainProgress {
+    pub profile_id: String,
+    pub state: String,
+    pub active: bool,
+    pub stage: String,
+    pub completed: u64,
+    pub total: u64,
+    pub error_count: u64,
+    pub active_model_version: Option<String>,
+    pub message: Option<String>,
+    /// Developer-details only. Normal UI should show a recovery message rather than surface
+    /// raw SQLite/Rust diagnostics directly.
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MomentBoundaryEvidenceView {
@@ -335,6 +365,11 @@ pub struct MomentRepresentativeView {
 pub struct MomentSummaryView {
     pub id: String,
     pub ordinal: u64,
+    /// Whether this card can be safely merged with the immediately preceding card in the current
+    /// timeline page. Incremental timelines can intentionally retain an older-run prefix, so a
+    /// visually adjacent cross-run pair must fail closed until a full local rebuild materializes
+    /// one complete run.
+    pub can_merge_with_previous: bool,
     pub label: MomentLabelView,
     pub captured_from: Option<String>,
     pub captured_to: Option<String>,
@@ -922,10 +957,21 @@ pub fn load_moment_timeline(
         .as_ref()
         .map(|timeline| timeline.ungrouped_count)
         .unwrap_or(0);
+    let mut previous_run_id: Option<&str> = None;
     let moments = page
         .moments
         .iter()
-        .map(|row| moment_summary_view(repository, project_id, row, preview_cache_root))
+        .map(|row| {
+            let can_merge_with_previous = previous_run_id == Some(row.run_id.as_str());
+            previous_run_id = Some(row.run_id.as_str());
+            moment_summary_view(
+                repository,
+                project_id,
+                row,
+                preview_cache_root,
+                can_merge_with_previous,
+            )
+        })
         .collect::<PersistenceResult<Vec<_>>>()?;
     let clock_diagnostics = repository
         .latest_camera_clock_offset_diagnostics(project_id)?
@@ -1176,7 +1222,13 @@ fn search_moments_with_provider(
         .take(limit)
         .filter_map(|ranked| candidates_by_id.remove(&ranked.asset_id))
         .map(|candidate| {
-            moment_summary_view(repository, project_id, &candidate.row, preview_cache_root)
+            moment_summary_view(
+                repository,
+                project_id,
+                &candidate.row,
+                preview_cache_root,
+                false,
+            )
         })
         .collect::<PersistenceResult<Vec<_>>>()?;
     Ok(MomentSearchResponse {
@@ -1206,8 +1258,13 @@ pub fn load_moment_detail(
     let Some(detail) = repository.moment_detail(project_id, moment_id)? else {
         return Ok(None);
     };
-    let mut summary =
-        moment_summary_view(repository, project_id, &detail.moment, preview_cache_root)?;
+    let mut summary = moment_summary_view(
+        repository,
+        project_id,
+        &detail.moment,
+        preview_cache_root,
+        false,
+    )?;
     summary.label.evidence = detail.label_evidence;
     let boundaries = summary
         .boundary_before
@@ -1780,14 +1837,30 @@ fn fail_moment_analysis(
     on_progress: &mut impl FnMut(&MomentAnalysisProgress),
     message: String,
 ) -> PersistenceResult<MomentAnalysisProgress> {
+    let persistence_failed = message.starts_with("Local Moment projection could not be saved:");
+    let user_message = if persistence_failed {
+        if timeline.is_some_and(|timeline| timeline.state == "ready") {
+            "Timeline update could not be saved. Your previous timeline is still available."
+                .to_owned()
+        } else {
+            "Timeline update could not be saved. No previous timeline was available.".to_owned()
+        }
+    } else {
+        message.clone()
+    };
     job.state = WorkflowRunState::Failed;
     job.error_count = job.error_count.saturating_add(1);
+    // Keep the exact storage failure in durable local developer diagnostics, but never make a
+    // raw SQLite exception the primary timeline message. The prior projection is untouched
+    // because its replacement transaction has already rolled back.
     job.error_message = Some(message.clone());
     job.updated_at = Utc::now();
     job.finished_at = Some(job.updated_at);
-    let progress = moment_progress(Some(job), timeline, Some(message));
+    let progress = moment_progress(Some(job), timeline, Some(user_message.clone()));
     job.resume_metadata = Some(serde_json::json!({
         "pipeline": "moment-analysis",
+        "user_message": user_message,
+        "developer_details": message,
         "summary": &progress,
     }));
     repository.update_background_job(job)?;
@@ -2538,6 +2611,11 @@ fn moment_progress(
         .unwrap_or("balanced")
         .to_owned();
     let timeline_ready = timeline.is_some_and(|timeline| timeline.state == "ready");
+    let persisted_user_message = job
+        .and_then(|job| job.resume_metadata.as_ref())
+        .and_then(|metadata| metadata.get("user_message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     MomentAnalysisProgress {
         active: state == "running" || state == "queued",
         paused: state == "paused",
@@ -2548,7 +2626,7 @@ fn moment_progress(
         moment_count: timeline.map(|timeline| timeline.moment_count).unwrap_or(0),
         ungrouped_asset_count: timeline.map(|timeline| timeline.ungrouped_count).unwrap_or(0),
         last_error: job.and_then(|job| job.error_message.clone()),
-        message: message.or_else(|| {
+        message: message.or(persisted_user_message).or_else(|| {
             if timeline_ready {
                 Some("Local structural timeline is ready. Human overrides remain separate and protected.".into())
             } else if state == "idle" {
@@ -2568,6 +2646,7 @@ fn moment_summary_view(
     project_id: &ProjectId,
     row: &persistence::MomentTimelineRow,
     preview_cache_root: &Path,
+    can_merge_with_previous: bool,
 ) -> PersistenceResult<MomentSummaryView> {
     let (source, strength) = if row.human_label.is_some() {
         ("human".into(), "strong".into())
@@ -2626,6 +2705,7 @@ fn moment_summary_view(
     Ok(MomentSummaryView {
         id: row.id.clone(),
         ordinal: row.ordinal,
+        can_merge_with_previous,
         label: MomentLabelView {
             display_label: row.display_label.clone(),
             ai_suggested_label: row.suggested_label.clone(),
@@ -4631,6 +4711,1479 @@ pub fn load_culling_progress(
     project_id: &ProjectId,
 ) -> PersistenceResult<CullingProgress> {
     repository.culling_progress(project_id)
+}
+
+/// Reads only a compact persisted Studio Brain status. It does not materialize historical
+/// examples, load an artifact, or start training, so opening a project remains nonblocking.
+pub fn load_studio_brain_status(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+) -> PersistenceResult<StudioBrainProjectStatus> {
+    repository.studio_brain_project_status(project_id)
+}
+
+pub fn set_studio_brain_project_included(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    included: bool,
+) -> PersistenceResult<StudioBrainProjectStatus> {
+    let profile_id = repository.ensure_default_studio_profile()?;
+    repository.set_project_training_included(&profile_id, project_id, included)?;
+    repository.studio_brain_project_status(project_id)
+}
+
+pub fn set_studio_brain_enabled(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    enabled: bool,
+) -> PersistenceResult<StudioBrainProjectStatus> {
+    let profile_id = repository.ensure_default_studio_profile()?;
+    repository.set_studio_personalization_enabled(&profile_id, enabled)?;
+    repository.studio_brain_project_status(project_id)
+}
+
+/// Removes only derived local models and recommendations. This intentionally leaves every
+/// culling decision, rating, star, representative, Moment, preview, and source file untouched.
+pub fn reset_studio_brain_personalization(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+) -> PersistenceResult<StudioBrainProjectStatus> {
+    let profile_id = repository.ensure_default_studio_profile()?;
+    repository.reset_studio_personalization(&profile_id)?;
+    repository.studio_brain_project_status(project_id)
+}
+
+/// Runs one explicit local retrain. The desktop calls this from a separate SQLite connection and
+/// background worker; this function never opens original media or calls a network service.
+pub fn train_studio_brain(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    mut on_progress: impl FnMut(&StudioBrainProgress),
+) -> PersistenceResult<StudioBrainProgress> {
+    let initial_status = repository.studio_brain_project_status(project_id)?;
+    let profile_id = initial_status.profile_id.clone();
+    let started_at = Utc::now();
+    let mut job = BackgroundJob {
+        id: JobId::new(),
+        state: WorkflowRunState::Running,
+        stage: JobStage::StudioTraining,
+        items_completed: 0,
+        items_total: None,
+        files_discovered: 0,
+        files_processed: 0,
+        error_count: 0,
+        project_id: Some(project_id.clone()),
+        index_root_id: None,
+        error_message: None,
+        resume_metadata: Some(serde_json::json!({
+            "pipeline": "studio-training",
+            "profile_id": &profile_id,
+            "mode": "explicit_local_retrain",
+        })),
+        created_at: started_at,
+        updated_at: started_at,
+        finished_at: None,
+    };
+    repository.insert_background_job(&job)?;
+    on_progress(&studio_progress(
+        &profile_id,
+        "training",
+        true,
+        "materialize_history",
+        0,
+        0,
+        0,
+        initial_status.active_model_version.clone(),
+        Some("Preparing an explicit local snapshot of eligible human decisions.".into()),
+        None,
+    ));
+
+    // Historical materialization is deliberately tied to this explicit action rather than status
+    // loading. Its idempotent source IDs prevent a model retry from duplicating human evidence.
+    if let Err(error) = repository.materialize_historical_studio_training_examples(&profile_id) {
+        return finish_pre_run_studio_training(
+            repository,
+            &mut job,
+            &profile_id,
+            initial_status.active_model_version,
+            error.to_string(),
+            &mut on_progress,
+        );
+    }
+    let (examples, pairwise_records, source_revision) =
+        match studio_training_source_snapshot(repository, &profile_id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return finish_pre_run_studio_training(
+                    repository,
+                    &mut job,
+                    &profile_id,
+                    initial_status.active_model_version,
+                    error.to_string(),
+                    &mut on_progress,
+                );
+            }
+        };
+    let observations = examples
+        .iter()
+        .filter_map(studio_training_observation)
+        .collect::<Vec<_>>();
+    // Relative representative evidence is a separate human signal. It is never synthesized from
+    // generic technical rankings and never changes Similar Set membership or culling labels.
+    let pairwise_preferences = pairwise_records
+        .iter()
+        .filter_map(studio_pairwise_preference)
+        .collect::<Vec<_>>();
+    let config = StudioTrainingConfig::default();
+    let snapshot_hash = match studio_training_snapshot_hash(&observations, &pairwise_preferences) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return finish_pre_run_studio_training(
+                repository,
+                &mut job,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    };
+    job.items_total = Some(examples.len() as u64);
+    job.files_discovered = examples.len() as u64;
+    job.updated_at = Utc::now();
+    if let Err(error) = repository.update_background_job(&job) {
+        return finish_pre_run_studio_training(
+            repository,
+            &mut job,
+            &profile_id,
+            initial_status.active_model_version,
+            error.to_string(),
+            &mut on_progress,
+        );
+    }
+    // Keep a verified prior artifact in memory only long enough to compare it on this exact
+    // frozen holdout. It is never retrained, mutated, or exposed as source data.
+    let previous_active_model = match repository.active_studio_model(&profile_id) {
+        Ok(model) => model,
+        Err(error) => {
+            return finish_pre_run_studio_training(
+                repository,
+                &mut job,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    };
+    let parameters_json = match serde_json::to_value(&config) {
+        Ok(value) => value,
+        Err(error) => {
+            return finish_pre_run_studio_training(
+                repository,
+                &mut job,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    };
+    let mut run = StudioTrainingRunRecord {
+        id: Uuid::new_v4().to_string(),
+        profile_id: profile_id.clone(),
+        background_job_id: job.id.to_string(),
+        algorithm: "regularized_linear_softmax".into(),
+        algorithm_version: STUDIO_BRAIN_ALGORITHM_VERSION.into(),
+        feature_schema_version: STUDIO_BRAIN_FEATURE_SCHEMA_VERSION.into(),
+        parameters_json,
+        snapshot_hash,
+        snapshot_count: examples.len() as u64,
+        previous_active_model_id: previous_active_model.as_ref().map(|model| model.id.clone()),
+        state: "training".into(),
+        error_message: None,
+        created_at: started_at.to_rfc3339(),
+        updated_at: Utc::now().to_rfc3339(),
+        finished_at: None,
+    };
+    if let Err(error) = repository.create_studio_training_run(&run) {
+        return finish_pre_run_studio_training(
+            repository,
+            &mut job,
+            &profile_id,
+            initial_status.active_model_version,
+            error.to_string(),
+            &mut on_progress,
+        );
+    }
+    let previous_active_artifact = match previous_active_model.as_ref() {
+        Some(model) => match serde_json::to_string(&model.artifact_json)
+            .map_err(PersistenceError::from)
+            .and_then(|artifact_json| {
+                decode_verified_model_artifact(&VerifiedModelArtifact {
+                    artifact_json,
+                    checksum: model.checksum.clone(),
+                })
+                .map_err(|error| PersistenceError::InvalidData(error.to_string()))
+            }) {
+            Ok(artifact) => Some(artifact),
+            Err(error) => {
+                return finish_failed_studio_training(
+                    repository,
+                    &mut job,
+                    &mut run,
+                    &profile_id,
+                    initial_status.active_model_version,
+                    error.to_string(),
+                    &mut on_progress,
+                );
+            }
+        },
+        None => None,
+    };
+    for (index, example) in examples.iter().enumerate() {
+        let split = studio_snapshot_split(&examples, index, &config);
+        let label = studio_decision_label(example).map(studio_decision_value_name);
+        if let Err(error) = repository.store_studio_training_snapshot(
+            &run.id,
+            &example.id,
+            split,
+            &example.feature_snapshot_json,
+            label,
+        ) {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    }
+    on_progress(&studio_progress(
+        &profile_id,
+        "training",
+        true,
+        "fit_local_model",
+        observations.len() as u64,
+        examples.len() as u64,
+        0,
+        initial_status.active_model_version.clone(),
+        Some("Training a compact local model from explicit human decisions only.".into()),
+        None,
+    ));
+
+    let result = match train_studio_model(&observations, &pairwise_preferences, &config) {
+        Ok(result) => result,
+        Err(error) => {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    };
+    let readiness_json = match serde_json::to_value(&result.readiness) {
+        Ok(value) => value,
+        Err(error) => {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    };
+    let readiness_state = studio_training_status_name(result.readiness.status);
+    job.items_completed = examples.len() as u64;
+    job.files_processed = examples.len() as u64;
+    job.stage = JobStage::StudioEvaluation;
+    job.updated_at = Utc::now();
+    if let Err(error) = repository.update_background_job(&job) {
+        return finish_failed_studio_training(
+            repository,
+            &mut job,
+            &mut run,
+            &profile_id,
+            initial_status.active_model_version,
+            error.to_string(),
+            &mut on_progress,
+        );
+    }
+    on_progress(&studio_progress(
+        &profile_id,
+        "evaluating",
+        true,
+        "leakage_aware_evaluation",
+        examples.len() as u64,
+        examples.len() as u64,
+        0,
+        initial_status.active_model_version.clone(),
+        Some("Checking grouped held-out evidence and calibration before any candidate can become active.".into()),
+        None,
+    ));
+
+    let Some(artifact) = result
+        .artifact
+        .filter(|_| result.readiness.status == StudioTrainingStatus::Ready)
+    else {
+        run.state = "not_activated".into();
+        run.updated_at = Utc::now().to_rfc3339();
+        run.finished_at = Some(run.updated_at.clone());
+        if let Err(error) = repository.update_studio_training_run(&run) {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+        if let Err(error) = repository.update_studio_profile_training_state(
+            &profile_id,
+            readiness_state,
+            &readiness_json,
+            None,
+        ) {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+        job.state = WorkflowRunState::Completed;
+        job.stage = JobStage::Finalize;
+        job.updated_at = Utc::now();
+        job.finished_at = Some(job.updated_at);
+        job.resume_metadata = Some(serde_json::json!({
+            "pipeline": "studio-training", "profile_id": &profile_id,
+            "summary": "No candidate was activated because local readiness conditions were not met.",
+            "readiness": &readiness_json,
+        }));
+        if let Err(error) = repository.update_background_job(&job) {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+        let progress = studio_progress(
+            &profile_id,
+            readiness_state,
+            false,
+            "complete",
+            examples.len() as u64,
+            examples.len() as u64,
+            0,
+            initial_status.active_model_version,
+            Some(result.readiness.message),
+            None,
+        );
+        on_progress(&progress);
+        return Ok(progress);
+    };
+
+    // A ready candidate still cannot displace a retained model merely because it passed an
+    // absolute threshold. Compare both artifacts on the exact same grouped current snapshot.
+    // If comparison is unavailable, stay conservative: the candidate remains unactivated.
+    if let Some(previous_artifact) = previous_active_artifact {
+        let candidate_evaluation =
+            match evaluate_studio_model_on_observations(&artifact, &observations, &config) {
+                Ok(evaluation) => evaluation,
+                Err(error) => {
+                    return finish_failed_studio_training(
+                        repository,
+                        &mut job,
+                        &mut run,
+                        &profile_id,
+                        initial_status.active_model_version,
+                        error.to_string(),
+                        &mut on_progress,
+                    );
+                }
+            };
+        let previous_evaluation =
+            match evaluate_studio_model_on_observations(&previous_artifact, &observations, &config)
+            {
+                Ok(evaluation) => evaluation,
+                Err(error) => {
+                    return finish_failed_studio_training(
+                        repository,
+                        &mut job,
+                        &mut run,
+                        &profile_id,
+                        initial_status.active_model_version,
+                        error.to_string(),
+                        &mut on_progress,
+                    );
+                }
+            };
+        if let Some(reason) = studio_candidate_rejection_reason(
+            &candidate_evaluation,
+            &previous_evaluation,
+            config.minimum_validation_examples,
+        ) {
+            return finish_rejected_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                &reason,
+                &mut on_progress,
+            );
+        }
+    }
+
+    // Safe structured JSON and checksum validation happen before persistence and again before
+    // activation. A malformed/corrupt candidate cannot replace a known-good active model.
+    let encoded = match encode_verified_model_artifact(&artifact) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            )
+        }
+    };
+    if let Err(error) = decode_verified_model_artifact(&encoded) {
+        return finish_failed_studio_training(
+            repository,
+            &mut job,
+            &mut run,
+            &profile_id,
+            initial_status.active_model_version,
+            error.to_string(),
+            &mut on_progress,
+        );
+    }
+    run.state = "persisting".into();
+    run.updated_at = Utc::now().to_rfc3339();
+    if let Err(error) = repository.update_studio_training_run(&run) {
+        return finish_failed_studio_training(
+            repository,
+            &mut job,
+            &mut run,
+            &profile_id,
+            initial_status.active_model_version,
+            error.to_string(),
+            &mut on_progress,
+        );
+    }
+    let model_id = Uuid::new_v4().to_string();
+    let artifact_json = match serde_json::from_str::<serde_json::Value>(&encoded.artifact_json) {
+        Ok(value) => value,
+        Err(error) => {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            )
+        }
+    };
+    let metrics = serde_json::json!({
+        "readiness": &result.readiness,
+        "evaluation": &result.evaluation,
+        "pairwise": &result.pairwise_summary,
+        "diagnostics": &result.diagnostics,
+        "calibration": artifact.calibration,
+    });
+    let model = StudioModelRecord {
+        id: model_id.clone(),
+        profile_id: profile_id.clone(),
+        training_run_id: run.id.clone(),
+        algorithm: "regularized_linear_softmax".into(),
+        model_version: format!("studio-brain-v1-{}", &run.id[..8]),
+        feature_schema_version: STUDIO_BRAIN_FEATURE_SCHEMA_VERSION.into(),
+        artifact_json,
+        checksum: encoded.checksum,
+        artifact_size_bytes: encoded.artifact_json.len() as u64,
+        state: "candidate".into(),
+        metrics_json: metrics,
+        created_at: Utc::now().to_rfc3339(),
+        activated_at: None,
+    };
+    if let Err(error) = repository.store_studio_model(&model) {
+        return finish_failed_studio_training(
+            repository,
+            &mut job,
+            &mut run,
+            &profile_id,
+            initial_status.active_model_version,
+            error.to_string(),
+            &mut on_progress,
+        );
+    }
+    // Candidate recommendations are computed and persisted while the prior model remains active.
+    // Cached candidate rows are invisible until the final atomic activation transaction succeeds.
+    let recommendations = match studio_recommendations_for_project(
+        repository,
+        project_id,
+        &profile_id,
+        &model,
+        &artifact,
+        &config,
+    ) {
+        Ok(recommendations) => recommendations,
+        Err(error) => {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            )
+        }
+    };
+    if let Err(error) = repository.replace_studio_recommendations(
+        &profile_id,
+        &model_id,
+        project_id,
+        &recommendations,
+    ) {
+        return finish_failed_studio_training(
+            repository,
+            &mut job,
+            &mut run,
+            &profile_id,
+            initial_status.active_model_version,
+            error.to_string(),
+            &mut on_progress,
+        );
+    }
+    // Review continues while a compact candidate trains. If a new eligible explicit decision
+    // arrived, the candidate's snapshot is no longer the one the user asked to evaluate, so it
+    // stays inactive and the next explicit update starts from a fresh immutable snapshot.
+    let current_examples = match repository.studio_training_examples(&profile_id) {
+        Ok(examples) => examples,
+        Err(error) => {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    };
+    let current_observations = current_examples
+        .iter()
+        .filter_map(studio_training_observation)
+        .collect::<Vec<_>>();
+    let current_pairwise_preferences = match repository.studio_pairwise_preferences(&profile_id) {
+        Ok(preferences) => preferences
+            .iter()
+            .filter_map(studio_pairwise_preference)
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    };
+    let current_snapshot_hash =
+        match studio_training_snapshot_hash(&current_observations, &current_pairwise_preferences) {
+            Ok(hash) => hash,
+            Err(error) => {
+                return finish_failed_studio_training(
+                    repository,
+                    &mut job,
+                    &mut run,
+                    &profile_id,
+                    initial_status.active_model_version,
+                    error.to_string(),
+                    &mut on_progress,
+                );
+            }
+        };
+    if current_snapshot_hash != run.snapshot_hash {
+        return finish_stale_studio_training(
+            repository,
+            &mut job,
+            &mut run,
+            &profile_id,
+            initial_status.active_model_version,
+            &mut on_progress,
+        );
+    }
+    job.state = WorkflowRunState::Completed;
+    job.stage = JobStage::Finalize;
+    job.updated_at = Utc::now();
+    job.finished_at = Some(job.updated_at);
+    job.resume_metadata = Some(serde_json::json!({
+        "pipeline": "studio-training", "profile_id": &profile_id, "model_id": &model_id,
+        "readiness": &readiness_json,
+    }));
+    // The model, run, profile, recommendation visibility, audit events, and terminal job state
+    // change together. Once this succeeds there is no later fallible write that could falsely
+    // tell the UI that the retained model is still active.
+    match repository.activate_studio_model(&profile_id, &model_id, source_revision, &job) {
+        Ok(StudioModelActivationOutcome::Activated) => {}
+        Ok(StudioModelActivationOutcome::SourceSnapshotStale) => {
+            return finish_stale_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                &mut on_progress,
+            );
+        }
+        Err(error) => {
+            return finish_failed_studio_training(
+                repository,
+                &mut job,
+                &mut run,
+                &profile_id,
+                initial_status.active_model_version,
+                error.to_string(),
+                &mut on_progress,
+            );
+        }
+    }
+    let progress = studio_progress(
+        &profile_id,
+        "ready",
+        false,
+        "complete",
+        examples.len() as u64,
+        examples.len() as u64,
+        0,
+        Some(model.model_version),
+        Some("A checked local candidate was activated. Recommendations remain advisory and never change your decisions.".into()),
+        None,
+    );
+    on_progress(&progress);
+    Ok(progress)
+}
+
+pub fn recover_interrupted_studio_training(
+    repository: &impl CatalogRepository,
+) -> PersistenceResult<u64> {
+    repository.recover_interrupted_studio_training()
+}
+
+// This constructs the public progress contract explicitly so every terminal and intermediate
+// state carries the same complete, non-inferred evidence to the desktop boundary.
+#[allow(clippy::too_many_arguments)]
+fn studio_progress(
+    profile_id: &str,
+    state: &str,
+    active: bool,
+    stage: &str,
+    completed: u64,
+    total: u64,
+    error_count: u64,
+    active_model_version: Option<String>,
+    message: Option<String>,
+    last_error: Option<String>,
+) -> StudioBrainProgress {
+    StudioBrainProgress {
+        profile_id: profile_id.into(),
+        state: state.into(),
+        active,
+        stage: stage.into(),
+        completed,
+        total,
+        error_count,
+        active_model_version,
+        message,
+        last_error,
+    }
+}
+
+fn studio_training_snapshot_hash(
+    observations: &[TrainingObservation],
+    pairwise_preferences: &[PairwisePreference],
+) -> PersistenceResult<String> {
+    Ok(blake3::hash(&serde_json::to_vec(&serde_json::json!({
+        "observations": observations,
+        "pairwisePreferences": pairwise_preferences,
+    }))?)
+    .to_hex()
+    .to_string())
+}
+
+/// Reads a bounded training snapshot only when the explicit-source generation is stable. The
+/// later activation transaction rechecks the same revision, closing both the normal read race
+/// and the final check-to-activation race without blocking human review for training.
+fn studio_training_source_snapshot(
+    repository: &impl CatalogRepository,
+    profile_id: &str,
+) -> PersistenceResult<(
+    Vec<StudioTrainingExampleRecord>,
+    Vec<StudioPairwisePreferenceRecord>,
+    u64,
+)> {
+    for _ in 0..2 {
+        let before = repository.studio_training_source_state(profile_id)?;
+        if before.materialization_pending {
+            continue;
+        }
+        let examples = repository.studio_training_examples(profile_id)?;
+        let preferences = repository.studio_pairwise_preferences(profile_id)?;
+        let after = repository.studio_training_source_state(profile_id)?;
+        if !after.materialization_pending && before.revision == after.revision {
+            return Ok((examples, preferences, after.revision));
+        }
+    }
+    Err(PersistenceError::InvalidData(
+        "Explicit Studio Brain sources are still being recorded locally; run the update again when review activity settles."
+            .into(),
+    ))
+}
+
+fn finish_stale_studio_training(
+    repository: &impl CatalogRepository,
+    job: &mut BackgroundJob,
+    run: &mut StudioTrainingRunRecord,
+    profile_id: &str,
+    active_model_version: Option<String>,
+    on_progress: &mut impl FnMut(&StudioBrainProgress),
+) -> PersistenceResult<StudioBrainProgress> {
+    let has_previous_model = active_model_version.is_some();
+    run.state = "not_activated".into();
+    run.error_message = Some(
+        "New eligible human decisions were recorded while this Studio Brain candidate trained."
+            .into(),
+    );
+    run.updated_at = Utc::now().to_rfc3339();
+    run.finished_at = Some(run.updated_at.clone());
+    repository.update_studio_training_run(run)?;
+    let status = if has_previous_model {
+        "stale"
+    } else {
+        "learning"
+    };
+    repository.update_studio_profile_training_state(
+        profile_id,
+        status,
+        &serde_json::json!({
+            "state": status,
+            "reasons": [
+                "New explicit decisions arrived during training, so the candidate was not activated.",
+                "Run an explicit Studio Brain update to evaluate a fresh local snapshot."
+            ]
+        }),
+        None,
+    )?;
+    job.state = WorkflowRunState::Completed;
+    job.stage = JobStage::Finalize;
+    job.updated_at = Utc::now();
+    job.finished_at = Some(job.updated_at);
+    job.resume_metadata = Some(serde_json::json!({
+        "pipeline": "studio-training",
+        "profile_id": profile_id,
+        "summary": "Candidate not activated because new explicit local decisions arrived.",
+    }));
+    repository.update_background_job(job)?;
+    let progress = studio_progress(
+        profile_id,
+        status,
+        false,
+        "complete",
+        job.items_completed,
+        job.items_total.unwrap_or(0),
+        0,
+        active_model_version,
+        Some(
+            "New explicit decisions arrived while Studio Brain was updating. The candidate was not activated; update again when ready."
+                .into(),
+        ),
+        None,
+    );
+    on_progress(&progress);
+    Ok(progress)
+}
+
+fn studio_training_status_name(status: StudioTrainingStatus) -> &'static str {
+    match status {
+        StudioTrainingStatus::NotReady => "not_ready",
+        StudioTrainingStatus::Learning => "learning",
+        StudioTrainingStatus::Ready => "ready",
+        StudioTrainingStatus::Stale => "stale",
+        StudioTrainingStatus::Error => "error",
+    }
+}
+
+fn studio_decision_label(example: &StudioTrainingExampleRecord) -> Option<StudioHumanDecision> {
+    if example.decision_type != "culling_decision" || !example.training_eligible {
+        return None;
+    }
+    match example.decision_value.as_deref() {
+        Some("keep") => Some(StudioHumanDecision::Keep),
+        Some("review") => Some(StudioHumanDecision::Review),
+        Some("reject") => Some(StudioHumanDecision::Reject),
+        _ => None,
+    }
+}
+
+fn studio_decision_value_name(value: StudioHumanDecision) -> &'static str {
+    match value {
+        StudioHumanDecision::Keep => "keep",
+        StudioHumanDecision::Review => "review",
+        StudioHumanDecision::Reject => "reject",
+    }
+}
+
+fn studio_training_observation(
+    example: &StudioTrainingExampleRecord,
+) -> Option<TrainingObservation> {
+    if example.feature_schema_version != STUDIO_BRAIN_FEATURE_SCHEMA_VERSION
+        || example
+            .feature_snapshot_json
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_str)
+            != Some(STUDIO_BRAIN_FEATURE_SCHEMA_VERSION)
+    {
+        // Persisted snapshots are immutable provenance. A future feature change must perform an
+        // explicit migration/backfill rather than silently parsing an old shape as new inputs.
+        return None;
+    }
+    let decision = studio_decision_label(example)?;
+    let asset_id = example.media_asset_id.clone()?;
+    let occurred_at_unix_ms = DateTime::parse_from_rfc3339(&example.occurred_at)
+        .map(|value| value.timestamp_millis())
+        .unwrap_or(0);
+    Some(TrainingObservation {
+        observation_id: example.id.clone(),
+        project_id: example.project_id.clone(),
+        asset_id,
+        decision,
+        action_kind: if example.provenance == "historical_backfill" {
+            ExplicitHumanActionKind::BackfilledExplicitDecision
+        } else {
+            ExplicitHumanActionKind::CullingDecision
+        },
+        occurred_at_unix_ms,
+        // Capture time is used only for leakage-aware fallback grouping. It is not a preference
+        // feature and missing/invalid timestamps remain unavailable rather than invented.
+        captured_at_unix_ms: example
+            .feature_snapshot_json
+            .get("capturedAt")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp_millis()),
+        review_session_id: example.review_session_id.clone(),
+        similarity_set_id: example.similarity_group_id.clone(),
+        moment_id: example.moment_id.clone(),
+        // The legacy UI did not record presentation state; unknown is intentionally not promoted
+        // to `shown`. The flag is provenance only and never enters feature assembly.
+        recommendation_was_shown: example.recommendation_shown == "shown",
+        generic_recommendation_at_decision: studio_generic_recommendation(
+            &example.generic_recommendation_json,
+        ),
+        auxiliary_human_signals: AuxiliaryHumanSignals::default(),
+        features: studio_feature_input(&example.feature_snapshot_json),
+        training_eligible: example.training_eligible,
+    })
+}
+
+fn studio_pairwise_preference(
+    preference: &StudioPairwisePreferenceRecord,
+) -> Option<PairwisePreference> {
+    let has_current_schema = |snapshot: &serde_json::Value| {
+        snapshot
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_str)
+            == Some(STUDIO_BRAIN_FEATURE_SCHEMA_VERSION)
+    };
+    if !has_current_schema(&preference.chosen_feature_snapshot_json)
+        || !has_current_schema(&preference.alternative_feature_snapshot_json)
+    {
+        return None;
+    }
+    let occurred_at_unix_ms = DateTime::parse_from_rfc3339(&preference.occurred_at)
+        .map(|value| value.timestamp_millis())
+        .unwrap_or(0);
+    if preference.chosen_asset_id == preference.alternative_asset_id {
+        return None;
+    }
+    Some(PairwisePreference {
+        preference_id: preference.id.clone(),
+        project_id: preference.project_id.clone(),
+        similarity_set_id: preference.similarity_group_id.clone(),
+        chosen_asset_id: preference.chosen_asset_id.clone(),
+        alternative_asset_id: preference.alternative_asset_id.clone(),
+        occurred_at_unix_ms,
+        chosen_features: studio_feature_input(&preference.chosen_feature_snapshot_json),
+        alternative_features: studio_feature_input(&preference.alternative_feature_snapshot_json),
+        training_eligible: preference.training_eligible,
+    })
+}
+
+fn studio_generic_recommendation(value: &serde_json::Value) -> Option<GenericRecommendation> {
+    match value
+        .get("label")
+        .or_else(|| value.get("genericRecommendation"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("strong_candidate") | Some("strong_alternative") | Some("keep") => {
+            Some(GenericRecommendation::Keep)
+        }
+        Some("review") => Some(GenericRecommendation::Review),
+        Some("technical_issue") | Some("probable_duplicate") | Some("reject") => {
+            Some(GenericRecommendation::Reject)
+        }
+        _ => None,
+    }
+}
+
+fn studio_feature_input(value: &serde_json::Value) -> StudioFeatureInput {
+    let technical_score = studio_score(value.get("technicalQualityScore"));
+    let sharpness_score = studio_score(value.get("globalSharpness"));
+    let blur_score = studio_score(value.get("directionalBlurRatio"));
+    let similar_set_size = value
+        .get("similarityGroupSize")
+        .and_then(serde_json::Value::as_u64)
+        .map(|count| count.min(u32::MAX as u64) as u32);
+    let higher_peers = value
+        .get("higherTechnicalPeers")
+        .and_then(serde_json::Value::as_u64);
+    let relative_technical_rank = similar_set_size.zip(higher_peers).map(|(size, higher)| {
+        if size <= 1 {
+            1.0
+        } else {
+            1.0 - (higher as f32 / (size.saturating_sub(1) as f32)).clamp(0.0, 1.0)
+        }
+    });
+    let moment_size = value
+        .get("momentSize")
+        .and_then(serde_json::Value::as_u64)
+        .map(|count| count.min(u32::MAX as u64) as u32);
+    let moment_position = moment_size
+        .zip(
+            value
+                .get("momentOrdinal")
+                .and_then(serde_json::Value::as_i64),
+        )
+        .map(|(size, ordinal)| {
+            if size <= 1 {
+                0.0
+            } else {
+                (ordinal.max(0) as f32 / (size.saturating_sub(1) as f32)).clamp(0.0, 1.0)
+            }
+        });
+    StudioFeatureInput {
+        technical_score,
+        sharpness_score,
+        blur_score,
+        exposure_score: None,
+        anonymous_face_count: value
+            .get("anonymousFaceCount")
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| count.min(u32::MAX as u64) as u32),
+        open_eyes_count: value
+            .get("openEyesCount")
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| count.min(u32::MAX as u64) as u32),
+        similar_set_size,
+        relative_technical_rank,
+        relative_sharpness_rank: None,
+        moment_size,
+        moment_position,
+        timeline_boundary_score: None,
+        generic_recommendation: studio_generic_recommendation(value),
+        is_generic_representative: value
+            .get("isGenericRepresentative")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        is_human_representative: value
+            .get("isHumanRepresentative")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        semantic_evidence_available: value
+            .get("semanticEvidenceAvailable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+fn studio_score(value: Option<&serde_json::Value>) -> Option<f32> {
+    let value = value.and_then(serde_json::Value::as_f64)?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let normalized = if value > 1.0 { value / 100.0 } else { value };
+    (normalized <= 1.0).then_some(normalized as f32)
+}
+
+fn studio_snapshot_split(
+    examples: &[StudioTrainingExampleRecord],
+    index: usize,
+    config: &StudioTrainingConfig,
+) -> &'static str {
+    let example = &examples[index];
+    if studio_decision_label(example).is_none() {
+        return "excluded";
+    }
+    let eligible = examples
+        .iter()
+        .filter(|value| studio_decision_label(value).is_some())
+        .collect::<Vec<_>>();
+    let distinct_projects = eligible
+        .iter()
+        .map(|value| value.project_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let key = studio_snapshot_group_key(example, distinct_projects);
+    let mut keys = eligible
+        .iter()
+        .map(|value| studio_snapshot_group_key(value, distinct_projects))
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    if keys.len() < 2 {
+        return "train";
+    }
+    keys.sort_by_key(|value| {
+        let digest = blake3::hash(value.as_bytes());
+        u64::from_le_bytes(
+            digest.as_bytes()[0..8]
+                .try_into()
+                .expect("blake3 has eight bytes"),
+        )
+    });
+    let validation_groups =
+        ((keys.len() as f32 * config.holdout_fraction).round() as usize).clamp(1, keys.len() - 1);
+    if keys
+        .iter()
+        .take(validation_groups)
+        .any(|candidate| candidate == &key)
+    {
+        "validation"
+    } else {
+        "train"
+    }
+}
+
+/// Keep the persisted run snapshot split identical to the pure model's leakage-aware splitter.
+/// In a single-project history a whole Similar Set, Moment, or capture-day stays together; a
+/// timestamp-less asset remains isolated rather than being grouped optimistically.
+fn studio_snapshot_group_key(
+    example: &StudioTrainingExampleRecord,
+    distinct_projects: usize,
+) -> String {
+    if distinct_projects >= 2 {
+        return format!("project:{}", example.project_id);
+    }
+    if let Some(group) = &example.similarity_group_id {
+        return format!("similar:{group}");
+    }
+    if let Some(moment) = &example.moment_id {
+        return format!("moment:{moment}");
+    }
+    if let Some(day) = example
+        .feature_snapshot_json
+        .get("capturedAt")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis().div_euclid(86_400_000))
+    {
+        return format!("day:{day}");
+    }
+    format!(
+        "asset:{}",
+        example.media_asset_id.as_deref().unwrap_or(&example.id)
+    )
+}
+
+fn studio_recommendations_for_project(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    profile_id: &str,
+    model: &StudioModelRecord,
+    artifact: &studio_brain::StudioModelArtifact,
+    config: &StudioTrainingConfig,
+) -> PersistenceResult<Vec<StudioRecommendationRecord>> {
+    let candidates = repository.studio_feature_candidates(project_id)?;
+    // The pairwise ranker is an entirely separate advisory channel. Its output is stored only as
+    // bounded explanation metadata beside an already-separate Studio recommendation; it never
+    // rewrites a Similar Set's technical or human representative.
+    let mut pairwise_by_asset = HashMap::<String, (usize, f32, Vec<String>)>::new();
+    if artifact.pairwise_ranker.is_some() {
+        let mut by_group = BTreeMap::<String, Vec<&persistence::StudioFeatureCandidate>>::new();
+        for candidate in &candidates {
+            if let Some(group_id) = &candidate.similarity_group_id {
+                by_group
+                    .entry(group_id.clone())
+                    .or_default()
+                    .push(candidate);
+            }
+        }
+        for group in by_group.into_values().filter(|group| group.len() > 1) {
+            let ranked = rank_similar_set(
+                artifact,
+                &group
+                    .iter()
+                    .map(|candidate| SimilarSetCandidate {
+                        asset_id: candidate.media_asset_id.clone(),
+                        features: studio_feature_input(&candidate.feature_snapshot_json),
+                    })
+                    .collect::<Vec<_>>(),
+                config.maximum_explanations,
+            )
+            .map_err(|error| {
+                PersistenceError::InvalidData(format!(
+                    "local Studio Similar Set ranking could not be evaluated: {error}"
+                ))
+            })?;
+            for (index, candidate) in ranked.into_iter().enumerate() {
+                pairwise_by_asset.insert(
+                    candidate.asset_id,
+                    (
+                        index + 1,
+                        candidate.relative_rank_score,
+                        candidate
+                            .explanations
+                            .iter()
+                            .map(studio_pairwise_explanation_factor)
+                            .collect(),
+                    ),
+                );
+            }
+        }
+    }
+    let mut records = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let input = studio_feature_input(&candidate.feature_snapshot_json);
+        let prediction = predict(artifact, &input, config).map_err(|error| {
+            PersistenceError::InvalidData(format!(
+                "local Studio prediction could not be evaluated: {error}"
+            ))
+        })?;
+        let (recommendation, confidence_band) = match prediction.recommendation {
+            Some(StudioHumanDecision::Keep) => (
+                "likely_keep",
+                studio_confidence_band_name(prediction.confidence_band),
+            ),
+            Some(StudioHumanDecision::Review) => (
+                "likely_review",
+                studio_confidence_band_name(prediction.confidence_band),
+            ),
+            Some(StudioHumanDecision::Reject) => (
+                "likely_reject",
+                studio_confidence_band_name(prediction.confidence_band),
+            ),
+            None => ("not_enough_evidence", "unavailable"),
+        };
+        let factors = prediction
+            .explanations
+            .iter()
+            .map(studio_explanation_factor)
+            .collect::<Vec<_>>();
+        let pairwise = pairwise_by_asset.get(&candidate.media_asset_id);
+        records.push(StudioRecommendationRecord {
+            id: Uuid::new_v4().to_string(),
+            profile_id: profile_id.into(),
+            model_id: model.id.clone(),
+            project_id: candidate.project_id,
+            media_asset_id: candidate.media_asset_id,
+            feature_schema_version: STUDIO_BRAIN_FEATURE_SCHEMA_VERSION.into(),
+            feature_fingerprint: candidate.feature_fingerprint,
+            recommendation: recommendation.into(),
+            confidence_band: confidence_band.into(),
+            explanation_json: serde_json::json!({
+                "factors": factors,
+                "similarSetRank": pairwise.map(|value| value.0),
+                "relativeRankScore": pairwise.map(|value| value.1),
+                "pairwiseFactors": pairwise.map(|value| value.2.clone()).unwrap_or_default(),
+            }),
+            generic_recommendation_json: candidate.generic_recommendation_json,
+            agreement: match prediction.generic_agreement {
+                GenericAgreement::Agrees => "agrees",
+                GenericAgreement::Differs => "differs",
+                GenericAgreement::NoGenericRecommendation | GenericAgreement::Abstained => {
+                    "unavailable"
+                }
+            }
+            .into(),
+            generated_at: Utc::now().to_rfc3339(),
+        });
+    }
+    Ok(records)
+}
+
+fn studio_confidence_band_name(value: studio_brain::ConfidenceBand) -> &'static str {
+    match value {
+        studio_brain::ConfidenceBand::High => "high",
+        studio_brain::ConfidenceBand::Moderate => "moderate",
+        studio_brain::ConfidenceBand::Low => "low",
+        studio_brain::ConfidenceBand::Abstain => "unavailable",
+    }
+}
+
+fn studio_explanation_factor(value: &studio_brain::FeatureContribution) -> String {
+    let direction = value.direction.as_str();
+    let subject = match value.feature.as_str() {
+        "technical_score" => "current technical quality evidence",
+        "sharpness_score" => "current sharpness evidence",
+        "blur_score" => "current blur evidence",
+        "anonymous_face_count_capped" => "available anonymous face-count evidence",
+        "open_eyes_fraction" => "available eye-state evidence",
+        "similar_set_size_capped" => "the size of this Similar Set",
+        "relative_technical_rank" => "this frame's technical position within its Similar Set",
+        "relative_sharpness_rank" => "this frame's sharpness position within its Similar Set",
+        "moment_size_capped" | "moment_position" => "its local Moment context",
+        "generic_keep" | "generic_review" | "generic_reject" => {
+            "the separate generic technical recommendation"
+        }
+        "generic_representative" => "the generic Similar Set starting point",
+        "semantic_evidence_available" => "availability of local semantic evidence",
+        _ => "a compact local evidence feature",
+    };
+    format!("{subject} {direction} this advisory result")
+}
+
+fn studio_pairwise_explanation_factor(value: &studio_brain::FeatureContribution) -> String {
+    let subject = match value.feature.as_str() {
+        "technical_score" => "technical quality evidence",
+        "sharpness_score" => "sharpness evidence",
+        "blur_score" => "blur evidence",
+        "anonymous_face_count_capped" => "anonymous face-count evidence",
+        "open_eyes_fraction" => "available eye-state evidence",
+        "relative_technical_rank" => "technical position within this Similar Set",
+        "relative_sharpness_rank" => "sharpness position within this Similar Set",
+        "generic_representative" => "the generic technical starting point",
+        _ => "a compact local comparison feature",
+    };
+    format!(
+        "{subject} {} the non-binding Similar Set order",
+        value.direction
+    )
+}
+
+// These are deliberately small non-inferiority tolerances, not a claim that a decimal change
+// reflects photographer-world quality. Both models are scored on the same frozen, grouped local
+// holdout; a candidate that loses more than either tolerance stays inactive.
+const STUDIO_MAX_VALIDATION_MACRO_F1_DROP: f32 = 0.03;
+const STUDIO_MAX_VALIDATION_BRIER_INCREASE: f32 = 0.03;
+
+fn studio_candidate_rejection_reason(
+    candidate: &studio_brain::EvaluationReport,
+    previous: &studio_brain::EvaluationReport,
+    minimum_validation_examples: usize,
+) -> Option<String> {
+    let (Some(candidate), Some(previous)) = (
+        candidate.personal_model.as_ref(),
+        previous.personal_model.as_ref(),
+    ) else {
+        return Some(
+            "New Studio Brain could not be compared safely with the active model. Previous model remains active."
+                .into(),
+        );
+    };
+    if candidate.sample_count < minimum_validation_examples
+        || previous.sample_count < minimum_validation_examples
+        || candidate.sample_count != previous.sample_count
+    {
+        return Some(
+            "New Studio Brain could not be compared safely with the active model. Previous model remains active."
+                .into(),
+        );
+    }
+    if candidate.macro_f1 + STUDIO_MAX_VALIDATION_MACRO_F1_DROP < previous.macro_f1
+        || candidate.brier_score > previous.brier_score + STUDIO_MAX_VALIDATION_BRIER_INCREASE
+    {
+        return Some(
+            "New Studio Brain did not improve validation performance. Previous model remains active."
+                .into(),
+        );
+    }
+    None
+}
+
+fn finish_rejected_studio_training(
+    repository: &impl CatalogRepository,
+    job: &mut BackgroundJob,
+    run: &mut StudioTrainingRunRecord,
+    profile_id: &str,
+    active_model_version: Option<String>,
+    reason: &str,
+    on_progress: &mut impl FnMut(&StudioBrainProgress),
+) -> PersistenceResult<StudioBrainProgress> {
+    run.state = "not_activated".into();
+    run.error_message = Some(reason.into());
+    run.updated_at = Utc::now().to_rfc3339();
+    run.finished_at = Some(run.updated_at.clone());
+    repository.update_studio_training_run(run)?;
+    repository.update_studio_profile_training_state(
+        profile_id,
+        "stale",
+        &serde_json::json!({
+            "state": "stale",
+            "reasons": [
+                "The new local candidate was not activated after comparison with the retained active model.",
+                reason,
+                "Run another explicit update after more human review if you want to reassess personalization."
+            ]
+        }),
+        None,
+    )?;
+    job.state = WorkflowRunState::Completed;
+    job.stage = JobStage::Finalize;
+    job.updated_at = Utc::now();
+    job.finished_at = Some(job.updated_at);
+    job.resume_metadata = Some(serde_json::json!({
+        "pipeline": "studio-training",
+        "profile_id": profile_id,
+        "summary": reason,
+        "candidateActivated": false,
+        "previousModelRetained": true,
+    }));
+    repository.update_background_job(job)?;
+    let progress = studio_progress(
+        profile_id,
+        "stale",
+        false,
+        "complete",
+        job.items_completed,
+        job.items_total.unwrap_or(0),
+        0,
+        active_model_version,
+        Some(reason.into()),
+        None,
+    );
+    on_progress(&progress);
+    Ok(progress)
+}
+
+/// Covers failures after a durable Studio background job exists but before a training-run row can
+/// reliably represent the failure. It deliberately returns a safe terminal progress projection
+/// rather than leaking a raw repository error into the desktop's last-resort worker path.
+fn finish_pre_run_studio_training(
+    repository: &impl CatalogRepository,
+    job: &mut BackgroundJob,
+    profile_id: &str,
+    active_model_version: Option<String>,
+    diagnostic: String,
+    on_progress: &mut impl FnMut(&StudioBrainProgress),
+) -> PersistenceResult<StudioBrainProgress> {
+    let recovery_message = if active_model_version.is_some() {
+        "Studio Brain update could not be completed. Your previous personalized model is still active."
+    } else {
+        "Studio Brain update could not be completed. No personalized model was activated; generic technical evidence remains available."
+    };
+    let now = Utc::now();
+    job.state = WorkflowRunState::Failed;
+    job.stage = JobStage::Finalize;
+    job.error_count = 1;
+    job.error_message = Some(diagnostic.clone());
+    job.updated_at = now;
+    job.finished_at = Some(now);
+    // Both writes are best effort: this path exists precisely because a prior repository action
+    // failed. The truthful UI result is still preferable to leaving the worker to claim a model
+    // that may not exist; startup recovery handles any unreachable durable job later.
+    let _ = repository.update_studio_profile_training_state(
+        profile_id,
+        "error",
+        &serde_json::json!({
+            "state": "error",
+            "reasons": ["A local Studio Brain update stopped before a training candidate was created."]
+        }),
+        Some(&diagnostic),
+    );
+    let _ = repository.update_background_job(job);
+    let progress = studio_progress(
+        profile_id,
+        "error",
+        false,
+        "complete",
+        job.items_completed,
+        job.items_total.unwrap_or(0),
+        1,
+        active_model_version,
+        Some(recovery_message.into()),
+        Some(diagnostic),
+    );
+    on_progress(&progress);
+    Ok(progress)
+}
+
+fn finish_failed_studio_training(
+    repository: &impl CatalogRepository,
+    job: &mut BackgroundJob,
+    run: &mut StudioTrainingRunRecord,
+    profile_id: &str,
+    active_model_version: Option<String>,
+    diagnostic: String,
+    on_progress: &mut impl FnMut(&StudioBrainProgress),
+) -> PersistenceResult<StudioBrainProgress> {
+    let recovery_message = if active_model_version.is_some() {
+        "Studio Brain update could not be completed. Your previous personalized model is still active."
+    } else {
+        "Studio Brain update could not be completed. No personalized model was activated; generic technical evidence remains available."
+    };
+    run.state = "failed".into();
+    run.error_message = Some(diagnostic.clone());
+    run.updated_at = Utc::now().to_rfc3339();
+    run.finished_at = Some(run.updated_at.clone());
+    repository.update_studio_training_run(run)?;
+    repository.update_studio_profile_training_state(
+        profile_id,
+        "error",
+        &serde_json::json!({"state":"error","reasons":["A local candidate could not be validated or activated. The prior model remains unchanged."]}),
+        Some(&diagnostic),
+    )?;
+    job.state = WorkflowRunState::Failed;
+    job.stage = JobStage::Finalize;
+    job.error_count = 1;
+    job.error_message = Some(diagnostic.clone());
+    job.updated_at = Utc::now();
+    job.finished_at = Some(job.updated_at);
+    repository.update_background_job(job)?;
+    let progress = studio_progress(
+        profile_id,
+        "error",
+        false,
+        "complete",
+        job.items_completed,
+        job.items_total.unwrap_or(0),
+        1,
+        active_model_version,
+        Some(recovery_message.into()),
+        Some(diagnostic),
+    );
+    on_progress(&progress);
+    Ok(progress)
 }
 
 pub fn apply_culling_decision(
@@ -10799,6 +12352,31 @@ mod tests {
             .moments
             .iter()
             .all(|moment| moment.display_label == "Untitled Moment"));
+        let initial_status = repository
+            .moment_timeline_status(&project.id)
+            .unwrap()
+            .unwrap();
+        // A normal Update with no catalog changes is a no-op. Repeating it must neither append
+        // Moments/memberships nor allocate a replacement run.
+        for _ in 0..2 {
+            let unchanged = start_moment_analysis(
+                &repository,
+                &project.id,
+                &unavailable_model,
+                AnalysisResourceMode::Balanced,
+                false,
+                || false,
+                |_| {},
+            )
+            .unwrap();
+            assert!(unchanged.timeline_ready);
+            let status = repository
+                .moment_timeline_status(&project.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.active_run_id, initial_status.active_run_id);
+            assert_eq!(status.moment_count, initial_status.moment_count);
+        }
         let first_moment = initial.moments[0].clone();
         let member_page = repository
             .visual_media_page(
@@ -10820,6 +12398,7 @@ mod tests {
         .unwrap();
         let representative_id =
             MediaAssetId::try_from(member_page.items[0].asset_id.as_str()).unwrap();
+        let representative_id_text = representative_id.to_string();
         set_moment_human_representative(
             &repository,
             &project.id,
@@ -10844,9 +12423,34 @@ mod tests {
             &adjacent.id,
         )
         .unwrap();
+        create_coverage_checklist_item(
+            &repository,
+            &project.id,
+            &CreateCoverageChecklistItemInput {
+                checklist_id: None,
+                phrase: "Photographer-confirmed coverage".into(),
+            },
+        )
+        .unwrap();
+        let checklist_item_id = load_moment_checklists(&repository, &project.id).unwrap()[0].items
+            [0]
+        .id
+        .clone();
+        update_coverage_confirmation(
+            &repository,
+            &project.id,
+            &UpdateCoverageConfirmationInput {
+                checklist_item_id: checklist_item_id.clone(),
+                state: "confirmed_covered".into(),
+                moment_id: Some(first_moment.id.clone()),
+                asset_id: Some(representative_id_text.clone()),
+            },
+        )
+        .unwrap();
 
         // An explicit rebuild reuses only durable local evidence, and must not erase the
-        // photographer's separate label/representative or protected split/merge intent.
+        // photographer's separate label/representative, coverage confirmation, or protected
+        // split/merge intent.
         let rebuilt_progress = start_moment_analysis(
             &repository,
             &project.id,
@@ -10864,6 +12468,71 @@ mod tests {
             .iter()
             .any(|moment| moment.human_label.as_deref() == Some("Photographer's timeline name")));
         assert!(rebuilt
+            .moments
+            .iter()
+            .any(|moment| moment.human_override_present));
+        let rebuilt_checklists = load_moment_checklists(&repository, &project.id).unwrap();
+        let rebuilt_confirmation = rebuilt_checklists[0]
+            .items
+            .iter()
+            .find(|item| item.id == checklist_item_id)
+            .unwrap();
+        assert_eq!(
+            rebuilt_confirmation.state, "confirmed_covered",
+            "a rebuild preserves the photographer's coverage decision"
+        );
+        assert_eq!(
+            rebuilt_confirmation.confirmed_asset_id.as_deref(),
+            Some(representative_id_text.as_str())
+        );
+        let rebuilt_confirmation_moment_id =
+            rebuilt_confirmation.confirmed_moment_id.as_ref().unwrap();
+        assert_ne!(rebuilt_confirmation_moment_id, &first_moment.id);
+        assert!(rebuilt
+            .moments
+            .iter()
+            .any(|moment| &moment.id == rebuilt_confirmation_moment_id));
+        let first_rebuild_run = repository
+            .moment_timeline_status(&project.id)
+            .unwrap()
+            .unwrap()
+            .active_run_id;
+        // Rebuild is deliberately a new immutable analysis run even if source evidence is
+        // unchanged. It replaces only the generated projection; all human authority remains.
+        let rebuilt_twice = start_moment_analysis(
+            &repository,
+            &project.id,
+            &unavailable_model,
+            AnalysisResourceMode::Eco,
+            true,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        assert!(rebuilt_twice.timeline_ready);
+        let second_rebuild_status = repository
+            .moment_timeline_status(&project.id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(second_rebuild_status.active_run_id, first_rebuild_run);
+        assert_eq!(
+            second_rebuild_status.eligible_count,
+            initial_status.eligible_count
+        );
+        let rebuilt_twice_page = repository.moment_timeline_page(&project.id, 20, 0).unwrap();
+        assert_eq!(
+            rebuilt_twice_page
+                .moments
+                .iter()
+                .map(|moment| moment.ordinal)
+                .collect::<Vec<_>>(),
+            (0..rebuilt_twice_page.moments.len() as u64).collect::<Vec<_>>()
+        );
+        assert!(rebuilt_twice_page
+            .moments
+            .iter()
+            .any(|moment| moment.human_label.as_deref() == Some("Photographer's timeline name")));
+        assert!(rebuilt_twice_page
             .moments
             .iter()
             .any(|moment| moment.human_override_present));
@@ -10925,6 +12594,78 @@ mod tests {
                 .len(),
             9
         );
+    }
+
+    #[test]
+    fn m7_persistence_failure_keeps_the_prior_timeline_message_user_safe() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = Project {
+            id: pid(1_180),
+            name: "M7 persistence recovery".into(),
+            created_at: Utc::now(),
+        };
+        repository.insert_project(&project).unwrap();
+        let now = Utc::now();
+        let mut job = BackgroundJob {
+            id: job_id(1_181),
+            state: WorkflowRunState::Running,
+            stage: JobStage::MomentAnalysis,
+            items_completed: 3,
+            items_total: Some(3),
+            files_discovered: 3,
+            files_processed: 3,
+            error_count: 0,
+            project_id: Some(project.id.clone()),
+            index_root_id: None,
+            error_message: None,
+            resume_metadata: Some(serde_json::json!({ "pipeline": "moment-analysis" })),
+            created_at: now,
+            updated_at: now,
+            finished_at: None,
+        };
+        repository.insert_background_job(&job).unwrap();
+        let previous_timeline = MomentTimelineStatusRecord {
+            timeline_id: "m7-recovery-timeline".into(),
+            project_id: project.id.to_string(),
+            state: "ready".into(),
+            analyzer_id: MOMENT_ANALYZER_ID.into(),
+            analyzer_version: "test".into(),
+            boundary_algorithm_version: MOMENT_BOUNDARY_ALGORITHM_VERSION.into(),
+            semantic_model_key: None,
+            input_catalog_version: "test-inputs".into(),
+            active_run_id: Some("m7-previous-run".into()),
+            moment_count: 2,
+            eligible_count: 3,
+            ungrouped_count: 0,
+            updated_at: now.to_rfc3339(),
+        };
+        let raw_detail = "Local Moment projection could not be saved: database error: UNIQUE constraint failed: moment_records.run_id, moment_records.ordinal";
+        let progress = fail_moment_analysis(
+            &repository,
+            &mut job,
+            Some(&previous_timeline),
+            &mut |_| {},
+            raw_detail.into(),
+        )
+        .unwrap();
+        assert_eq!(
+            progress.message.as_deref(),
+            Some("Timeline update could not be saved. Your previous timeline is still available.")
+        );
+        assert_eq!(progress.last_error.as_deref(), Some(raw_detail));
+        let saved = repository.get_background_job(&job.id).unwrap().unwrap();
+        assert_eq!(saved.error_message.as_deref(), Some(raw_detail));
+        assert_eq!(
+            saved
+                .resume_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("user_message"))
+                .and_then(serde_json::Value::as_str),
+            Some("Timeline update could not be saved. Your previous timeline is still available.")
+        );
+        let reloaded = moment_progress(Some(&saved), Some(&previous_timeline), None);
+        assert_eq!(reloaded.message, progress.message);
+        assert_eq!(reloaded.last_error.as_deref(), Some(raw_detail));
     }
 
     #[test]
@@ -11169,5 +12910,53 @@ mod tests {
         assert!(view.summary.contains("did not change any timestamps"));
         assert!(!view.summary.contains("ahead"));
         assert!(!view.summary.contains("behind"));
+    }
+
+    fn m8_evaluation_report(
+        macro_f1: f32,
+        brier_score: f32,
+        sample_count: usize,
+    ) -> studio_brain::EvaluationReport {
+        studio_brain::EvaluationReport {
+            split: studio_brain::HoldoutSplitSummary {
+                strategy: studio_brain::HoldoutStrategy::ProjectHoldout,
+                training_count: 24,
+                validation_count: sample_count,
+                held_out_group_count: 1,
+                notes: vec!["test-only grouped holdout".into()],
+            },
+            personal_model: Some(studio_brain::ClassificationMetrics {
+                sample_count,
+                accuracy: macro_f1,
+                macro_f1,
+                log_loss: 0.4,
+                brier_score,
+                expected_calibration_error: 0.1,
+                confusion: Vec::new(),
+            }),
+            generic_baseline: None,
+            majority_baseline: None,
+            calibration: None,
+            caveats: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn m8_candidate_noninferiority_rejects_regression_and_incomparable_holdouts() {
+        let previous = m8_evaluation_report(0.71, 0.30, 12);
+        let small_non_regression = m8_evaluation_report(0.69, 0.32, 12);
+        assert!(studio_candidate_rejection_reason(&small_non_regression, &previous, 8).is_none());
+
+        let regressed = m8_evaluation_report(0.65, 0.30, 12);
+        assert_eq!(
+            studio_candidate_rejection_reason(&regressed, &previous, 8).as_deref(),
+            Some("New Studio Brain did not improve validation performance. Previous model remains active.")
+        );
+
+        let incomparable = m8_evaluation_report(0.73, 0.28, 7);
+        assert_eq!(
+            studio_candidate_rejection_reason(&incomparable, &previous, 8).as_deref(),
+            Some("New Studio Brain could not be compared safely with the active model. Previous model remains active.")
+        );
     }
 }

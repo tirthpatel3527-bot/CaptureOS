@@ -313,6 +313,7 @@ dependencies = [
  "serde",
  "serde_json",
  "storage",
+ "studio-brain",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
@@ -2831,12 +2832,14 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "persistence"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "capture-graph",
  "chrono",
  "media-model",
  "rusqlite",
  "serde",
  "serde_json",
+ "studio-brain",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
@@ -3944,6 +3947,25 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "studio-brain"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "studio-brain-bench"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "studio-brain",
+]
 
 [[package]]
 name = "swift-rs"

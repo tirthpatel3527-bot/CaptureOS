@@ -1,8 +1,15 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const eventListeners = vi.hoisted(() => new Map<string, (event: { payload: unknown }) => void>());
+
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(vi.fn()) }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async (event: string, callback: (event: { payload: unknown }) => void) => {
+    eventListeners.set(event, callback);
+    return vi.fn();
+  }),
+}));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
@@ -202,6 +209,7 @@ const momentProgress = {
 const firstMoment = {
   id: "moment-1",
   ordinal: 1,
+  canMergeWithPrevious: false,
   label: {
     displayLabel: "Outdoor portraits",
     aiSuggestedLabel: "Outdoor portraits",
@@ -229,6 +237,7 @@ const secondMoment = {
   ...firstMoment,
   id: "moment-2",
   ordinal: 2,
+  canMergeWithPrevious: true,
   label: { ...firstMoment.label, displayLabel: "Untitled Moment", aiSuggestedLabel: null, source: "none", strength: "unavailable", evidence: [] },
   capturedFrom: "2026-01-01T10:18:00Z",
   capturedTo: "2026-01-01T10:22:00Z",
@@ -353,12 +362,29 @@ const aiIngestHistory = [{ id: "ai-job", state: "completed", policy: "standard",
 const blockedPreflight = { canStart: false, report: { sources: [], destinations: [], issues: [{ severity: "error", code: "fixture", message: "Fixture only" }], totalSourceBytes: 0 } };
 const emptyVisual = { items: [], hasMore: false, cacheBytes: 0 };
 const aiHome = { ...home, project: { id: "project-2", name: "AI Test" }, summary: { ...home.summary, mediaAssets: 0, fileInstances: 0, storageVolumes: 0 }, media: [] };
+const studioStatus = {
+  profileId: "studio-profile-1", profileName: "Local Studio Profile", trainingStatus: "learning",
+  personalizationEnabled: true, projectIncluded: true, eligibleDecisionCount: 4,
+  keepCount: 2, reviewCount: 1, rejectCount: 1, ratingCount: 0, starredCount: 0,
+  representativeCount: 0, contributingProjectCount: 1, activeModelVersion: null,
+  lastTrainedAt: null, readiness: { state: "learning", message: "Not enough evidence for personalization." }, lastError: null,
+};
 
 let projectLibrary = [goldenProject];
 let commandOverrides: Record<string, unknown> = {};
 
 function setCommandOverrides(overrides: Record<string, unknown>) {
   commandOverrides = overrides;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 async function renderProject(name = "Golden Wedding") {
@@ -371,6 +397,7 @@ describe("CaptureOS application shell and local media engine", () => {
     window.history.replaceState({}, "", "#/");
     projectLibrary = [goldenProject];
     commandOverrides = {};
+    eventListeners.clear();
     vi.mocked(open).mockReset();
     vi.mocked(invoke).mockReset();
     vi.mocked(invoke).mockImplementation(async (command, args) => {
@@ -393,6 +420,7 @@ describe("CaptureOS application shell and local media engine", () => {
       if (command === "prepare_media_command") return { state: "completed", stage: "finalize", itemsCompleted: 1, itemsTotal: 1, errorCount: 0, message: null };
       if (command === "media_asset_detail_command") return detail;
       if (command === "culling_progress_command") return cullingWorkspace.progress;
+      if (command === "studio_brain_status_command") return studioStatus;
       if (command === "culling_workspace_command") return cullingWorkspace;
       if (command === "update_culling_decision_command") {
         const input = (args as { input: { decision?: string; clearDecision?: boolean; rating?: number; starred?: boolean; note?: string } }).input;
@@ -684,6 +712,134 @@ describe("CaptureOS application shell and local media engine", () => {
     }));
   });
 
+  it("synchronously ignores duplicate Moment update clicks while the request is in flight", async () => {
+    const pendingStart = deferred<typeof momentProgress>();
+    setCommandOverrides({
+      moment_timeline_status: momentProgress,
+      moment_timeline: momentTimeline,
+      moment_checklists: momentChecklists,
+      start_moment_analysis: () => pendingStart.promise,
+    });
+    await renderProject();
+    fireEvent.click(screen.getByRole("button", { name: "Moments" }));
+    await screen.findByText("Outdoor portraits");
+    const update = screen.getByRole("button", { name: "Update timeline" });
+    fireEvent.click(update);
+    fireEvent.click(update);
+    await waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "start_moment_analysis")).toHaveLength(1));
+    expect(screen.getByRole("button", { name: "Rebuild AI timeline" }).hasAttribute("disabled")).toBe(true);
+    await act(async () => {
+      pendingStart.resolve({ ...momentProgress, state: "queued", active: true, message: "Queued local Moment analysis." });
+      await pendingStart.promise;
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Analyzing locally…" }).hasAttribute("disabled")).toBe(true));
+  });
+
+  it("blocks timeline updates while a structural mutation is pending", async () => {
+    const pendingMerge = deferred<void>();
+    setCommandOverrides({
+      moment_timeline_status: momentProgress,
+      moment_timeline: momentTimeline,
+      moment_checklists: momentChecklists,
+      merge_adjacent_moments: () => pendingMerge.promise,
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    try {
+      await renderProject();
+      fireEvent.click(screen.getByRole("button", { name: "Moments" }));
+      await screen.findByText("Outdoor portraits");
+      const merge = screen.getByRole("button", { name: "Merge with previous" });
+      fireEvent.click(merge);
+      fireEvent.click(merge);
+      await waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "merge_adjacent_moments")).toHaveLength(1));
+      expect(screen.getByRole("button", { name: "Update timeline" }).hasAttribute("disabled")).toBe(true);
+      fireEvent.click(screen.getByRole("button", { name: "Update timeline" }));
+      expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "start_moment_analysis")).toHaveLength(0);
+    } finally {
+      await act(async () => {
+        pendingMerge.resolve();
+        await pendingMerge.promise;
+      });
+      confirm.mockRestore();
+    }
+  });
+
+  it("explains why a cross-run Moment boundary must be rebuilt before merging", async () => {
+    setCommandOverrides({
+      moment_timeline_status: momentProgress,
+      moment_timeline: {
+        ...momentTimeline,
+        moments: [
+          firstMoment,
+          { ...secondMoment, canMergeWithPrevious: false },
+        ],
+      },
+      moment_checklists: momentChecklists,
+    });
+    await renderProject();
+    fireEvent.click(screen.getByRole("button", { name: "Moments" }));
+    expect(await screen.findByText("These adjacent Moments are from different local analysis runs. Rebuild AI timeline before merging across this boundary.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Merge with previous" })).toBeNull();
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "merge_adjacent_moments")).toHaveLength(0);
+  });
+
+  it("shows a recoverable Moment persistence failure without placing SQLite text in the primary status", async () => {
+    const sqliteDetail = "database error: UNIQUE constraint failed: moment_records.run_id, moment_records.ordinal";
+    setCommandOverrides({
+      moment_timeline_status: momentProgress,
+      moment_timeline: momentTimeline,
+      moment_checklists: momentChecklists,
+      start_moment_analysis: {
+        ...momentProgress,
+        state: "failed",
+        active: false,
+        lastError: sqliteDetail,
+        message: "Timeline update could not be saved. Your previous timeline is still available.",
+      },
+    });
+    await renderProject();
+    fireEvent.click(screen.getByRole("button", { name: "Moments" }));
+    await screen.findByText("Outdoor portraits");
+    fireEvent.click(screen.getByRole("button", { name: "Update timeline" }));
+    const status = screen.getByRole("status");
+    await waitFor(() => expect(status.textContent).toContain("Your previous timeline is still available."));
+    expect(status.textContent).not.toContain("UNIQUE constraint failed");
+    expect([...document.querySelectorAll("details")].some((details) => details.textContent?.includes(sqliteDetail))).toBe(true);
+    expect(screen.getByText("Developer Details")).toBeTruthy();
+    expect(screen.getByText("Outdoor portraits")).toBeTruthy();
+  });
+
+  it("renders a persisted Moment failure received through the background progress event safely", async () => {
+    const sqliteDetail = "database error: UNIQUE constraint failed: moment_records.run_id, moment_records.ordinal";
+    const failedProgress = {
+      ...momentProgress,
+      state: "failed",
+      active: false,
+      lastError: sqliteDetail,
+      message: "Timeline update could not be saved. Your previous timeline is still available.",
+    };
+    let persistedFailure = false;
+    setCommandOverrides({
+      moment_timeline_status: () => persistedFailure ? failedProgress : momentProgress,
+      moment_timeline: () => ({ ...momentTimeline, progress: persistedFailure ? failedProgress : momentProgress }),
+      moment_checklists: momentChecklists,
+    });
+    await renderProject();
+    fireEvent.click(screen.getByRole("button", { name: "Moments" }));
+    await screen.findByText("Outdoor portraits");
+    await waitFor(() => expect(eventListeners.get("moment-analysis-progress")).toBeDefined());
+    persistedFailure = true;
+    await act(async () => {
+      eventListeners.get("moment-analysis-progress")?.({
+        payload: { projectId: "project-1", progress: failedProgress },
+      });
+    });
+    const status = screen.getByRole("status");
+    await waitFor(() => expect(status.textContent).toContain("Your previous timeline is still available."));
+    expect(status.textContent).not.toContain("UNIQUE constraint failed");
+    expect([...document.querySelectorAll("details")].some((details) => details.textContent?.includes(sqliteDetail))).toBe(true);
+  });
+
   it("keeps Moment-card and checklist candidate retrieval local, scoped, and non-confirming", async () => {
     setCommandOverrides({
       moment_timeline_status: momentProgress,
@@ -839,5 +995,33 @@ describe("CaptureOS application shell and local media engine", () => {
     fireEvent.doubleClick(await screen.findByRole("button", { name: /Open DSC03400.JPG; double click to select for compare/ }));
     expect(await screen.findByRole("button", { name: /Open DSC03400.JPG; Compare selection 1/ })).toBeTruthy();
     expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "update_culling_decision_command")).toHaveLength(decisionCallsBeforeSelection);
+  });
+
+  it("opens Studio Brain in an honest learning state without silently starting training", async () => {
+    await renderProject();
+    await screen.findByText("Local preference learning");
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "start_studio_brain_training_command")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Studio Brain" }));
+    expect(await screen.findByRole("heading", { name: "Learning" })).toBeTruthy();
+    expect(screen.getByText(/4 eligible explicit decisions/)).toBeTruthy();
+    expect(screen.getByText(/never automatically culls/i)).toBeTruthy();
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "start_studio_brain_training_command")).toHaveLength(0);
+  });
+
+  it("queues one explicit Studio Brain train action and never turns it into a culling decision", async () => {
+    setCommandOverrides({
+      start_studio_brain_training_command: {
+        profileId: "studio-profile-1", state: "queued", active: true, stage: "queued", completed: 0,
+        total: 0, errorCount: 0, activeModelVersion: null,
+        message: "Studio Brain training is queued locally and will not block project browsing.", lastError: null,
+      },
+    });
+    await renderProject();
+    fireEvent.click(screen.getByRole("button", { name: "Studio Brain" }));
+    await screen.findByRole("button", { name: "Train Studio Brain" });
+    fireEvent.click(screen.getByRole("button", { name: "Train Studio Brain" }));
+    fireEvent.click(screen.getByRole("button", { name: "Train Studio Brain" }));
+    await waitFor(() => expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "start_studio_brain_training_command")).toHaveLength(1));
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "update_culling_decision_command")).toHaveLength(0);
   });
 });

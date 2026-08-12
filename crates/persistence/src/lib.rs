@@ -3,12 +3,16 @@
 use capture_graph::{EntityRef, Relationship, RelationshipKind};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use media_model::*;
-use rusqlite::{params, Connection, OptionalExtension, Row};
-use std::{collections::BTreeSet, path::Path};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+use studio_brain::{decode_verified_model_artifact, VerifiedModelArtifact};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 18;
 // This is a query-page size, never a catalog/result limit. Moment semantic search continues
 // until its cursor is exhausted so it cannot silently omit a large project's later Moments.
 const MOMENT_SEARCH_ROW_PAGE_SIZE: u32 = 256;
@@ -471,6 +475,9 @@ pub struct CullingMediaRow {
     pub similarity_group_id: Option<String>,
     pub is_ai_representative: bool,
     pub is_human_representative: bool,
+    /// Separate, optional local Studio Brain advice. It never replaces `decision` or generic
+    /// Capture Intelligence evidence.
+    pub studio_brain: Option<StudioRecommendationView>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -507,6 +514,10 @@ pub struct CullingGroupSummary {
     /// `auto_all_reviewed` is derived from decision state; `explicit_user_completion` is the
     /// durable photographer override stored in `group_review_completion`.
     pub completion_kind: Option<String>,
+    /// A non-mutating starting point only when an active local Studio model supplied genuine
+    /// comparable-set evidence. It never changes either representative field above.
+    pub studio_starting_point_asset_id: Option<String>,
+    pub studio_starting_point_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -570,6 +581,168 @@ pub struct PreferenceExampleView {
     pub ai_recommendation: serde_json::Value,
     pub human_decision_context: String,
     pub created_at: String,
+}
+
+/// Local-only, profile-scoped Studio Brain state for a single project. This deliberately keeps
+/// a project's contribution to learning separate from whether that project may *use* an active
+/// local personalization model.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioBrainProjectStatus {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub training_status: String,
+    pub personalization_enabled: bool,
+    pub project_included: bool,
+    pub eligible_decision_count: u64,
+    pub keep_count: u64,
+    pub review_count: u64,
+    pub reject_count: u64,
+    pub rating_count: u64,
+    pub starred_count: u64,
+    pub representative_count: u64,
+    pub contributing_project_count: u64,
+    pub active_model_version: Option<String>,
+    pub last_trained_at: Option<String>,
+    pub readiness: serde_json::Value,
+    pub last_error: Option<String>,
+}
+
+/// An immutable record of an explicit human signal. `feature_snapshot_json` is a compact,
+/// engineered local snapshot; it never contains source paths, note text, raw semantic vectors,
+/// or biometric identity data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StudioTrainingExampleRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub project_id: String,
+    pub media_asset_id: Option<String>,
+    pub source_kind: String,
+    pub source_record_id: String,
+    pub decision_type: String,
+    pub decision_value: Option<String>,
+    pub occurred_at: String,
+    pub review_session_id: Option<String>,
+    pub similarity_group_id: Option<String>,
+    pub moment_id: Option<String>,
+    pub generic_recommendation_json: serde_json::Value,
+    pub studio_recommendation_id_at_decision: Option<String>,
+    pub recommendation_shown: String,
+    pub provenance: String,
+    pub feature_schema_version: String,
+    pub feature_snapshot_json: serde_json::Value,
+    pub training_eligible: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StudioTrainingRunRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub background_job_id: String,
+    pub algorithm: String,
+    pub algorithm_version: String,
+    pub feature_schema_version: String,
+    pub parameters_json: serde_json::Value,
+    pub snapshot_hash: String,
+    pub snapshot_count: u64,
+    pub previous_active_model_id: Option<String>,
+    pub state: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// Activation is distinguishable from an ordinary persistence failure. A source change simply
+/// means the candidate's immutable snapshot is no longer current and must stay inactive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StudioModelActivationOutcome {
+    Activated,
+    SourceSnapshotStale,
+}
+
+/// A bounded read projection used to keep a training snapshot out of an in-progress authoritative
+/// human-action append. It exposes no source content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StudioTrainingSourceState {
+    pub revision: u64,
+    pub materialization_pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StudioModelRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub training_run_id: String,
+    pub algorithm: String,
+    pub model_version: String,
+    pub feature_schema_version: String,
+    pub artifact_json: serde_json::Value,
+    pub checksum: String,
+    pub artifact_size_bytes: u64,
+    pub state: String,
+    pub metrics_json: serde_json::Value,
+    pub created_at: String,
+    pub activated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioRecommendationView {
+    pub recommendation: String,
+    pub confidence_band: String,
+    pub model_version: String,
+    pub explanation_factors: Vec<String>,
+    pub generic_recommendation: Option<String>,
+    pub agreement: String,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StudioRecommendationRecord {
+    pub id: String,
+    pub profile_id: String,
+    pub model_id: String,
+    pub project_id: String,
+    pub media_asset_id: String,
+    pub feature_schema_version: String,
+    pub feature_fingerprint: String,
+    pub recommendation: String,
+    pub confidence_band: String,
+    pub explanation_json: serde_json::Value,
+    pub generic_recommendation_json: serde_json::Value,
+    pub agreement: String,
+    pub generated_at: String,
+}
+
+/// Current compact, local feature candidates used only by Studio Brain orchestration. These are
+/// deliberately engineered summaries rather than semantic embeddings or source-media data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StudioFeatureCandidate {
+    pub project_id: String,
+    pub media_asset_id: String,
+    pub feature_snapshot_json: serde_json::Value,
+    pub feature_fingerprint: String,
+    pub generic_recommendation_json: serde_json::Value,
+    pub similarity_group_id: Option<String>,
+    pub moment_id: Option<String>,
+}
+
+/// An immutable, explicitly human-chosen comparison inside an existing Similar Set. Both
+/// snapshots are bounded evidence from the original representative action; the record never
+/// changes Similar Set membership or reinterprets a generic recommendation as a label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StudioPairwisePreferenceRecord {
+    pub id: String,
+    pub project_id: String,
+    pub similarity_group_id: String,
+    pub chosen_asset_id: String,
+    pub alternative_asset_id: String,
+    pub occurred_at: String,
+    pub chosen_feature_snapshot_json: serde_json::Value,
+    pub alternative_feature_snapshot_json: serde_json::Value,
+    pub training_eligible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -821,6 +994,9 @@ pub struct MomentTimelineStatusRecord {
 #[serde(rename_all = "camelCase")]
 pub struct MomentTimelineRow {
     pub id: String,
+    /// Immutable local-analysis provenance. This stays behind the core boundary and is used
+    /// only to determine whether a structurally safe adjacent merge can be offered.
+    pub run_id: String,
     pub ordinal: u64,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
@@ -1358,6 +1534,92 @@ pub trait CatalogRepository {
     ) -> Result<ReviewSessionView>;
     fn culling_report(&self, project_id: &ProjectId) -> Result<Vec<CullingReportRow>>;
     fn preference_examples(&self, project_id: &ProjectId) -> Result<Vec<PreferenceExampleView>>;
+    /// Creates/returns the one local default profile. This is identity-only and does not scan
+    /// historical decisions or train a model.
+    fn ensure_default_studio_profile(&self) -> Result<String>;
+    /// Cheap status projection used by project opening. It must never enqueue training, load a
+    /// model artifact, or backfill an unbounded catalog.
+    fn studio_brain_project_status(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<StudioBrainProjectStatus>;
+    fn set_project_training_included(
+        &self,
+        profile_id: &str,
+        project_id: &ProjectId,
+        included: bool,
+    ) -> Result<()>;
+    fn set_studio_personalization_enabled(&self, profile_id: &str, enabled: bool) -> Result<()>;
+    fn update_studio_profile_training_state(
+        &self,
+        profile_id: &str,
+        status: &str,
+        readiness: &serde_json::Value,
+        error_message: Option<&str>,
+    ) -> Result<()>;
+    /// Explicit-training backfill from immutable existing human history. It is idempotent and
+    /// never runs while merely opening a project.
+    fn materialize_historical_studio_training_examples(&self, profile_id: &str) -> Result<u64>;
+    fn studio_training_examples(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<StudioTrainingExampleRecord>>;
+    /// A monotonic local token for changes to the explicit eligible-source set. A candidate
+    /// captures it with its snapshot and activation checks it inside the write transaction.
+    fn studio_training_source_revision(&self, profile_id: &str) -> Result<u64>;
+    fn studio_training_source_state(&self, profile_id: &str) -> Result<StudioTrainingSourceState>;
+    fn studio_feature_candidates(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<StudioFeatureCandidate>>;
+    /// Returns only explicit Similar Set representative comparisons whose profile/project/
+    /// decision-level eligibility is currently active. The underlying source snapshots are
+    /// immutable and contain no path, filename, note, raw embedding, or identity data.
+    fn studio_pairwise_preferences(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<StudioPairwisePreferenceRecord>>;
+    fn set_studio_training_example_excluded(
+        &self,
+        profile_id: &str,
+        example_id: &str,
+        excluded: bool,
+    ) -> Result<()>;
+    fn create_studio_training_run(&self, record: &StudioTrainingRunRecord) -> Result<()>;
+    fn update_studio_training_run(&self, record: &StudioTrainingRunRecord) -> Result<()>;
+    fn store_studio_training_snapshot(
+        &self,
+        run_id: &str,
+        example_id: &str,
+        split: &str,
+        feature_snapshot_json: &serde_json::Value,
+        label: Option<&str>,
+    ) -> Result<()>;
+    fn store_studio_model(&self, record: &StudioModelRecord) -> Result<()>;
+    /// Validates persisted candidate identity, activates it, and completes its durable
+    /// background job in one transaction. The caller must have already validated the
+    /// structured artifact and checksum.
+    fn activate_studio_model(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        expected_source_revision: u64,
+        completed_job: &BackgroundJob,
+    ) -> Result<StudioModelActivationOutcome>;
+    fn active_studio_model(&self, profile_id: &str) -> Result<Option<StudioModelRecord>>;
+    fn latest_studio_training_run(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<StudioTrainingRunRecord>>;
+    fn replace_studio_recommendations(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        project_id: &ProjectId,
+        recommendations: &[StudioRecommendationRecord],
+    ) -> Result<()>;
+    fn reset_studio_personalization(&self, profile_id: &str) -> Result<()>;
+    fn recover_interrupted_studio_training(&self) -> Result<u64>;
     fn latest_capture_intelligence_job(
         &self,
         project_id: &ProjectId,
@@ -1679,6 +1941,31 @@ impl SqliteRepository {
             self.connection.execute_batch(MIGRATION_013)?;
             self.connection
                 .pragma_update(None, "user_version", 13_i64)?;
+        }
+        if version < 14 {
+            self.connection.execute_batch(MIGRATION_014)?;
+            self.connection
+                .pragma_update(None, "user_version", 14_i64)?;
+        }
+        if version < 15 {
+            self.connection.execute_batch(MIGRATION_015)?;
+            self.connection
+                .pragma_update(None, "user_version", 15_i64)?;
+        }
+        if version < 16 {
+            self.connection.execute_batch(MIGRATION_016)?;
+            self.connection
+                .pragma_update(None, "user_version", 16_i64)?;
+        }
+        if version < 17 {
+            self.connection.execute_batch(MIGRATION_017)?;
+            self.connection
+                .pragma_update(None, "user_version", 17_i64)?;
+        }
+        if version < 18 {
+            self.connection.execute_batch(MIGRATION_018)?;
+            self.connection
+                .pragma_update(None, "user_version", 18_i64)?;
         }
         Ok(())
     }
@@ -2033,10 +2320,12 @@ impl SqliteRepository {
     }
 }
 
-fn validate_moment_tail_payload(
+#[allow(clippy::too_many_arguments)]
+fn validate_moment_projection_payload(
     timeline: &MomentTimelineStatusRecord,
     run: &MomentAnalysisRunRecord,
-    affected_tail_start_ordinal: u64,
+    moment_ordinal_start: Option<u64>,
+    membership_ordinal_start: u64,
     segments: &[TimelineSegmentRecord],
     moments: &[MomentRecord],
     memberships: &[MomentMembershipRecord],
@@ -2044,55 +2333,72 @@ fn validate_moment_tail_payload(
 ) -> Result<BTreeSet<String>> {
     if timeline.project_id != run.project_id || timeline.timeline_id != run.timeline_id {
         return Err(PersistenceError::InvalidData(
-            "timeline and tail analysis run identities differ".into(),
-        ));
-    }
-    if timeline.active_run_id.is_none() {
-        return Err(PersistenceError::InvalidData(
-            "tail replacement requires an existing active Moment analysis run".into(),
+            "timeline and analysis run identities differ".into(),
         ));
     }
     let mut segment_ids = BTreeSet::new();
+    let mut segment_ordinals = BTreeSet::new();
+    let mut segment_ordinal_by_id = BTreeMap::new();
     for segment in segments {
         if segment.project_id != timeline.project_id || segment.run_id != run.id {
             return Err(PersistenceError::InvalidData(
-                "tail segment does not belong to the selected timeline run/project".into(),
+                "Moment segment does not belong to the selected timeline run/project".into(),
             ));
         }
         if segment.stale {
             return Err(PersistenceError::InvalidData(
-                "tail replacement cannot insert a stale timeline segment".into(),
+                "Moment replacement cannot insert a stale timeline segment".into(),
             ));
         }
-        if !segment_ids.insert(segment.id.as_str()) {
+        if !segment_ids.insert(segment.id.clone()) || !segment_ordinals.insert(segment.ordinal) {
             return Err(PersistenceError::InvalidData(
-                "tail analysis contains duplicate segment IDs".into(),
+                "Moment analysis contains duplicate timeline segment IDs or ordinals".into(),
             ));
         }
+        segment_ordinal_by_id.insert(segment.id.clone(), segment.ordinal);
     }
+    validate_contiguous_moment_ordinals(
+        "Timeline segment",
+        &segment_ordinals,
+        moment_ordinal_start,
+    )?;
 
     let mut moment_ids = BTreeSet::new();
+    let mut moment_segment_ids = BTreeSet::new();
     let mut moment_ordinals = BTreeSet::new();
     let mut new_asset_ids = BTreeSet::new();
     for moment in moments {
         if moment.project_id != timeline.project_id
             || moment.timeline_id != timeline.timeline_id
             || moment.run_id != run.id
-            || !segment_ids.contains(moment.segment_id.as_str())
+            || !segment_ids.contains(&moment.segment_id)
         {
             return Err(PersistenceError::InvalidData(
-                "tail Moment record does not belong to the supplied project, timeline, run, and segment"
+                "Moment record does not belong to the supplied project, timeline, run, and segment"
                     .into(),
             ));
         }
         if moment.stale {
             return Err(PersistenceError::InvalidData(
-                "tail replacement cannot insert a stale Moment record".into(),
+                "Moment replacement cannot insert a stale Moment record".into(),
             ));
         }
         if !moment_ids.insert(moment.id.as_str()) || !moment_ordinals.insert(moment.ordinal) {
             return Err(PersistenceError::InvalidData(
-                "tail analysis contains duplicate Moment IDs or ordinals".into(),
+                "Moment analysis contains duplicate Moment IDs or ordinals".into(),
+            ));
+        }
+        let segment_ordinal = segment_ordinal_by_id
+            .get(&moment.segment_id)
+            .expect("validated Moment segment must have an ordinal");
+        if *segment_ordinal != moment.ordinal {
+            return Err(PersistenceError::InvalidData(
+                "Moment and timeline segment ordinals must agree within a generated run".into(),
+            ));
+        }
+        if !moment_segment_ids.insert(moment.segment_id.as_str()) {
+            return Err(PersistenceError::InvalidData(
+                "Moment analysis contains multiple Moment records for one timeline segment".into(),
             ));
         }
         new_asset_ids.insert(moment.anchor_asset_id.clone());
@@ -2100,17 +2406,24 @@ fn validate_moment_tail_payload(
             new_asset_ids.insert(representative.clone());
         }
     }
+    validate_contiguous_moment_ordinals("Moment", &moment_ordinals, moment_ordinal_start)?;
+    if moment_segment_ids.len() != segment_ids.len() {
+        return Err(PersistenceError::InvalidData(
+            "every supplied timeline segment must materialize exactly one Moment record".into(),
+        ));
+    }
 
     let mut membership_asset_ids = BTreeSet::new();
     let mut membership_ordinals = BTreeSet::new();
+    let mut member_assets_by_moment = BTreeMap::<String, BTreeSet<String>>::new();
     for membership in memberships {
         if membership.project_id != timeline.project_id
             || membership.run_id != run.id
             || !membership.active
-            || membership.ordinal < affected_tail_start_ordinal
+            || membership.ordinal < membership_ordinal_start
         {
             return Err(PersistenceError::InvalidData(
-                "tail membership is outside the supplied active tail or belongs to another project/run"
+                "Moment membership is outside the supplied active projection or belongs to another project/run"
                     .into(),
             ));
         }
@@ -2118,57 +2431,118 @@ fn validate_moment_tail_payload(
             || !membership_ordinals.insert(membership.ordinal)
         {
             return Err(PersistenceError::InvalidData(
-                "tail analysis contains duplicate membership media assets or ordinals".into(),
+                "Moment analysis contains duplicate membership media assets or ordinals".into(),
             ));
         }
         match membership.membership_state.as_str() {
             "member" => {
                 let Some(moment_id) = membership.moment_id.as_deref() else {
                     return Err(PersistenceError::InvalidData(
-                        "tail member membership requires a supplied Moment ID".into(),
+                        "Moment member membership requires a supplied Moment ID".into(),
                     ));
                 };
                 if !moment_ids.contains(moment_id) {
                     return Err(PersistenceError::InvalidData(
-                        "tail membership refers to a Moment outside the supplied tail".into(),
+                        "Moment membership refers to a Moment outside the supplied projection"
+                            .into(),
                     ));
                 }
+                member_assets_by_moment
+                    .entry(moment_id.to_owned())
+                    .or_default()
+                    .insert(membership.media_asset_id.clone());
             }
             "ungrouped" if membership.moment_id.is_none() => {}
             "ungrouped" => {
                 return Err(PersistenceError::InvalidData(
-                    "tail ungrouped membership cannot point to a Moment".into(),
+                    "Moment ungrouped membership cannot point to a Moment".into(),
                 ))
             }
             _ => {
                 return Err(PersistenceError::InvalidData(
-                    "tail membership has an unsupported state".into(),
+                    "Moment membership has an unsupported state".into(),
                 ))
             }
         }
         new_asset_ids.insert(membership.media_asset_id.clone());
+    }
+    validate_contiguous_moment_ordinals(
+        "Moment membership",
+        &membership_ordinals,
+        Some(membership_ordinal_start),
+    )?;
+    for moment in moments {
+        let member_assets = member_assets_by_moment.get(&moment.id).ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "every supplied Moment record must have at least one member membership".into(),
+            )
+        })?;
+        if !member_assets.contains(&moment.anchor_asset_id) {
+            return Err(PersistenceError::InvalidData(
+                "Moment anchor asset must be a member of its supplied Moment record".into(),
+            ));
+        }
+        if let Some(representative) = &moment.ai_representative_asset_id {
+            if !member_assets.contains(representative) {
+                return Err(PersistenceError::InvalidData(
+                    "AI Moment representative must be a member of its supplied Moment record"
+                        .into(),
+                ));
+            }
+        }
+        if moment.asset_count != member_assets.len() as u64 {
+            return Err(PersistenceError::InvalidData(
+                "Moment asset count must match its supplied member memberships".into(),
+            ));
+        }
     }
     let mut boundary_ids = BTreeSet::new();
     let mut boundary_ordinals = BTreeSet::new();
     for boundary in boundaries {
         if boundary.project_id != timeline.project_id || boundary.run_id != run.id {
             return Err(PersistenceError::InvalidData(
-                "tail boundary evidence belongs to another project or run".into(),
+                "Moment boundary evidence belongs to another project or run".into(),
             ));
         }
         if !boundary_ids.insert(boundary.id.as_str()) || !boundary_ordinals.insert(boundary.ordinal)
         {
             return Err(PersistenceError::InvalidData(
-                "tail analysis contains duplicate boundary evidence IDs or ordinals".into(),
+                "Moment analysis contains duplicate boundary evidence IDs or ordinals".into(),
             ));
         }
         new_asset_ids.insert(boundary.left_asset_id.clone());
         new_asset_ids.insert(boundary.right_asset_id.clone());
     }
+    validate_contiguous_moment_ordinals("Moment boundary evidence", &boundary_ordinals, Some(0))?;
     Ok(new_asset_ids)
 }
 
-fn assert_moment_tail_assets_belong_to_project(
+fn validate_contiguous_moment_ordinals(
+    kind: &str,
+    ordinals: &BTreeSet<u64>,
+    expected_start: Option<u64>,
+) -> Result<()> {
+    let Some(first) = ordinals.first().copied() else {
+        return Ok(());
+    };
+    let start = expected_start.unwrap_or(first);
+    for (index, ordinal) in ordinals.iter().enumerate() {
+        let index = u64::try_from(index).map_err(|_| {
+            PersistenceError::InvalidData("Moment ordinal count exceeds u64 range".into())
+        })?;
+        let expected = start.checked_add(index).ok_or_else(|| {
+            PersistenceError::InvalidData("Moment ordinal exceeds u64 range".into())
+        })?;
+        if *ordinal != expected {
+            return Err(PersistenceError::InvalidData(format!(
+                "{kind} ordinals must be contiguous from {start}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn assert_moment_assets_belong_to_project(
     connection: &Connection,
     project_id: &ProjectId,
     asset_ids: &BTreeSet<String>,
@@ -2193,10 +2567,91 @@ fn assert_moment_tail_assets_belong_to_project(
             })?;
         if count != chunk.len() as i64 {
             return Err(PersistenceError::InvalidData(
-                "tail analysis referenced a media asset outside the selected project".into(),
+                "Moment analysis referenced a media asset outside the selected project".into(),
             ));
         }
     }
+    Ok(())
+}
+
+/// Check the active projection that will exist after a replacement but before the new rows are
+/// inserted. This protects the persistence boundary from malformed direct callers as well as
+/// core-generated payloads: global display and membership ordinals are always deterministic,
+/// gap-free `0..n` sequences.
+fn assert_active_moment_projection_contiguous(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    incoming_moments: &[MomentRecord],
+    incoming_memberships: &[MomentMembershipRecord],
+) -> Result<()> {
+    let stored_moment_ordinals = transaction
+        .prepare(
+            "SELECT ordinal FROM moment_records
+             WHERE project_id = ?1 AND stale = 0",
+        )?
+        .query_map(params![project_id], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut moment_ordinals = BTreeSet::new();
+    for ordinal in stored_moment_ordinals {
+        let ordinal = u64::try_from(ordinal).map_err(|_| {
+            PersistenceError::InvalidData("active Moment ordinal must not be negative".into())
+        })?;
+        if !moment_ordinals.insert(ordinal) {
+            return Err(PersistenceError::InvalidData(
+                "active Moment projection contains duplicate display ordinals".into(),
+            ));
+        }
+    }
+    for moment in incoming_moments {
+        if !moment_ordinals.insert(moment.ordinal) {
+            return Err(PersistenceError::InvalidData(
+                "replacement Moment ordinal collides with the active projection".into(),
+            ));
+        }
+    }
+    validate_contiguous_moment_ordinals("active Moment", &moment_ordinals, Some(0))?;
+
+    let stored_memberships = transaction
+        .prepare(
+            "SELECT ordinal, media_asset_id FROM moment_memberships
+             WHERE project_id = ?1 AND active = 1",
+        )?
+        .query_map(params![project_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut membership_ordinals = BTreeSet::new();
+    let mut membership_asset_ids = BTreeSet::new();
+    for (ordinal, asset_id) in stored_memberships {
+        let ordinal = u64::try_from(ordinal).map_err(|_| {
+            PersistenceError::InvalidData(
+                "active Moment membership ordinal must not be negative".into(),
+            )
+        })?;
+        if !membership_ordinals.insert(ordinal) {
+            return Err(PersistenceError::InvalidData(
+                "active Moment projection contains duplicate membership ordinals".into(),
+            ));
+        }
+        if !membership_asset_ids.insert(asset_id) {
+            return Err(PersistenceError::InvalidData(
+                "active Moment projection contains duplicate membership media assets".into(),
+            ));
+        }
+    }
+    for membership in incoming_memberships {
+        if !membership_ordinals.insert(membership.ordinal) {
+            return Err(PersistenceError::InvalidData(
+                "replacement Moment membership ordinal collides with the active projection".into(),
+            ));
+        }
+        if !membership_asset_ids.insert(membership.media_asset_id.clone()) {
+            return Err(PersistenceError::InvalidData(
+                "replacement Moment membership repeats a preserved active media asset".into(),
+            ));
+        }
+    }
+    validate_contiguous_moment_ordinals("active Moment membership", &membership_ordinals, Some(0))?;
     Ok(())
 }
 
@@ -3604,6 +4059,10 @@ impl CatalogRepository for SqliteRepository {
                 params![artifact.media_asset_id.to_string()],
             )?;
         }
+        mark_studio_recommendations_stale_for_asset(
+            &self.connection,
+            &artifact.media_asset_id.to_string(),
+        )?;
         Ok(())
     }
 
@@ -3692,6 +4151,10 @@ impl CatalogRepository for SqliteRepository {
                 evidence.error_message,
             ],
         )?;
+        mark_studio_recommendations_stale_for_asset(
+            &self.connection,
+            &evidence.media_asset_id.to_string(),
+        )?;
         Ok(())
     }
 
@@ -3718,6 +4181,7 @@ impl CatalogRepository for SqliteRepository {
                 ],
             )?;
         }
+        mark_studio_recommendations_stale_for_asset(&self.connection, &asset_id.to_string())?;
         Ok(())
     }
 
@@ -3764,6 +4228,10 @@ impl CatalogRepository for SqliteRepository {
                 ],
             )?;
         }
+        transaction.execute(
+            "UPDATE studio_recommendations SET stale = 1, status = 'stale' WHERE project_id = ?1 AND stale = 0",
+            params![project_id.to_string()],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -3847,6 +4315,10 @@ impl CatalogRepository for SqliteRepository {
                 recommendation.status.as_str(),
             ],
         )?;
+        mark_studio_recommendations_stale_for_asset(
+            &self.connection,
+            &recommendation.media_asset_id.to_string(),
+        )?;
         Ok(())
     }
 
@@ -3864,6 +4336,9 @@ impl CatalogRepository for SqliteRepository {
                 ));
             }
         }
+        // M8.3's SQLite trigger advances the source revision and pending counter in this same
+        // authoritative write. The later compact snapshot is therefore unable to race a visible
+        // human correction, while snapshot failures remain fail-open for the correction itself.
         self.connection.execute(
             "INSERT INTO intelligence_overrides (id, media_asset_id, recommendation_id, decision, decided_at, note)
              VALUES (
@@ -3886,6 +4361,51 @@ impl CatalogRepository for SqliteRepository {
                 timestamp(&decision.decided_at), decision.note,
             ],
         )?;
+        // M4's explicit human override remains a distinct source. It is never conflated with a
+        // generic recommendation label, and the optional note is intentionally excluded.
+        // The M4 human action above is authoritative and already durable. Studio source capture
+        // is additive: if a compact snapshot cannot be read right now, explicit backfill on the
+        // next requested update recovers it without making the human action appear unsaved.
+        let mut captured_profile_id = None;
+        let mut source_materialized = false;
+        if let (Ok(project_id), Ok(profile_id)) = (
+            self.connection.query_row(
+                "SELECT project_id FROM media_assets WHERE id = ?1",
+                params![decision.media_asset_id.to_string()],
+                |row| row.get::<_, String>(0),
+            ),
+            self.ensure_default_studio_profile(),
+        ) {
+            captured_profile_id = Some(profile_id.clone());
+            let source = StudioHistoricalRow {
+                source_kind: "m4_human_override".into(),
+                source_record_id: decision.id.to_string(),
+                project_id,
+                media_asset_id: Some(decision.media_asset_id.to_string()),
+                decision_type: "culling_decision".into(),
+                decision_value: Some(decision.decision.as_str().into()),
+                occurred_at: timestamp(&decision.decided_at),
+                review_session_id: None,
+                similarity_group_id: None,
+                moment_id: None,
+            };
+            match materialize_live_studio_training_example(&self.connection, &profile_id, &source) {
+                Ok(()) => source_materialized = true,
+                Err(_) => mark_studio_source_capture_deferred(&self.connection, &profile_id),
+            }
+        }
+        if source_materialized {
+            // The trigger created one action-scoped guard for this human override. A failed
+            // capture deliberately leaves that guard pending for explicit historical reconciliation.
+            if let Some(profile_id) = captured_profile_id.as_deref() {
+                let _ = finish_studio_source_materialization(
+                    &self.connection,
+                    profile_id,
+                    "m4_human_override",
+                    &decision.id.to_string(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -4287,6 +4807,10 @@ impl CatalogRepository for SqliteRepository {
         query: &CullingQuery,
     ) -> Result<CullingWorkspaceView> {
         validate_culling_mode(&query.mode)?;
+        // Validate once before querying cached advisory rows. A corrupt active artifact is
+        // marked unavailable and Smart Cull falls back to its existing generic evidence.
+        let profile_id = self.ensure_default_studio_profile()?;
+        let _ = self.active_studio_model(&profile_id)?;
         if let Some(moment_id) = &query.moment_id {
             if !self.moment_belongs_to_project(project_id, moment_id)? {
                 return Err(PersistenceError::InvalidData(
@@ -4355,6 +4879,11 @@ impl CatalogRepository for SqliteRepository {
                 similarity_group_id: group.as_ref().map(|value| value.0.clone()),
                 is_ai_representative: group.as_ref().is_some_and(|value| value.1),
                 is_human_representative: group.as_ref().is_some_and(|value| value.2),
+                studio_brain: studio_recommendation_for_asset(
+                    &self.connection,
+                    project_id,
+                    &asset_id.to_string(),
+                )?,
             });
         }
         Ok(CullingWorkspaceView {
@@ -4405,12 +4934,26 @@ impl CatalogRepository for SqliteRepository {
                 ));
             }
         }
-        let before =
-            culling_decision_for_asset(&self.connection, project_id, &asset_id.to_string())?;
+        // The authority record, its action-scoped Studio guard (triggered by the write below),
+        // and every append-only decision-history event commit together. Explicit backfill can
+        // therefore never observe a guard without the complete corresponding M5 history.
+        let transaction = moment_write_transaction(&self.connection)?;
+        let before = culling_decision_for_asset(&transaction, project_id, &asset_id.to_string())?;
+        let source_signal_will_change = (update.clear_decision && before.decision.is_some())
+            || (!update.clear_decision
+                && update
+                    .decision
+                    .is_some_and(|decision| before.decision.as_deref() != Some(decision.as_str())))
+            || update.rating.is_some_and(|rating| before.rating != rating)
+            || update
+                .starred
+                .is_some_and(|starred| before.starred != starred);
+        // M8.4 records an action-scoped source guard atomically inside the following human decision
+        // write. Notes, flags, and no-op edits cannot create a marker because the SQL trigger
+        // observes only a real decision/rating/star transition.
         let flags = update.flags.as_ref().map(json).transpose()?;
         let now = timestamp(&Utc::now());
-        let decision_id = self
-            .connection
+        let decision_id = transaction
             .query_row(
                 "SELECT id FROM media_decisions WHERE project_id = ?1 AND media_asset_id = ?2",
                 params![project_id.to_string(), asset_id.to_string()],
@@ -4418,7 +4961,7 @@ impl CatalogRepository for SqliteRepository {
             )
             .optional()?
             .unwrap_or_else(|| MediaDecisionId::new().to_string());
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO media_decisions (id, project_id, media_asset_id, decision, rating, starred, note, flags_json, source, session_id, updated_at)
              VALUES (?1, ?2, ?3, ?4, COALESCE(?5, 0), COALESCE(?6, 0), CASE WHEN ?7 IS NULL OR ?7 = '' THEN NULL ELSE ?7 END, COALESCE(?8, '[]'), 'human', ?9, ?10)
              ON CONFLICT(project_id, media_asset_id) DO UPDATE SET
@@ -4430,8 +4973,7 @@ impl CatalogRepository for SqliteRepository {
                session_id = COALESCE(?9, media_decisions.session_id), updated_at = ?10",
             params![decision_id, project_id.to_string(), asset_id.to_string(), update.decision.map(CullingDecisionValue::as_str), update.rating.map(i64::from), update.starred.map(i64::from), update.note.as_deref(), flags, update.session_id.as_deref(), now, update.clear_decision],
         )?;
-        let after =
-            culling_decision_for_asset(&self.connection, project_id, &asset_id.to_string())?;
+        let after = culling_decision_for_asset(&transaction, project_id, &asset_id.to_string())?;
         let changes = [
             (
                 "DECISION_CHANGED",
@@ -4464,22 +5006,70 @@ impl CatalogRepository for SqliteRepository {
                 before.flags != after.flags,
             ),
         ];
+        let mut studio_sources = Vec::new();
         for (event_type, previous, current, changed) in changes {
             if !changed {
                 continue;
             }
-            self.connection.execute(
+            let history_id = ReviewEventId::new().to_string();
+            transaction.execute(
                 "INSERT INTO decision_history (id, project_id, media_asset_id, decision_id, session_id, event_type, previous_value_json, current_value_json, source, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'human', ?9)",
-                params![ReviewEventId::new().to_string(), project_id.to_string(), asset_id.to_string(), decision_id, update.session_id.as_deref(), event_type, json(&previous)?, json(&current)?, now],
+                params![history_id, project_id.to_string(), asset_id.to_string(), decision_id, update.session_id.as_deref(), event_type, json(&previous)?, json(&current)?, now],
             )?;
             if matches!(
                 event_type,
                 "DECISION_CHANGED" | "RATING_CHANGED" | "STAR_CHANGED"
             ) {
-                self.connection.execute(
+                transaction.execute(
                     "INSERT INTO review_events (id, project_id, session_id, media_asset_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![ReviewEventId::new().to_string(), project_id.to_string(), update.session_id.as_deref(), asset_id.to_string(), event_type, json(&serde_json::json!({ "previous": previous, "current": current }))?, now],
                 )?;
+            }
+            // Materialize only explicit human culling signals. Notes and flags deliberately do
+            // not reach Studio Brain, and an unavailable/unknown recommendation is preserved as
+            // such rather than reconstructed from a later UI state.
+            if matches!(
+                event_type,
+                "DECISION_CHANGED" | "RATING_CHANGED" | "STAR_CHANGED"
+            ) {
+                if let Some(source) = studio_historical_row_from_live_decision(
+                    &history_id,
+                    &project_id.to_string(),
+                    &asset_id.to_string(),
+                    update.session_id.as_deref(),
+                    event_type,
+                    &current,
+                    &now,
+                ) {
+                    studio_sources.push(source);
+                }
+            }
+        }
+        transaction.commit()?;
+        if source_signal_will_change {
+            if let Ok(profile_id) = self.ensure_default_studio_profile() {
+                let mut source_materialized = true;
+                for source in &studio_sources {
+                    if materialize_live_studio_training_example(
+                        &self.connection,
+                        &profile_id,
+                        source,
+                    )
+                    .is_err()
+                    {
+                        source_materialized = false;
+                        mark_studio_source_capture_deferred(&self.connection, &profile_id);
+                        break;
+                    }
+                }
+                if source_materialized {
+                    let _ = finish_studio_source_materialization(
+                        &self.connection,
+                        &profile_id,
+                        "m5_culling",
+                        &format!("{decision_id}:{now}"),
+                    );
+                }
             }
         }
         Ok(after)
@@ -4546,30 +5136,64 @@ impl CatalogRepository for SqliteRepository {
         if prior.as_deref() == Some(&asset_id.to_string()) {
             return Ok(());
         }
+        // The representative, trigger-created action guard, immutable preference example, and
+        // review event commit together so an explicit reconciliation cannot see a partial action.
         let now = timestamp(&Utc::now());
-        self.connection.execute(
+        let transaction = moment_write_transaction(&self.connection)?;
+        transaction.execute(
             "INSERT INTO group_human_representatives (group_id, project_id, media_asset_id, session_id, selected_at) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(group_id) DO UPDATE SET media_asset_id = excluded.media_asset_id, session_id = excluded.session_id, selected_at = excluded.selected_at",
             params![group_id, project_id.to_string(), asset_id.to_string(), session_id, now],
         )?;
-        let compared = self.connection.prepare(
+        let compared = transaction.prepare(
             "SELECT media_asset_id FROM similarity_group_members WHERE group_id = ?1 AND media_asset_id <> ?2 ORDER BY ordinal ASC, media_asset_id ASC"
         )?.query_map(params![group_id, asset_id.to_string()], |row| row.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
         // The snapshot contains only normalized technical/recommendation metadata. It intentionally
         // excludes byte data, face crops, source paths, and private image content.
-        let evidence = preference_evidence_snapshot(&self.connection, group_id, asset_id)?;
-        let ai_recommendation = self.connection.query_row(
+        let evidence = preference_evidence_snapshot(&transaction, group_id, asset_id)?;
+        let ai_recommendation = transaction.query_row(
             "SELECT json_object('assetId', g.representative_asset_id, 'recommendation', r.label, 'confidence', r.confidence) FROM similarity_groups g LEFT JOIN analysis_recommendations r ON r.media_asset_id = g.representative_asset_id AND r.stale = 0 WHERE g.id = ?1",
             params![group_id], |row| row.get::<_, String>(0),
         ).optional()?.unwrap_or_else(|| "{}".into());
-        self.connection.execute(
+        let preference_example_id = PreferenceExampleId::new().to_string();
+        transaction.execute(
             "INSERT INTO preference_examples (id, project_id, similarity_group_id, chosen_asset_id, compared_asset_ids_json, technical_evidence_json, ai_recommendation_json, human_decision_context, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'group_representative', ?8)",
-            params![PreferenceExampleId::new().to_string(), project_id.to_string(), group_id, asset_id.to_string(), json(&compared)?, evidence, ai_recommendation, now],
+            params![preference_example_id, project_id.to_string(), group_id, asset_id.to_string(), json(&compared)?, evidence, ai_recommendation, now],
         )?;
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO review_events (id, project_id, session_id, media_asset_id, similarity_group_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'GROUP_REPRESENTATIVE_CHANGED', ?6, ?7)",
             params![ReviewEventId::new().to_string(), project_id.to_string(), session_id, asset_id.to_string(), group_id, json(&serde_json::json!({ "previousAssetId": prior, "chosenAssetId": asset_id.to_string() }))?, now],
         )?;
+        transaction.commit()?;
+        let mut source_materialized = false;
+        let mut captured_profile_id = None;
+        if let Ok(profile_id) = self.ensure_default_studio_profile() {
+            captured_profile_id = Some(profile_id.clone());
+            match materialize_live_similarity_representative(
+                &self.connection,
+                &profile_id,
+                &preference_example_id,
+                &project_id.to_string(),
+                group_id,
+                &asset_id.to_string(),
+                &compared,
+                &ai_recommendation,
+                &now,
+            ) {
+                Ok(()) => source_materialized = true,
+                Err(_) => mark_studio_source_capture_deferred(&self.connection, &profile_id),
+            }
+        }
+        if source_materialized {
+            if let Some(profile_id) = captured_profile_id.as_deref() {
+                let _ = finish_studio_source_materialization(
+                    &self.connection,
+                    profile_id,
+                    "similar_set_representative",
+                    &format!("{group_id}:{now}"),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -4688,6 +5312,814 @@ impl CatalogRepository for SqliteRepository {
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    fn ensure_default_studio_profile(&self) -> Result<String> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at) VALUES (?1, 'local-default', 'Local Studio Profile', 'not_ready', 1, ?2, ?3, ?4, ?4)",
+            params![Uuid::new_v4().to_string(), json(&serde_json::json!({"mode":"explicit_retrain","algorithm":"studio-linear-v1"}))?, json(&serde_json::json!({"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}))?, now],
+        )?;
+        let profile_id = transaction.query_row(
+            "SELECT id FROM studio_profiles WHERE profile_key = 'local-default'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        transaction.commit()?;
+        Ok(profile_id)
+    }
+
+    fn studio_brain_project_status(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<StudioBrainProjectStatus> {
+        if self.get_project(project_id)?.is_none() {
+            return Err(PersistenceError::InvalidData(
+                "project does not exist for Studio Brain status".into(),
+            ));
+        }
+        let profile_id = self.ensure_default_studio_profile()?;
+        let active_model = self.active_studio_model(&profile_id)?;
+        let (profile_name, training_status, personalization_enabled, readiness_json, last_trained_at, last_error) = self.connection.query_row(
+            "SELECT display_name, training_status, personalization_enabled, readiness_json, last_trained_at, last_error FROM studio_profiles WHERE id = ?1",
+            params![profile_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?)),
+        )?;
+        let project_included: bool = self.connection.query_row(
+            "SELECT COALESCE((SELECT included FROM project_training_preferences WHERE studio_profile_id = ?1 AND project_id = ?2), 1)",
+            params![profile_id, project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let (eligible_decision_count, keep_count, review_count, reject_count, rating_count, starred_count) = self.connection.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN event_type = 'DECISION_CHANGED' AND json_extract(current_value_json, '$') IN ('keep', 'review', 'reject') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'DECISION_CHANGED' AND json_extract(current_value_json, '$') = 'keep' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'DECISION_CHANGED' AND json_extract(current_value_json, '$') = 'review' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'DECISION_CHANGED' AND json_extract(current_value_json, '$') = 'reject' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'RATING_CHANGED' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN event_type = 'STAR_CHANGED' AND json_extract(current_value_json, '$') = 1 THEN 1 ELSE 0 END), 0)
+             FROM decision_history history
+             WHERE EXISTS (SELECT 1 FROM projects p WHERE p.id = history.project_id)
+               AND COALESCE((SELECT pref.included FROM project_training_preferences pref WHERE pref.studio_profile_id = ?1 AND pref.project_id = history.project_id), 1) = 1",
+            params![profile_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?)),
+        )?;
+        let representative_count: i64 = self.connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM preference_examples) + (SELECT COUNT(*) FROM moment_events WHERE event_type = 'MOMENT_REPRESENTATIVE_CHANGED')",
+            [], |row| row.get(0),
+        )?;
+        let contributing_project_count: i64 = self.connection.query_row(
+            "SELECT COUNT(DISTINCT history.project_id) FROM decision_history history WHERE history.event_type = 'DECISION_CHANGED' AND json_extract(history.current_value_json, '$') IN ('keep', 'review', 'reject') AND COALESCE((SELECT pref.included FROM project_training_preferences pref WHERE pref.studio_profile_id = ?1 AND pref.project_id = history.project_id), 1) = 1",
+            params![profile_id], |row| row.get(0),
+        )?;
+        let active_model_version = active_model.map(|model| model.model_version);
+        Ok(StudioBrainProjectStatus {
+            profile_id,
+            profile_name,
+            training_status,
+            personalization_enabled,
+            project_included,
+            eligible_decision_count: eligible_decision_count as u64,
+            keep_count: keep_count as u64,
+            review_count: review_count as u64,
+            reject_count: reject_count as u64,
+            rating_count: rating_count as u64,
+            starred_count: starred_count as u64,
+            representative_count: representative_count as u64,
+            contributing_project_count: contributing_project_count as u64,
+            active_model_version,
+            last_trained_at,
+            readiness: from_json(&readiness_json)?,
+            last_error,
+        })
+    }
+
+    fn set_project_training_included(
+        &self,
+        profile_id: &str,
+        project_id: &ProjectId,
+        included: bool,
+    ) -> Result<()> {
+        if self.get_project(project_id)?.is_none() {
+            return Err(PersistenceError::InvalidData(
+                "project does not exist".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_studio_profile_exists(&transaction, profile_id)?;
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "INSERT INTO project_training_preferences (studio_profile_id, project_id, included, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(studio_profile_id, project_id) DO UPDATE SET included = excluded.included, updated_at = excluded.updated_at",
+            params![profile_id, project_id.to_string(), included, now],
+        )?;
+        insert_studio_event(
+            &transaction,
+            profile_id,
+            Some(&project_id.to_string()),
+            None,
+            None,
+            if included {
+                "PROJECT_TRAINING_INCLUDED"
+            } else {
+                "PROJECT_TRAINING_EXCLUDED"
+            },
+            &serde_json::json!({"included": included}),
+            &now,
+        )?;
+        // The underlying human decisions remain untouched. An active derived model is now
+        // based on a different eligible-source set, so it must ask for an explicit update.
+        mark_studio_profile_stale_if_active(&transaction, profile_id, &now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn set_studio_personalization_enabled(&self, profile_id: &str, enabled: bool) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_studio_profile_exists(&transaction, profile_id)?;
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "UPDATE studio_profiles SET personalization_enabled = ?2, updated_at = ?3 WHERE id = ?1",
+            params![profile_id, enabled, now],
+        )?;
+        insert_studio_event(
+            &transaction,
+            profile_id,
+            None,
+            None,
+            None,
+            "PERSONALIZATION_TOGGLED",
+            &serde_json::json!({"enabled": enabled}),
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn update_studio_profile_training_state(
+        &self,
+        profile_id: &str,
+        status: &str,
+        readiness: &serde_json::Value,
+        error_message: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            "not_ready" | "learning" | "ready" | "stale" | "error"
+        ) {
+            return Err(PersistenceError::InvalidData(
+                "invalid Studio Brain profile status".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_studio_profile_exists(&transaction, profile_id)?;
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "UPDATE studio_profiles SET training_status = ?2, readiness_json = ?3, last_error = ?4, updated_at = ?5 WHERE id = ?1",
+            params![profile_id, status, json(readiness)?, error_message, now],
+        )?;
+        if status == "error" {
+            insert_studio_event(
+                &transaction,
+                profile_id,
+                None,
+                None,
+                None,
+                "STUDIO_TRAINING_FAILED",
+                &serde_json::json!({"message":"A local Studio Brain candidate was not activated."}),
+                &now,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn materialize_historical_studio_training_examples(&self, profile_id: &str) -> Result<u64> {
+        self.ensure_default_studio_profile()?;
+        // Hold the write reservation while both reading append-only authority records and
+        // clearing a previous pending marker. A new human action therefore lands either wholly
+        // before this reconciliation (and is included) or wholly after it (and leaves a new
+        // pending marker that the following snapshot refuses). No source can be missed between
+        // a successful reconciliation and a candidate activation.
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_studio_profile_exists(&transaction, profile_id)?;
+        let histories = studio_historical_decision_rows(&transaction)?;
+        let overrides = studio_historical_override_rows(&transaction)?;
+        let representatives = studio_historical_similarity_rows(&transaction)?;
+        let moment_representatives = studio_historical_moment_rows(&transaction)?;
+        // Opt-out applies at source creation as well as at read time. Historical backfill is
+        // explicit and idempotent, but it must not silently materialize new preference records
+        // from a project the photographer has currently excluded.
+        let mut included_decision_rows = Vec::new();
+        for row in histories.into_iter().chain(overrides) {
+            if studio_project_training_is_included(&transaction, profile_id, &row.project_id)? {
+                included_decision_rows.push(row);
+            }
+        }
+        let mut included_representatives = Vec::new();
+        for row in representatives {
+            if studio_project_training_is_included(&transaction, profile_id, &row.project_id)? {
+                included_representatives.push(row);
+            }
+        }
+        let mut included_moment_representatives = Vec::new();
+        for row in moment_representatives {
+            if studio_project_training_is_included(&transaction, profile_id, &row.project_id)? {
+                included_moment_representatives.push(row);
+            }
+        }
+        let now = timestamp(&Utc::now());
+        let mut created = 0_u64;
+        for row in included_decision_rows {
+            let snapshot = row
+                .media_asset_id
+                .as_deref()
+                .map(|asset| studio_feature_snapshot(&transaction, &row.project_id, asset))
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!({"availability":"unavailable"}));
+            let row = studio_historical_row_with_snapshot_context(row, &snapshot);
+            created += insert_studio_training_example(
+                &transaction,
+                profile_id,
+                &row,
+                &snapshot,
+                &serde_json::json!({"status":"unavailable_historical"}),
+                "unknown",
+                "historical_backfill",
+                &now,
+            )? as u64;
+        }
+        for row in included_representatives {
+            let snapshot =
+                studio_feature_snapshot(&transaction, &row.project_id, &row.chosen_asset_id)?;
+            let example = StudioHistoricalRow {
+                source_kind: "similar_set_representative".into(),
+                source_record_id: row.id.clone(),
+                project_id: row.project_id.clone(),
+                media_asset_id: Some(row.chosen_asset_id.clone()),
+                decision_type: "similar_set_representative".into(),
+                decision_value: None,
+                occurred_at: row.created_at.clone(),
+                review_session_id: None,
+                similarity_group_id: Some(row.group_id.clone()),
+                moment_id: None,
+            };
+            if insert_studio_training_example(
+                &transaction,
+                profile_id,
+                &example,
+                &snapshot,
+                &row.generic_recommendation_json,
+                "unknown",
+                "historical_backfill",
+                &now,
+            )? {
+                let example_id: String = transaction.query_row("SELECT id FROM studio_training_examples WHERE studio_profile_id = ?1 AND source_kind = ?2 AND source_record_id = ?3", params![profile_id, example.source_kind, example.source_record_id], |db_row| db_row.get(0))?;
+                transaction.execute("INSERT OR IGNORE INTO studio_training_example_references (studio_training_example_id, role, media_asset_id) VALUES (?1, 'chosen', ?2)", params![example_id, row.chosen_asset_id])?;
+                for alternative in row.alternative_asset_ids {
+                    transaction.execute("INSERT OR IGNORE INTO studio_training_example_references (studio_training_example_id, role, media_asset_id) VALUES (?1, 'alternative', ?2)", params![example_id, alternative])?;
+                }
+                created += 1;
+            }
+        }
+        for row in included_moment_representatives {
+            let snapshot = studio_feature_snapshot(&transaction, &row.project_id, &row.asset_id)?;
+            let example = StudioHistoricalRow {
+                source_kind: "moment_representative".into(),
+                source_record_id: row.id,
+                project_id: row.project_id,
+                media_asset_id: Some(row.asset_id),
+                decision_type: "moment_representative".into(),
+                decision_value: None,
+                occurred_at: row.created_at,
+                review_session_id: None,
+                similarity_group_id: None,
+                moment_id: Some(row.moment_id),
+            };
+            created += insert_studio_training_example(
+                &transaction,
+                profile_id,
+                &example,
+                &snapshot,
+                &serde_json::json!({"status":"unavailable_historical"}),
+                "unknown",
+                "historical_backfill",
+                &now,
+            )? as u64;
+        }
+        // Every action-scoped guard visible to this write-reserved transaction has complete
+        // durable authority history and was just reconciled into immutable source history.
+        // An action that arrives after commit creates its own new guard, so it cannot be erased
+        // by this reconciliation.
+        transaction.execute(
+            "DELETE FROM studio_source_materialization_guards WHERE studio_profile_id = ?1",
+            params![profile_id],
+        )?;
+        transaction.commit()?;
+        Ok(created)
+    }
+
+    fn studio_training_examples(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<StudioTrainingExampleRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.id, e.studio_profile_id, e.project_id, e.media_asset_id, e.source_kind, e.source_record_id, e.decision_type, e.decision_value, e.occurred_at, e.review_session_id, e.similarity_group_id, e.moment_id, e.generic_recommendation_json, e.studio_recommendation_id_at_decision, e.recommendation_shown, e.provenance, e.feature_schema_version, e.feature_snapshot_json, (e.training_eligible = 1 AND e.feature_schema_version = ?2 AND COALESCE(pref.included, 1) = 1 AND exclusion.studio_training_example_id IS NULL), e.created_at
+             FROM studio_training_examples e
+             LEFT JOIN project_training_preferences pref ON pref.studio_profile_id = e.studio_profile_id AND pref.project_id = e.project_id
+             LEFT JOIN decision_training_exclusions exclusion ON exclusion.studio_profile_id = e.studio_profile_id AND exclusion.studio_training_example_id = e.id
+             WHERE e.studio_profile_id = ?1 ORDER BY e.occurred_at ASC, e.id ASC"
+        )?;
+        let rows = statement
+            .query_map(
+                params![profile_id, STUDIO_FEATURE_SCHEMA_VERSION],
+                studio_training_example_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn studio_training_source_revision(&self, profile_id: &str) -> Result<u64> {
+        Ok(self.studio_training_source_state(profile_id)?.revision)
+    }
+
+    fn studio_training_source_state(&self, profile_id: &str) -> Result<StudioTrainingSourceState> {
+        let (revision, pending): (i64, bool) = self.connection.query_row(
+            "SELECT source_revision,
+                    EXISTS(SELECT 1 FROM studio_source_materialization_guards guard WHERE guard.studio_profile_id = studio_profiles.id)
+             FROM studio_profiles WHERE id = ?1",
+            params![profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(StudioTrainingSourceState {
+            revision: u64::try_from(revision).map_err(|_| {
+                PersistenceError::InvalidData("Studio training source revision is invalid".into())
+            })?,
+            materialization_pending: pending,
+        })
+    }
+
+    fn studio_feature_candidates(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<StudioFeatureCandidate>> {
+        if self.get_project(project_id)?.is_none() {
+            return Err(PersistenceError::InvalidData(
+                "project does not exist for Studio Brain features".into(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM media_assets WHERE project_id = ?1 AND media_type IN ('raw_photo', 'jpeg', 'heif', 'png', 'tiff') ORDER BY COALESCE(captured_at, created_at), id",
+        )?;
+        let asset_ids = statement
+            .query_map(params![project_id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut candidates = Vec::with_capacity(asset_ids.len());
+        for asset_id in asset_ids {
+            let snapshot =
+                studio_feature_snapshot(&self.connection, &project_id.to_string(), &asset_id)?;
+            let generic = studio_generic_recommendation_snapshot(&self.connection, &asset_id)?;
+            let feature_fingerprint = studio_feature_fingerprint(&snapshot)?;
+            candidates.push(StudioFeatureCandidate {
+                project_id: project_id.to_string(),
+                media_asset_id: asset_id,
+                similarity_group_id: snapshot
+                    .get("similarityGroupId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                moment_id: snapshot
+                    .get("momentId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned),
+                feature_snapshot_json: snapshot,
+                feature_fingerprint,
+                generic_recommendation_json: generic,
+            });
+        }
+        Ok(candidates)
+    }
+
+    fn studio_pairwise_preferences(
+        &self,
+        profile_id: &str,
+    ) -> Result<Vec<StudioPairwisePreferenceRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT example.id, example.project_id, example.similarity_group_id,
+                    chosen.media_asset_id, alternative.media_asset_id, example.occurred_at,
+                    example.feature_snapshot_json, preference.technical_evidence_json,
+                    preference.ai_recommendation_json,
+                    (example.training_eligible = 1
+                     AND COALESCE(project_preference.included, 1) = 1
+                     AND exclusion.studio_training_example_id IS NULL)
+             FROM studio_training_examples example
+             JOIN studio_training_example_references chosen
+               ON chosen.studio_training_example_id = example.id AND chosen.role = 'chosen'
+             JOIN studio_training_example_references alternative
+               ON alternative.studio_training_example_id = example.id AND alternative.role = 'alternative'
+             JOIN preference_examples preference
+               ON example.source_kind = 'similar_set_representative'
+              AND preference.id = example.source_record_id
+             LEFT JOIN project_training_preferences project_preference
+               ON project_preference.studio_profile_id = example.studio_profile_id
+              AND project_preference.project_id = example.project_id
+             LEFT JOIN decision_training_exclusions exclusion
+               ON exclusion.studio_profile_id = example.studio_profile_id
+              AND exclusion.studio_training_example_id = example.id
+             WHERE example.studio_profile_id = ?1
+               AND example.feature_schema_version = ?2
+               AND example.source_kind = 'similar_set_representative'
+               AND example.similarity_group_id IS NOT NULL
+             ORDER BY example.occurred_at ASC, example.id ASC, alternative.media_asset_id ASC",
+        )?;
+        let rows = statement
+            .query_map(params![profile_id, STUDIO_FEATURE_SCHEMA_VERSION], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    json_value_from_row(row, 6)?,
+                    json_value_from_row(row, 7)?,
+                    json_value_from_row(row, 8)?,
+                    row.get::<_, bool>(9)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut preferences = Vec::with_capacity(rows.len());
+        for (
+            example_id,
+            project_id,
+            similarity_group_id,
+            chosen_asset_id,
+            alternative_asset_id,
+            occurred_at,
+            chosen_feature_snapshot_json,
+            technical_evidence_json,
+            generic_recommendation_json,
+            training_eligible,
+        ) in rows
+        {
+            let Some(alternative_feature_snapshot_json) = studio_pairwise_snapshot_from_evidence(
+                &technical_evidence_json,
+                &generic_recommendation_json,
+                &similarity_group_id,
+                &alternative_asset_id,
+            ) else {
+                // Historic M5 evidence can be incomplete. It is safer to abstain from a
+                // relative comparison than to reconstruct a missing alternative from current
+                // mutable catalog state.
+                continue;
+            };
+            preferences.push(StudioPairwisePreferenceRecord {
+                id: format!("{example_id}:{alternative_asset_id}"),
+                project_id,
+                similarity_group_id,
+                chosen_asset_id,
+                alternative_asset_id,
+                occurred_at,
+                chosen_feature_snapshot_json,
+                alternative_feature_snapshot_json,
+                training_eligible,
+            });
+        }
+        Ok(preferences)
+    }
+
+    fn set_studio_training_example_excluded(
+        &self,
+        profile_id: &str,
+        example_id: &str,
+        excluded: bool,
+    ) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_studio_profile_exists(&transaction, profile_id)?;
+        let valid: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM studio_training_examples WHERE id = ?1 AND studio_profile_id = ?2)", params![example_id, profile_id], |row| row.get(0))?;
+        if !valid {
+            return Err(PersistenceError::InvalidData(
+                "training example does not belong to the selected Studio Profile".into(),
+            ));
+        }
+        let now = timestamp(&Utc::now());
+        if excluded {
+            transaction.execute("INSERT OR IGNORE INTO decision_training_exclusions (studio_profile_id, studio_training_example_id, excluded_at) VALUES (?1, ?2, ?3)", params![profile_id, example_id, now])?;
+        } else {
+            transaction.execute("DELETE FROM decision_training_exclusions WHERE studio_profile_id = ?1 AND studio_training_example_id = ?2", params![profile_id, example_id])?;
+        }
+        insert_studio_event(
+            &transaction,
+            profile_id,
+            None,
+            None,
+            None,
+            if excluded {
+                "DECISION_TRAINING_EXCLUDED"
+            } else {
+                "DECISION_TRAINING_INCLUDED"
+            },
+            &serde_json::json!({"trainingExampleId": example_id, "excluded": excluded}),
+            &now,
+        )?;
+        mark_studio_profile_stale_if_active(&transaction, profile_id, &now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn create_studio_training_run(&self, record: &StudioTrainingRunRecord) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_studio_profile_exists(&transaction, &record.profile_id)?;
+        transaction.execute(
+            "INSERT INTO studio_training_runs (id, studio_profile_id, background_job_id, algorithm, algorithm_version, feature_schema_version, parameters_json, snapshot_hash, snapshot_count, previous_active_model_id, state, error_message, created_at, updated_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![record.id, record.profile_id, record.background_job_id, record.algorithm, record.algorithm_version, record.feature_schema_version, json(&record.parameters_json)?, record.snapshot_hash, record.snapshot_count as i64, record.previous_active_model_id, record.state, record.error_message, record.created_at, record.updated_at, record.finished_at],
+        )?;
+        insert_studio_event(
+            &transaction,
+            &record.profile_id,
+            None,
+            Some(&record.id),
+            None,
+            "STUDIO_TRAINING_STARTED",
+            &serde_json::json!({"algorithm": record.algorithm, "featureSchemaVersion": record.feature_schema_version}),
+            &record.created_at,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn update_studio_training_run(&self, record: &StudioTrainingRunRecord) -> Result<()> {
+        self.connection.execute(
+            "UPDATE studio_training_runs SET state = ?2, error_message = ?3, parameters_json = ?4, snapshot_hash = ?5, snapshot_count = ?6, updated_at = ?7, finished_at = ?8 WHERE id = ?1 AND studio_profile_id = ?9",
+            params![record.id, record.state, record.error_message, json(&record.parameters_json)?, record.snapshot_hash, record.snapshot_count as i64, record.updated_at, record.finished_at, record.profile_id],
+        )?;
+        Ok(())
+    }
+
+    fn store_studio_training_snapshot(
+        &self,
+        run_id: &str,
+        example_id: &str,
+        split: &str,
+        feature_snapshot_json: &serde_json::Value,
+        label: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(split, "train" | "validation" | "holdout" | "excluded") {
+            return Err(PersistenceError::InvalidData(
+                "unsupported Studio training split".into(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO studio_training_run_examples (studio_training_run_id, studio_training_example_id, split, feature_snapshot_json, label) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(studio_training_run_id, studio_training_example_id) DO UPDATE SET split = excluded.split, feature_snapshot_json = excluded.feature_snapshot_json, label = excluded.label",
+            params![run_id, example_id, split, json(feature_snapshot_json)?, label],
+        )?;
+        Ok(())
+    }
+
+    fn store_studio_model(&self, record: &StudioModelRecord) -> Result<()> {
+        if record.checksum.trim().is_empty() {
+            return Err(PersistenceError::InvalidData(
+                "Studio model checksum is required".into(),
+            ));
+        }
+        if record.state != "candidate" {
+            return Err(PersistenceError::InvalidData(
+                "Studio model storage accepts only a validated candidate".into(),
+            ));
+        }
+        verify_studio_model_artifact(record)?;
+        let transaction = moment_write_transaction(&self.connection)?;
+        transaction.execute(
+            "INSERT INTO studio_models (id, studio_profile_id, studio_training_run_id, algorithm, model_version, feature_schema_version, artifact_json, checksum, artifact_size_bytes, state, metrics_json, created_at, activated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![record.id, record.profile_id, record.training_run_id, record.algorithm, record.model_version, record.feature_schema_version, json(&record.artifact_json)?, record.checksum, record.artifact_size_bytes as i64, record.state, json(&record.metrics_json)?, record.created_at, record.activated_at],
+        )?;
+        store_studio_model_metric_rows(&transaction, record)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn activate_studio_model(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        expected_source_revision: u64,
+        completed_job: &BackgroundJob,
+    ) -> Result<StudioModelActivationOutcome> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_studio_profile_exists(&transaction, profile_id)?;
+        let candidate = transaction.query_row(
+            "SELECT id, studio_profile_id, studio_training_run_id, algorithm, model_version, feature_schema_version, artifact_json, checksum, artifact_size_bytes, state, metrics_json, created_at, activated_at FROM studio_models WHERE id = ?1 AND studio_profile_id = ?2 AND state = 'candidate'",
+            params![model_id, profile_id],
+            studio_model_from_row,
+        ).optional()?;
+        let Some(candidate) = candidate else {
+            return Err(PersistenceError::InvalidData(
+                "Studio candidate model is missing, invalid, or does not belong to this profile"
+                    .into(),
+            ));
+        };
+        let (current_source_revision, source_materialization_pending): (i64, bool) = transaction.query_row(
+            "SELECT source_revision,
+                    EXISTS(SELECT 1 FROM studio_source_materialization_guards guard WHERE guard.studio_profile_id = studio_profiles.id)
+             FROM studio_profiles WHERE id = ?1",
+            params![profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if source_materialization_pending
+            || current_source_revision < 0
+            || current_source_revision as u64 != expected_source_revision
+        {
+            // This transaction holds the write lock. A source committed immediately before it
+            // is observed here; one that begins immediately after it will mark the new model
+            // stale after activation. Neither path can silently omit human evidence.
+            return Ok(StudioModelActivationOutcome::SourceSnapshotStale);
+        }
+        let expected_job_id: String = transaction.query_row(
+            "SELECT background_job_id FROM studio_training_runs WHERE id = ?1",
+            params![candidate.training_run_id],
+            |row| row.get(0),
+        )?;
+        if expected_job_id != completed_job.id.to_string()
+            || completed_job.state != WorkflowRunState::Completed
+        {
+            return Err(PersistenceError::InvalidData(
+                "Studio activation must complete its own terminal background job".into(),
+            ));
+        }
+        if let Err(error) = verify_studio_model_artifact(&candidate) {
+            let now = timestamp(&Utc::now());
+            transaction.execute(
+                "UPDATE studio_models SET state = 'invalid' WHERE id = ?1 AND state = 'candidate'",
+                params![model_id],
+            )?;
+            transaction.execute(
+                "UPDATE studio_training_runs SET state = 'failed', error_message = ?2, updated_at = ?3, finished_at = ?3 WHERE id = ?1",
+                params![candidate.training_run_id, "A local Studio Brain candidate could not be validated before activation.", now],
+            )?;
+            insert_studio_event(
+                &transaction,
+                profile_id,
+                None,
+                Some(&candidate.training_run_id),
+                Some(model_id),
+                "STUDIO_TRAINING_FAILED",
+                &serde_json::json!({"reason":"candidate_artifact_validation_failed"}),
+                &now,
+            )?;
+            transaction.commit()?;
+            return Err(error);
+        }
+        let now = timestamp(&Utc::now());
+        transaction.execute("UPDATE studio_models SET state = 'previous' WHERE studio_profile_id = ?1 AND state = 'active'", params![profile_id])?;
+        transaction.execute("UPDATE studio_models SET state = 'active', activated_at = ?3 WHERE id = ?1 AND studio_profile_id = ?2 AND state = 'candidate'", params![model_id, profile_id, now])?;
+        // New candidate recommendations were persisted while this model was still a candidate,
+        // so no intermediate state can hide a previous active model. This single transaction
+        // switches model visibility and retires prior advisory rows together.
+        transaction.execute(
+            "UPDATE studio_recommendations SET stale = 1, status = 'stale' WHERE studio_profile_id = ?1 AND studio_model_id <> ?2 AND stale = 0",
+            params![profile_id, model_id],
+        )?;
+        let run_id = candidate.training_run_id;
+        transaction.execute("UPDATE studio_training_runs SET state = 'completed', updated_at = ?2, finished_at = ?2 WHERE id = ?1", params![run_id, now])?;
+        transaction.execute("UPDATE studio_profiles SET training_status = 'ready', last_trained_at = ?2, last_error = NULL, updated_at = ?2 WHERE id = ?1", params![profile_id, now])?;
+        let updated_job = transaction.execute(
+            "UPDATE background_jobs SET state_json = ?2, stage_json = ?3, items_completed = ?4, items_total = ?5, files_discovered = ?6, files_processed = ?7, error_count = ?8, error_message = ?9, resume_metadata_json = ?10, updated_at = ?11, finished_at = ?12 WHERE id = ?1",
+            params![completed_job.id.to_string(), json(&completed_job.state)?, json(&completed_job.stage)?, completed_job.items_completed as i64, completed_job.items_total.map(|value| value as i64), completed_job.files_discovered as i64, completed_job.files_processed as i64, completed_job.error_count as i64, completed_job.error_message, completed_job.resume_metadata.as_ref().map(serde_json::to_string).transpose()?, timestamp(&completed_job.updated_at), optional_timestamp(&completed_job.finished_at)],
+        )?;
+        if updated_job != 1 {
+            return Err(PersistenceError::InvalidData(
+                "Studio activation background job is missing".into(),
+            ));
+        }
+        insert_studio_event(
+            &transaction,
+            profile_id,
+            None,
+            Some(&run_id),
+            Some(model_id),
+            "STUDIO_MODEL_ACTIVATED",
+            &serde_json::json!({"modelId": model_id}),
+            &now,
+        )?;
+        insert_studio_event(
+            &transaction,
+            profile_id,
+            None,
+            Some(&run_id),
+            Some(model_id),
+            "STUDIO_TRAINING_COMPLETED",
+            &serde_json::json!({"modelId": model_id}),
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(StudioModelActivationOutcome::Activated)
+    }
+
+    fn active_studio_model(&self, profile_id: &str) -> Result<Option<StudioModelRecord>> {
+        let model = self.connection.query_row(
+            "SELECT id, studio_profile_id, studio_training_run_id, algorithm, model_version, feature_schema_version, artifact_json, checksum, artifact_size_bytes, state, metrics_json, created_at, activated_at FROM studio_models WHERE studio_profile_id = ?1 AND state = 'active' ORDER BY activated_at DESC, id DESC LIMIT 1",
+            params![profile_id], studio_model_from_row,
+        ).optional()?;
+        if let Some(model) = model {
+            if verify_studio_model_artifact(&model).is_err() {
+                invalidate_corrupt_active_studio_model(&self.connection, &model)?;
+                return Ok(None);
+            }
+            return Ok(Some(model));
+        }
+        Ok(None)
+    }
+
+    fn latest_studio_training_run(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<StudioTrainingRunRecord>> {
+        self.connection.query_row(
+            "SELECT id, studio_profile_id, background_job_id, algorithm, algorithm_version, feature_schema_version, parameters_json, snapshot_hash, snapshot_count, previous_active_model_id, state, error_message, created_at, updated_at, finished_at FROM studio_training_runs WHERE studio_profile_id = ?1 ORDER BY updated_at DESC, id DESC LIMIT 1",
+            params![profile_id], studio_training_run_from_row,
+        ).optional().map_err(Into::into)
+    }
+
+    fn replace_studio_recommendations(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        project_id: &ProjectId,
+        recommendations: &[StudioRecommendationRecord],
+    ) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let model_state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM studio_models WHERE id = ?1 AND studio_profile_id = ?2",
+                params![model_id, profile_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(model_state) = model_state else {
+            return Err(PersistenceError::InvalidData(
+                "Studio model does not belong to this profile".into(),
+            ));
+        };
+        if !matches!(model_state.as_str(), "candidate" | "active") {
+            return Err(PersistenceError::InvalidData(
+                "cannot write recommendations for an invalid Studio model".into(),
+            ));
+        }
+        if model_state == "active" {
+            transaction.execute("UPDATE studio_recommendations SET stale = 1, status = 'stale' WHERE studio_profile_id = ?1 AND project_id = ?2 AND studio_model_id <> ?3 AND stale = 0", params![profile_id, project_id.to_string(), model_id])?;
+        }
+        for record in recommendations {
+            if record.profile_id != profile_id
+                || record.model_id != model_id
+                || record.project_id != project_id.to_string()
+            {
+                return Err(PersistenceError::InvalidData(
+                    "Studio recommendation scope mismatch".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO studio_recommendations (id, studio_profile_id, studio_model_id, project_id, media_asset_id, feature_schema_version, feature_fingerprint, recommendation, confidence_band, explanation_json, generic_recommendation_json, agreement, status, stale, generated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'ready', 0, ?13) ON CONFLICT(studio_model_id, media_asset_id, feature_fingerprint) DO UPDATE SET recommendation = excluded.recommendation, confidence_band = excluded.confidence_band, explanation_json = excluded.explanation_json, generic_recommendation_json = excluded.generic_recommendation_json, agreement = excluded.agreement, status = 'ready', stale = 0, generated_at = excluded.generated_at",
+                params![record.id, record.profile_id, record.model_id, record.project_id, record.media_asset_id, record.feature_schema_version, record.feature_fingerprint, record.recommendation, record.confidence_band, json(&record.explanation_json)?, json(&record.generic_recommendation_json)?, record.agreement, record.generated_at],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn reset_studio_personalization(&self, profile_id: &str) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_studio_profile_exists(&transaction, profile_id)?;
+        let now = timestamp(&Utc::now());
+        transaction.execute("UPDATE studio_models SET state = 'reset' WHERE studio_profile_id = ?1 AND state IN ('active', 'previous', 'candidate')", params![profile_id])?;
+        transaction.execute("UPDATE studio_recommendations SET stale = 1, status = 'stale' WHERE studio_profile_id = ?1 AND stale = 0", params![profile_id])?;
+        let example_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM studio_training_examples WHERE studio_profile_id = ?1",
+            params![profile_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute("UPDATE studio_profiles SET training_status = ?2, last_trained_at = NULL, last_error = NULL, readiness_json = ?3, updated_at = ?4 WHERE id = ?1", params![profile_id, if example_count == 0 { "not_ready" } else { "learning" }, json(&serde_json::json!({"state": if example_count == 0 { "not_ready" } else { "learning" }, "reasons":["Personalized model artifacts were reset. Human decisions remain available for an explicit local retrain."]}))?, now])?;
+        insert_studio_event(
+            &transaction,
+            profile_id,
+            None,
+            None,
+            None,
+            "PERSONALIZATION_RESET",
+            &serde_json::json!({"humanDecisionsPreserved": true}),
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn recover_interrupted_studio_training(&self) -> Result<u64> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let now = timestamp(&Utc::now());
+        let changed = transaction.execute("UPDATE studio_training_runs SET state = 'interrupted', error_message = COALESCE(error_message, 'Studio Brain training was interrupted before activation; any previous personalized model remains active.'), updated_at = ?1, finished_at = ?1 WHERE state IN ('queued', 'training', 'evaluating', 'persisting')", params![now])?;
+        transaction.execute("UPDATE background_jobs SET state_json = '\"interrupted\"', stage_json = '\"studio_training\"', error_message = COALESCE(error_message, 'Studio Brain training was interrupted before activation; any previous personalized model remains active.'), updated_at = ?1, finished_at = ?1 WHERE state_json = '\"running\"' AND resume_metadata_json LIKE '%\"pipeline\":\"studio-training\"%'", params![now])?;
+        transaction.commit()?;
+        Ok(changed as u64)
     }
 
     fn latest_capture_intelligence_job(
@@ -4902,6 +6334,10 @@ impl CatalogRepository for SqliteRepository {
             "INSERT INTO semantic_embeddings (media_asset_id, project_id, input_fingerprint, model_id, provider, model_version, embedding_version, preprocessing_version, metric, dimensions, encoding, embedding_blob, generated_at, status, error_message, stale) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'f32le-normalized', ?11, ?12, ?13, ?14, 0) ON CONFLICT(media_asset_id, input_fingerprint, model_id, provider, model_version, embedding_version, preprocessing_version, metric) DO UPDATE SET project_id = excluded.project_id, dimensions = excluded.dimensions, encoding = excluded.encoding, embedding_blob = excluded.embedding_blob, generated_at = excluded.generated_at, status = excluded.status, error_message = excluded.error_message, stale = 0",
             params![embedding.media_asset_id.to_string(), embedding.project_id.to_string(), embedding.input_fingerprint, embedding.model.model_id, embedding.model.provider, embedding.model.model_version, embedding.model.embedding_version, embedding.model.preprocessing_version, embedding.model.metric, dimensions as i64, blob, timestamp(&embedding.generated_at), embedding.status.as_str(), embedding.error_message],
         )?;
+        mark_studio_recommendations_stale_for_asset(
+            &self.connection,
+            &embedding.media_asset_id.to_string(),
+        )?;
         Ok(())
     }
 
@@ -4933,6 +6369,12 @@ impl CatalogRepository for SqliteRepository {
                 model.dimensions as i64,
             ],
         )?;
+        if changed > 0 {
+            mark_studio_recommendations_stale_for_project(
+                &self.connection,
+                &project_id.to_string(),
+            )?;
+        }
         Ok(changed as u64)
     }
 
@@ -5601,7 +7043,24 @@ impl CatalogRepository for SqliteRepository {
                 "timeline and analysis run project IDs differ".into(),
             ));
         }
-        let transaction = self.connection.unchecked_transaction()?;
+        let referenced_assets = validate_moment_projection_payload(
+            timeline,
+            run,
+            Some(0),
+            0,
+            segments,
+            moments,
+            memberships,
+            boundaries,
+        )?;
+        let selected_project = ProjectId::try_from(timeline.project_id.as_str())
+            .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+        let transaction = moment_write_transaction(&self.connection)?;
+        assert_moment_assets_belong_to_project(
+            &transaction,
+            &selected_project,
+            &referenced_assets,
+        )?;
         transaction.execute(
             "UPDATE moment_memberships SET active = 0 WHERE project_id = ?1 AND active = 1",
             params![timeline.project_id],
@@ -5613,6 +7072,12 @@ impl CatalogRepository for SqliteRepository {
         transaction.execute(
             "UPDATE timeline_segments SET stale = 1 WHERE project_id = ?1 AND stale = 0",
             params![timeline.project_id],
+        )?;
+        assert_active_moment_projection_contiguous(
+            &transaction,
+            &timeline.project_id,
+            moments,
+            memberships,
         )?;
         transaction.execute(
             "INSERT INTO shoot_timelines (id, project_id, active_run_id, state, analyzer_id, analyzer_version, boundary_algorithm_version, semantic_model_key, input_catalog_version, created_at, updated_at, last_analyzed_at)
@@ -5655,6 +7120,9 @@ impl CatalogRepository for SqliteRepository {
                 params![membership.id, membership.project_id, membership.run_id, membership.moment_id, membership.media_asset_id, membership.ordinal as i64, membership.membership_state, membership.created_at, membership.active],
             )?;
         }
+        remap_human_labels_to_active_moments(&transaction, &timeline.project_id)?;
+        remap_coverage_confirmations_to_active_moments(&transaction, &timeline.project_id)?;
+        remap_human_representatives_to_active_moments(&transaction, &timeline.project_id)?;
         for boundary in boundaries {
             transaction.execute(
                 "INSERT INTO moment_boundary_evidence (id, project_id, run_id, left_asset_id, right_asset_id, ordinal, category, components_json, explanation, created_at)
@@ -5662,6 +7130,11 @@ impl CatalogRepository for SqliteRepository {
                 params![boundary.id, boundary.project_id, boundary.run_id, boundary.left_asset_id, boundary.right_asset_id, boundary.ordinal as i64, boundary.category, json(&boundary.components)?, boundary.explanation, boundary.created_at],
             )?;
         }
+        transaction.execute(
+            "UPDATE studio_recommendations SET stale = 1, status = 'stale'
+             WHERE project_id = ?1 AND stale = 0",
+            params![timeline.project_id],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -5692,9 +7165,10 @@ impl CatalogRepository for SqliteRepository {
                 "affected tail ordinal exceeds SQLite integer range".into(),
             )
         })?;
-        let referenced_assets = validate_moment_tail_payload(
+        let referenced_assets = validate_moment_projection_payload(
             timeline,
             run,
+            None,
             affected_tail_start_ordinal,
             segments,
             moments,
@@ -5703,8 +7177,12 @@ impl CatalogRepository for SqliteRepository {
         )?;
         let selected_project = ProjectId::try_from(timeline.project_id.as_str())
             .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
-        assert_moment_tail_assets_belong_to_project(
-            &self.connection,
+        // Validate every mutable part of the existing projection while holding the writer
+        // reservation. A second catalog connection cannot slip a structural edit between these
+        // checks and the replacement below.
+        let transaction = moment_write_transaction(&self.connection)?;
+        assert_moment_assets_belong_to_project(
+            &transaction,
             &selected_project,
             &referenced_assets,
         )?;
@@ -5712,14 +7190,10 @@ impl CatalogRepository for SqliteRepository {
             .iter()
             .map(|membership| membership.media_asset_id.clone())
             .collect();
-        let new_moment_anchors: BTreeSet<String> = moments
-            .iter()
-            .map(|moment| moment.anchor_asset_id.clone())
-            .collect();
 
         // A tail writer must never cut an existing active Moment in half. The window method
         // selects whole latest Moment(s), but this check also protects direct callers.
-        let crosses_existing_moment: bool = self.connection.query_row(
+        let crosses_existing_moment: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1
                 FROM moment_memberships earlier
@@ -5744,8 +7218,7 @@ impl CatalogRepository for SqliteRepository {
             ));
         }
 
-        let old_tail_assets: BTreeSet<String> = self
-            .connection
+        let old_tail_assets: BTreeSet<String> = transaction
             .prepare(
                 "SELECT media_asset_id FROM moment_memberships
                  WHERE project_id = ?1 AND active = 1 AND ordinal >= ?2
@@ -5760,11 +7233,10 @@ impl CatalogRepository for SqliteRepository {
             ));
         }
 
-        // Human labels/representatives are anchored to a stable asset, not a generated Moment
-        // ID. Requiring the corresponding anchor in the replacement makes a tail update fail
-        // closed rather than hide a photographer's current presentation choice.
-        let protected_tail_anchors: BTreeSet<String> = self
-            .connection
+        // A label and representative follow their photographer-selected asset through a
+        // resegmented tail. The replacement must retain those assets even when its generated
+        // card anchor changes.
+        let protected_tail_label_anchors: BTreeSet<String> = transaction
             .prepare(
                 "SELECT record.anchor_asset_id
                  FROM moment_records record
@@ -5779,9 +7251,11 @@ impl CatalogRepository for SqliteRepository {
                          AND member.membership_state = 'member'
                          AND member.ordinal >= ?3
                    )
-                   AND (
-                       EXISTS (SELECT 1 FROM moment_human_labels label WHERE label.project_id = record.project_id AND label.anchor_asset_id = record.anchor_asset_id)
-                       OR EXISTS (SELECT 1 FROM moment_human_representatives representative WHERE representative.project_id = record.project_id AND representative.anchor_asset_id = record.anchor_asset_id)
+                   AND EXISTS (
+                       SELECT 1
+                       FROM moment_human_labels label
+                       WHERE label.project_id = record.project_id
+                         AND label.anchor_asset_id = record.anchor_asset_id
                    )",
             )?
             .query_map(
@@ -5789,14 +7263,42 @@ impl CatalogRepository for SqliteRepository {
                 |row| row.get(0),
             )?
             .collect::<std::result::Result<_, _>>()?;
-        if !protected_tail_anchors.is_subset(&new_moment_anchors) {
+        if !protected_tail_label_anchors.is_subset(&new_membership_assets) {
             return Err(PersistenceError::InvalidData(
-                "tail replacement would orphan a human Moment label or representative anchor; use a full rebuild with preserved anchors"
+                "tail replacement would orphan a human Moment label anchor asset; use a full rebuild with that asset"
                     .into(),
             ));
         }
-
-        let transaction = self.connection.unchecked_transaction()?;
+        let protected_tail_representative_assets: BTreeSet<String> = transaction
+            .prepare(
+                "SELECT representative.media_asset_id
+                 FROM moment_human_representatives representative
+                 JOIN moment_records record
+                   ON record.project_id = representative.project_id
+                  AND record.anchor_asset_id = representative.anchor_asset_id
+                 WHERE representative.project_id = ?1
+                   AND record.timeline_id = ?2
+                   AND record.stale = 0
+                   AND EXISTS (
+                       SELECT 1 FROM moment_memberships member
+                       WHERE member.project_id = record.project_id
+                         AND member.moment_id = record.id
+                         AND member.active = 1
+                         AND member.membership_state = 'member'
+                         AND member.ordinal >= ?3
+                   )",
+            )?
+            .query_map(
+                params![timeline.project_id, timeline.timeline_id, tail_start],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<_, _>>()?;
+        if !protected_tail_representative_assets.is_subset(&new_membership_assets) {
+            return Err(PersistenceError::InvalidData(
+                "tail replacement would orphan a photographer-selected representative; use a full rebuild with that selected asset"
+                    .into(),
+            ));
+        }
         transaction.execute(
             "UPDATE timeline_segments
              SET stale = 1
@@ -5837,6 +7339,12 @@ impl CatalogRepository for SqliteRepository {
              SET active = 0
              WHERE project_id = ?1 AND active = 1 AND ordinal >= ?2",
             params![timeline.project_id, tail_start],
+        )?;
+        assert_active_moment_projection_contiguous(
+            &transaction,
+            &timeline.project_id,
+            moments,
+            memberships,
         )?;
 
         for moment in moments {
@@ -5927,6 +7435,9 @@ impl CatalogRepository for SqliteRepository {
                 params![membership.id, membership.project_id, membership.run_id, membership.moment_id, membership.media_asset_id, membership.ordinal as i64, membership.membership_state, membership.created_at, membership.active],
             )?;
         }
+        remap_human_labels_to_active_moments(&transaction, &timeline.project_id)?;
+        remap_coverage_confirmations_to_active_moments(&transaction, &timeline.project_id)?;
+        remap_human_representatives_to_active_moments(&transaction, &timeline.project_id)?;
         for boundary in boundaries {
             transaction.execute(
                 "INSERT INTO moment_boundary_evidence (id, project_id, run_id, left_asset_id, right_asset_id, ordinal, category, components_json, explanation, created_at)
@@ -5934,6 +7445,11 @@ impl CatalogRepository for SqliteRepository {
                 params![boundary.id, boundary.project_id, boundary.run_id, boundary.left_asset_id, boundary.right_asset_id, boundary.ordinal as i64, boundary.category, json(&boundary.components)?, boundary.explanation, boundary.created_at],
             )?;
         }
+        transaction.execute(
+            "UPDATE studio_recommendations SET stale = 1, status = 'stale'
+             WHERE project_id = ?1 AND stale = 0",
+            params![timeline.project_id],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -6077,17 +7593,19 @@ impl CatalogRepository for SqliteRepository {
                 "moment label must contain 1 through 160 characters".into(),
             ));
         }
-        let anchor = moment_anchor_asset_id(&self.connection, project_id, moment_id)?;
         let now = timestamp(&Utc::now());
-        self.connection.execute(
+        let transaction = moment_write_transaction(&self.connection)?;
+        let anchor = moment_anchor_asset_id(&transaction, project_id, moment_id)?;
+        transaction.execute(
             "INSERT INTO moment_human_labels (id, project_id, anchor_asset_id, label, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(project_id, anchor_asset_id) DO UPDATE SET label = excluded.label, updated_at = excluded.updated_at",
             params![Uuid::new_v4().to_string(), project_id.to_string(), anchor, label, now],
         )?;
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_RENAMED', ?4, ?5)",
             params![Uuid::new_v4().to_string(), project_id.to_string(), moment_id, json(&serde_json::json!({"label": label}))?, now],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -6097,22 +7615,74 @@ impl CatalogRepository for SqliteRepository {
         moment_id: &str,
         asset_id: &str,
     ) -> Result<()> {
-        let anchor = moment_anchor_asset_id(&self.connection, project_id, moment_id)?;
-        if !self.moment_contains_asset(project_id, moment_id, asset_id)? {
+        // Validate the user-visible target before setting a guard so an invalid request cannot
+        // leave an otherwise healthy local profile waiting for restart recovery.
+        if !self.moment_belongs_to_project(project_id, moment_id)? {
+            return Err(PersistenceError::InvalidData(
+                "moment does not belong to the selected project".into(),
+            ));
+        }
+        let member_belongs_to_moment: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND media_asset_id = ?3 AND active = 1 AND membership_state = 'member')",
+            params![project_id.to_string(), moment_id, asset_id],
+            |row| row.get(0),
+        )?;
+        if !member_belongs_to_moment {
+            return Err(PersistenceError::InvalidData(
+                "human representative must belong to the selected moment".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let anchor = moment_anchor_asset_id(&transaction, project_id, moment_id)?;
+        let member_belongs_to_moment: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND media_asset_id = ?3 AND active = 1 AND membership_state = 'member')",
+            params![project_id.to_string(), moment_id, asset_id],
+            |row| row.get(0),
+        )?;
+        if !member_belongs_to_moment {
             return Err(PersistenceError::InvalidData(
                 "human representative must belong to the selected moment".into(),
             ));
         }
         let now = timestamp(&Utc::now());
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO moment_human_representatives (id, project_id, anchor_asset_id, media_asset_id, selected_at) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(project_id, anchor_asset_id) DO UPDATE SET media_asset_id = excluded.media_asset_id, selected_at = excluded.selected_at",
             params![Uuid::new_v4().to_string(), project_id.to_string(), anchor, asset_id, now],
         )?;
-        self.connection.execute(
+        let moment_event_id = Uuid::new_v4().to_string();
+        transaction.execute(
             "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_REPRESENTATIVE_CHANGED', ?4, ?5)",
-            params![Uuid::new_v4().to_string(), project_id.to_string(), moment_id, json(&serde_json::json!({"assetId": asset_id}))?, now],
+            params![moment_event_id, project_id.to_string(), moment_id, json(&serde_json::json!({"assetId": asset_id}))?, now],
         )?;
+        transaction.commit()?;
+        let mut source_materialized = false;
+        let mut captured_profile_id = None;
+        if let Ok(profile_id) = self.ensure_default_studio_profile() {
+            captured_profile_id = Some(profile_id.clone());
+            match materialize_live_moment_representative(
+                &self.connection,
+                &profile_id,
+                &moment_event_id,
+                &project_id.to_string(),
+                moment_id,
+                asset_id,
+                &now,
+            ) {
+                Ok(()) => source_materialized = true,
+                Err(_) => mark_studio_source_capture_deferred(&self.connection, &profile_id),
+            }
+        }
+        if source_materialized {
+            if let Some(profile_id) = captured_profile_id.as_deref() {
+                let _ = finish_studio_source_materialization(
+                    &self.connection,
+                    profile_id,
+                    "moment_representative",
+                    &moment_event_id,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -6122,23 +7692,35 @@ impl CatalogRepository for SqliteRepository {
         left_moment_id: &str,
         right_moment_id: &str,
     ) -> Result<()> {
-        let left = moment_record_for_edit(&self.connection, project_id, left_moment_id)?;
-        let right = moment_record_for_edit(&self.connection, project_id, right_moment_id)?;
-        if left.0 != right.0 || left.1 != right.1 || right.3 != left.3 + 1 {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let left = moment_record_for_edit(&transaction, project_id, left_moment_id)?;
+        let right = moment_record_for_edit(&transaction, project_id, right_moment_id)?;
+        if left.0 != right.0 || right.3 != left.3 + 1 {
             return Err(PersistenceError::InvalidData(
                 "only adjacent active moments can be merged".into(),
             ));
         }
-        let left_last = self.connection.query_row(
+        if left.1 != right.1 {
+            return Err(PersistenceError::InvalidData(
+                "These adjacent Moments are from different local analysis runs. Rebuild AI timeline before merging across this boundary.".into(),
+            ));
+        }
+        rebind_human_label_for_active_moment(
+            &transaction,
+            project_id,
+            &right.4,
+            &left.4,
+            left_moment_id,
+        )?;
+        let left_last = transaction.query_row(
             "SELECT media_asset_id FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' ORDER BY ordinal DESC, media_asset_id DESC LIMIT 1",
             params![project_id.to_string(), left_moment_id], |row| row.get::<_, String>(0),
         )?;
-        let right_first = self.connection.query_row(
+        let right_first = transaction.query_row(
             "SELECT media_asset_id FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' ORDER BY ordinal ASC, media_asset_id ASC LIMIT 1",
             params![project_id.to_string(), right_moment_id], |row| row.get::<_, String>(0),
         )?;
         let now = timestamp(&Utc::now());
-        let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO moment_override_operations (id, project_id, operation, left_asset_id, right_asset_id, created_at, active) VALUES (?1, ?2, 'merge', ?3, ?4, ?5, 1)
              ON CONFLICT(project_id, operation, left_asset_id, right_asset_id) DO UPDATE SET active = 1, created_at = excluded.created_at",
@@ -6148,17 +7730,47 @@ impl CatalogRepository for SqliteRepository {
             "UPDATE moment_memberships SET moment_id = ?3 WHERE project_id = ?1 AND moment_id = ?2 AND active = 1",
             params![project_id.to_string(), right_moment_id, left_moment_id],
         )?;
+        if let Some(asset_id) = rebind_human_representative_for_active_moment(
+            &transaction,
+            project_id,
+            &right.4,
+            &left.4,
+            left_moment_id,
+        )? {
+            transaction.execute(
+                "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_REPRESENTATIVE_CHANGED', ?4, ?5)",
+                params![Uuid::new_v4().to_string(), project_id.to_string(), left_moment_id, json(&serde_json::json!({"assetId": asset_id, "source": "merge_rebind", "previousMomentId": right_moment_id}))?, now],
+            )?;
+        }
+        // A coverage confirmation is a photographer decision about a particular asset. When its
+        // selected Moment is absorbed, retain that decision on the surviving active Moment rather
+        // than leaving it pointed at a stale generated record.
+        transaction.execute(
+            "UPDATE coverage_confirmations SET moment_id = ?1 WHERE project_id = ?2 AND moment_id = ?3",
+            params![left_moment_id, project_id.to_string(), right_moment_id],
+        )?;
         transaction.execute(
             "UPDATE moment_records SET stale = 1 WHERE id = ?1 AND project_id = ?2",
             params![right_moment_id, project_id.to_string()],
         )?;
         transaction.execute(
+            "UPDATE timeline_segments SET stale = 1 WHERE id = ?1 AND project_id = ?2",
+            params![right.2, project_id.to_string()],
+        )?;
+        transaction.execute(
             "UPDATE moment_records SET asset_count = (SELECT COUNT(*) FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member'), ended_at = (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM moment_memberships member JOIN media_assets asset ON asset.id = member.media_asset_id LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE member.project_id = ?1 AND member.moment_id = ?2 AND member.active = 1 ORDER BY member.ordinal DESC LIMIT 1) WHERE id = ?2",
             params![project_id.to_string(), left_moment_id],
         )?;
+        let active_order = active_moment_ids_for_project(&transaction, project_id)?;
+        reindex_active_moment_projection(&transaction, project_id, &active_order)?;
         transaction.execute(
             "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_MERGED', ?4, ?5)",
             params![Uuid::new_v4().to_string(), project_id.to_string(), left_moment_id, json(&serde_json::json!({"mergedMomentId": right_moment_id}))?, now],
+        )?;
+        transaction.execute(
+            "UPDATE studio_recommendations SET stale = 1, status = 'stale'
+             WHERE project_id = ?1 AND stale = 0",
+            params![project_id.to_string()],
         )?;
         transaction.commit()?;
         Ok(())
@@ -6170,49 +7782,87 @@ impl CatalogRepository for SqliteRepository {
         moment_id: &str,
         after_asset_id: &str,
     ) -> Result<()> {
-        let (timeline_id, run_id, _segment_id, moment_ordinal, _anchor, _started, _ended) =
-            moment_record_for_edit(&self.connection, project_id, moment_id)?;
-        let after_ordinal: i64 = self.connection.query_row(
+        let transaction = moment_write_transaction(&self.connection)?;
+        let (timeline_id, run_id, _segment_id, _moment_ordinal, source_anchor, _started, _ended) =
+            moment_record_for_edit(&transaction, project_id, moment_id)?;
+        let after_ordinal: i64 = transaction.query_row(
             "SELECT ordinal FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND media_asset_id = ?3 AND active = 1 AND membership_state = 'member'",
             params![project_id.to_string(), moment_id, after_asset_id], |row| row.get(0),
         ).optional()?.ok_or_else(|| PersistenceError::InvalidData("split point must be a member of the selected moment".into()))?;
-        let next = self.connection.query_row(
+        let next = transaction.query_row(
             "SELECT media_asset_id, ordinal FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' AND ordinal > ?3 ORDER BY ordinal ASC, media_asset_id ASC LIMIT 1",
             params![project_id.to_string(), moment_id, after_ordinal], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         ).optional()?.ok_or_else(|| PersistenceError::InvalidData("split point must leave at least one photo after it".into()))?;
+        let (next_asset_id, _next_membership_ordinal) = next;
         let new_moment_id = Uuid::new_v4().to_string();
         let new_segment_id = Uuid::new_v4().to_string();
         let now = timestamp(&Utc::now());
-        let new_ordinal = moment_ordinal + 1;
-        let segment_ordinal: i64 = self.connection.query_row(
-            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM timeline_segments WHERE run_id = ?1",
+        let (after_time, next_time): (Option<String>, Option<String>) = transaction.query_row(
+            "SELECT (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM media_assets asset LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE asset.id = ?1), (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM media_assets asset LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE asset.id = ?2)",
+            params![after_asset_id, next_asset_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut active_order = active_moment_ids_for_project(&transaction, project_id)?;
+        let insertion_index = active_order
+            .iter()
+            .position(|id| id == moment_id)
+            .ok_or_else(|| {
+                PersistenceError::InvalidData(
+                    "selected Moment changed before its split could be saved".into(),
+                )
+            })?
+            + 1;
+        active_order.insert(insertion_index, new_moment_id.clone());
+        let new_ordinal = next_moment_record_ordinal(&transaction, project_id, &run_id)?;
+        let previous_segment_ordinal: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(ordinal), -1) FROM timeline_segments WHERE run_id = ?1",
             params![run_id],
             |row| row.get(0),
         )?;
-        let (after_time, next_time): (Option<String>, Option<String>) = self.connection.query_row(
-            "SELECT (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM media_assets asset LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE asset.id = ?1), (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM media_assets asset LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE asset.id = ?2)",
-            params![after_asset_id, next.0], |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "UPDATE moment_records SET ordinal = ordinal + 1000000 WHERE project_id = ?1 AND run_id = ?2 AND stale = 0 AND ordinal > ?3",
-            params![project_id.to_string(), run_id, moment_ordinal],
-        )?;
-        transaction.execute(
-            "UPDATE moment_records SET ordinal = ordinal - 999999 WHERE project_id = ?1 AND run_id = ?2 AND stale = 0 AND ordinal >= ?3",
-            params![project_id.to_string(), run_id, moment_ordinal + 1_000_001],
-        )?;
+        let segment_ordinal = previous_segment_ordinal.checked_add(1).ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "timeline segment ordinal exceeds SQLite integer range".into(),
+            )
+        })?;
         transaction.execute(
             "INSERT INTO timeline_segments (id, project_id, run_id, ordinal, started_at, ended_at, asset_count, boundary_category, boundary_evidence_json, created_at, stale) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 'strong', ?6, ?7, 0)",
             params![new_segment_id, project_id.to_string(), run_id, segment_ordinal, next_time, json(&serde_json::json!({"manual": true, "afterAssetId": after_asset_id}))?, now],
         )?;
         transaction.execute(
             "INSERT INTO moment_records (id, project_id, timeline_id, run_id, segment_id, anchor_asset_id, ordinal, started_at, ended_at, asset_count, ai_representative_asset_id, centroid_blob, centroid_dimensions, suggested_label, label_confidence, label_evidence_json, label_state, created_at, stale) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 0, NULL, NULL, NULL, NULL, NULL, '{}', 'abstained', ?9, 0)",
-            params![new_moment_id, project_id.to_string(), timeline_id, run_id, new_segment_id, next.0, new_ordinal, next_time, now],
+            params![new_moment_id, project_id.to_string(), timeline_id, run_id, new_segment_id, next_asset_id, new_ordinal, next_time, now],
         )?;
         transaction.execute(
             "UPDATE moment_memberships SET moment_id = ?4 WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member' AND ordinal > ?3",
             params![project_id.to_string(), moment_id, after_ordinal, new_moment_id],
+        )?;
+        if let Some(asset_id) = rebind_human_representative_for_active_moment(
+            &transaction,
+            project_id,
+            &source_anchor,
+            &next_asset_id,
+            &new_moment_id,
+        )? {
+            transaction.execute(
+                "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_REPRESENTATIVE_CHANGED', ?4, ?5)",
+                params![Uuid::new_v4().to_string(), project_id.to_string(), new_moment_id, json(&serde_json::json!({"assetId": asset_id, "source": "split_rebind", "previousMomentId": moment_id}))?, now],
+            )?;
+        }
+        // Keep a human confirmation attached to the same selected asset when that asset moves
+        // into the second Moment created by this split.
+        transaction.execute(
+            "UPDATE coverage_confirmations
+             SET moment_id = ?1
+             WHERE project_id = ?2
+               AND moment_id = ?3
+               AND media_asset_id IN (
+                   SELECT media_asset_id
+                   FROM moment_memberships
+                   WHERE project_id = ?2
+                     AND moment_id = ?1
+                     AND active = 1
+                     AND membership_state = 'member'
+               )",
+            params![new_moment_id, project_id.to_string(), moment_id],
         )?;
         transaction.execute(
             "UPDATE moment_records SET asset_count = (SELECT COUNT(*) FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member'), ended_at = ?3 WHERE id = ?2",
@@ -6222,13 +7872,19 @@ impl CatalogRepository for SqliteRepository {
             "UPDATE moment_records SET asset_count = (SELECT COUNT(*) FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND active = 1 AND membership_state = 'member'), ended_at = (SELECT COALESCE(metadata.captured_at_local, asset.captured_at) FROM moment_memberships member JOIN media_assets asset ON asset.id = member.media_asset_id LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id WHERE member.project_id = ?1 AND member.moment_id = ?2 AND member.active = 1 ORDER BY member.ordinal DESC LIMIT 1) WHERE id = ?2",
             params![project_id.to_string(), new_moment_id],
         )?;
+        reindex_active_moment_projection(&transaction, project_id, &active_order)?;
         transaction.execute(
             "INSERT INTO moment_override_operations (id, project_id, operation, left_asset_id, right_asset_id, created_at, active) VALUES (?1, ?2, 'split', ?3, ?4, ?5, 1) ON CONFLICT(project_id, operation, left_asset_id, right_asset_id) DO UPDATE SET active = 1, created_at = excluded.created_at",
-            params![Uuid::new_v4().to_string(), project_id.to_string(), after_asset_id, next.0, now],
+            params![Uuid::new_v4().to_string(), project_id.to_string(), after_asset_id, next_asset_id, now],
         )?;
         transaction.execute(
             "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'MOMENT_SPLIT', ?4, ?5), (?6, ?2, ?7, 'MOMENT_CREATED', ?8, ?5)",
             params![Uuid::new_v4().to_string(), project_id.to_string(), moment_id, json(&serde_json::json!({"afterAssetId": after_asset_id, "newMomentId": new_moment_id}))?, now, Uuid::new_v4().to_string(), new_moment_id, json(&serde_json::json!({"source":"human_split", "afterAssetId": after_asset_id}))?],
+        )?;
+        transaction.execute(
+            "UPDATE studio_recommendations SET stale = 1, status = 'stale'
+             WHERE project_id = ?1 AND stale = 0",
+            params![project_id.to_string()],
         )?;
         transaction.commit()?;
         Ok(())
@@ -6267,10 +7923,12 @@ impl CatalogRepository for SqliteRepository {
                 "checklist phrase must contain 1 through 160 characters".into(),
             ));
         }
-        self.connection.execute(
+        let transaction = moment_write_transaction(&self.connection)?;
+        transaction.execute(
             "INSERT INTO coverage_checklist_items (id, project_id, phrase, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(project_id, phrase) DO NOTHING",
             params![item.id, item.project_id, phrase, item.created_at],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -6287,7 +7945,8 @@ impl CatalogRepository for SqliteRepository {
                 "unsupported coverage confirmation state".into(),
             ));
         }
-        let checklist_owned: bool = self.connection.query_row(
+        let transaction = moment_write_transaction(&self.connection)?;
+        let checklist_owned: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM coverage_checklist_items WHERE id = ?1 AND project_id = ?2)", params![checklist_item_id, project_id.to_string()], |row| row.get(0),
         )?;
         if !checklist_owned {
@@ -6296,7 +7955,12 @@ impl CatalogRepository for SqliteRepository {
             ));
         }
         if let Some(moment_id) = moment_id {
-            if !self.moment_belongs_to_project(project_id, moment_id)? {
+            let moment_belongs_to_project: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM moment_records WHERE id = ?1 AND project_id = ?2 AND stale = 0)",
+                params![moment_id, project_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !moment_belongs_to_project {
                 return Err(PersistenceError::InvalidData(
                     "moment does not belong to the selected project".into(),
                 ));
@@ -6305,13 +7969,23 @@ impl CatalogRepository for SqliteRepository {
         if let Some(asset_id) = media_asset_id {
             let asset = MediaAssetId::try_from(asset_id)
                 .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
-            if !self.media_asset_belongs_to_project(&asset, project_id)? {
+            let asset_belongs_to_project: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM media_assets WHERE id = ?1 AND project_id = ?2)",
+                params![asset.to_string(), project_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !asset_belongs_to_project {
                 return Err(PersistenceError::InvalidData(
                     "media asset does not belong to the selected project".into(),
                 ));
             }
             if let Some(moment_id) = moment_id {
-                if !self.moment_contains_asset(project_id, moment_id, asset_id)? {
+                let member_belongs_to_moment: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM moment_memberships WHERE project_id = ?1 AND moment_id = ?2 AND media_asset_id = ?3 AND active = 1 AND membership_state = 'member')",
+                    params![project_id.to_string(), moment_id, asset_id],
+                    |row| row.get(0),
+                )?;
+                if !member_belongs_to_moment {
                     return Err(PersistenceError::InvalidData(
                         "coverage asset must belong to the selected moment".into(),
                     ));
@@ -6319,15 +7993,16 @@ impl CatalogRepository for SqliteRepository {
             }
         }
         let now = timestamp(&Utc::now());
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO coverage_confirmations (id, project_id, checklist_item_id, state, moment_id, media_asset_id, confirmed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(project_id, checklist_item_id) DO UPDATE SET state = excluded.state, moment_id = excluded.moment_id, media_asset_id = excluded.media_asset_id, confirmed_at = excluded.confirmed_at",
             params![Uuid::new_v4().to_string(), project_id.to_string(), checklist_item_id, state, moment_id, media_asset_id, now],
         )?;
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, 'COVERAGE_CONFIRMED', ?4, ?5)",
             params![Uuid::new_v4().to_string(), project_id.to_string(), moment_id, json(&serde_json::json!({"checklistItemId": checklist_item_id, "state": state, "assetId": media_asset_id}))?, now],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -7090,8 +8765,24 @@ fn moment_timeline_rows_with_cursor(
         })?;
     let after_id = after.map(|(_, id)| id);
     let mut statement = connection.prepare(
-        "SELECT m.id, m.ordinal, m.started_at, m.ended_at, m.asset_count, m.ai_representative_asset_id,
-            human_rep.media_asset_id, m.suggested_label, human_label.label,
+        "SELECT m.id, m.ordinal, m.started_at, m.ended_at, m.asset_count,
+            CASE WHEN m.ai_representative_asset_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM moment_memberships representative_member
+                WHERE representative_member.project_id = m.project_id
+                  AND representative_member.moment_id = m.id
+                  AND representative_member.media_asset_id = m.ai_representative_asset_id
+                  AND representative_member.active = 1
+                  AND representative_member.membership_state = 'member'
+            ) THEN m.ai_representative_asset_id ELSE NULL END,
+            CASE WHEN human_rep.media_asset_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM moment_memberships representative_member
+                WHERE representative_member.project_id = m.project_id
+                  AND representative_member.moment_id = m.id
+                  AND representative_member.media_asset_id = human_rep.media_asset_id
+                  AND representative_member.active = 1
+                  AND representative_member.membership_state = 'member'
+            ) THEN human_rep.media_asset_id ELSE NULL END,
+            m.suggested_label, human_label.label,
             COALESCE(human_label.label, m.suggested_label, 'Untitled Moment'), m.label_state,
             (SELECT COUNT(DISTINCT g.id) FROM moment_memberships member JOIN similarity_group_members group_member ON group_member.media_asset_id = member.media_asset_id JOIN similarity_groups g ON g.id = group_member.group_id AND g.stale = 0 WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member'),
             (SELECT COALESCE(SUM(CASE WHEN decision.decision = 'keep' THEN 1 ELSE 0 END), 0) FROM moment_memberships member LEFT JOIN media_decisions decision ON decision.project_id = member.project_id AND decision.media_asset_id = member.media_asset_id WHERE member.project_id = m.project_id AND member.moment_id = m.id AND member.active = 1 AND member.membership_state = 'member'),
@@ -7115,7 +8806,8 @@ fn moment_timeline_rows_with_cursor(
                   WHERE operation.project_id = m.project_id
                     AND operation.active = 1
                     AND member.moment_id = m.id
-              )
+              ),
+            m.run_id
          FROM moment_records m
          LEFT JOIN moment_human_labels human_label ON human_label.project_id = m.project_id AND human_label.anchor_asset_id = m.anchor_asset_id
          LEFT JOIN moment_human_representatives human_rep ON human_rep.project_id = m.project_id AND human_rep.anchor_asset_id = m.anchor_asset_id
@@ -7142,6 +8834,7 @@ fn moment_timeline_rows_with_cursor(
             |row| {
                 Ok(MomentTimelineRow {
                     id: row.get(0)?,
+                    run_id: row.get(21)?,
                     ordinal: row.get::<_, i64>(1)? as u64,
                     started_at: row.get(2)?,
                     ended_at: row.get(3)?,
@@ -7257,6 +8950,632 @@ fn moment_record_for_edit(
         .ok_or_else(|| PersistenceError::InvalidData("moment does not belong to the selected project".into()))
 }
 
+/// Moment writes change a user-visible timeline projection. Acquire SQLite's writer reservation
+/// before making the multi-statement change so a competing catalog writer cannot interleave an
+/// ordinal/override update between validation and commit. `Transaction` still rolls back on any
+/// error unless its caller explicitly commits it.
+fn moment_write_transaction(connection: &Connection) -> Result<Transaction<'_>> {
+    Transaction::new_unchecked(connection, TransactionBehavior::Immediate).map_err(Into::into)
+}
+
+/// Rebind a confirmation whose generated Moment record was replaced to the current active
+/// Moment containing the photographer-selected asset. If no asset was selected, use the old
+/// Moment's durable anchor asset as a conservative structural link. A confirmation whose anchor
+/// is no longer an active member keeps its human state but deliberately loses the stale Moment
+/// reference rather than implying that it belongs to an unrelated replacement card.
+fn remap_coverage_confirmations_to_active_moments(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE coverage_confirmations
+         SET moment_id = (
+             SELECT active_member.moment_id
+             FROM moment_memberships active_member
+             JOIN moment_records active_record ON active_record.id = active_member.moment_id
+             WHERE active_member.project_id = coverage_confirmations.project_id
+               AND active_member.active = 1
+               AND active_member.membership_state = 'member'
+               AND active_record.stale = 0
+               AND active_member.media_asset_id = COALESCE(
+                   coverage_confirmations.media_asset_id,
+                   (
+                       SELECT stale_record.anchor_asset_id
+                       FROM moment_records stale_record
+                       WHERE stale_record.id = coverage_confirmations.moment_id
+                         AND stale_record.project_id = coverage_confirmations.project_id
+                       LIMIT 1
+                   )
+               )
+             ORDER BY active_member.ordinal ASC, active_member.id ASC
+             LIMIT 1
+         )
+         WHERE project_id = ?1
+           AND moment_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1
+               FROM moment_records stale_record
+               WHERE stale_record.id = coverage_confirmations.moment_id
+                 AND stale_record.project_id = coverage_confirmations.project_id
+                 AND stale_record.stale = 1
+           )",
+        params![project_id],
+    )?;
+    Ok(())
+}
+
+/// Keep a photographer's name attached to the active card containing its durable anchor asset
+/// after generated Moments are replaced. Two different human names converging onto one new card
+/// are ambiguous authority, so the enclosing replacement fails closed instead of silently
+/// choosing or erasing either name.
+fn remap_human_labels_to_active_moments(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+) -> Result<()> {
+    let labels = transaction
+        .prepare(
+            "SELECT anchor_asset_id, label, created_at, updated_at
+             FROM moment_human_labels
+             WHERE project_id = ?1
+             ORDER BY updated_at ASC, anchor_asset_id ASC",
+        )?
+        .query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // destination anchor -> (destination Moment ID, source anchor, label, created at, updated at)
+    let mut assignments = BTreeMap::<String, (String, String, String, String, String)>::new();
+    let mut labels_by_destination = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut source_destinations = Vec::<(String, String)>::new();
+    let mut destination_anchors = BTreeSet::<String>::new();
+    for (source_anchor, label, created_at, updated_at) in labels {
+        let destination: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT record.id, record.anchor_asset_id
+                 FROM moment_memberships member
+                 JOIN moment_records record ON record.id = member.moment_id
+                 WHERE member.project_id = ?1
+                   AND member.media_asset_id = ?2
+                   AND member.active = 1
+                   AND member.membership_state = 'member'
+                   AND record.stale = 0
+                 ORDER BY member.ordinal ASC, member.id ASC
+                 LIMIT 1",
+                params![project_id, source_anchor],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((destination_moment_id, destination_anchor)) = destination else {
+            // No active card contains the former anchor. Keep its local history rather than
+            // inventing a new attachment.
+            continue;
+        };
+        labels_by_destination
+            .entry(destination_anchor.clone())
+            .or_default()
+            .insert(label.clone());
+        destination_anchors.insert(destination_anchor.clone());
+        source_destinations.push((source_anchor.clone(), destination_anchor.clone()));
+        let replace_destination = assignments
+            .get(&destination_anchor)
+            .map(|(_, existing_source, _, _, existing_updated_at)| {
+                (updated_at.as_str(), source_anchor.as_str())
+                    >= (existing_updated_at.as_str(), existing_source.as_str())
+            })
+            .unwrap_or(true);
+        if replace_destination {
+            assignments.insert(
+                destination_anchor,
+                (
+                    destination_moment_id,
+                    source_anchor,
+                    label,
+                    created_at,
+                    updated_at,
+                ),
+            );
+        }
+    }
+    if let Some((destination_anchor, _)) = labels_by_destination
+        .iter()
+        .find(|(_, labels)| labels.len() > 1)
+    {
+        return Err(PersistenceError::InvalidData(format!(
+            "multiple human Moment labels would converge on active anchor {destination_anchor}; resolve the names before rebuilding"
+        )));
+    }
+
+    for (
+        destination_anchor,
+        (destination_moment_id, source_anchor, label, created_at, updated_at),
+    ) in assignments
+    {
+        transaction.execute(
+            "INSERT INTO moment_human_labels (id, project_id, anchor_asset_id, label, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(project_id, anchor_asset_id) DO UPDATE SET
+               label = excluded.label,
+               created_at = excluded.created_at,
+               updated_at = excluded.updated_at",
+            params![Uuid::new_v4().to_string(), project_id, destination_anchor, label, created_at, updated_at],
+        )?;
+        if source_anchor != destination_anchor {
+            transaction.execute(
+                "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at)
+                 VALUES (?1, ?2, ?3, 'MOMENT_RENAMED', ?4, ?5)",
+                params![Uuid::new_v4().to_string(), project_id, destination_moment_id, json(&serde_json::json!({"label": label, "previousAnchorAssetId": source_anchor, "source": "generated_projection_replaced"}))?, timestamp(&Utc::now())],
+            )?;
+        }
+    }
+    for (source_anchor, destination_anchor) in source_destinations {
+        if source_anchor != destination_anchor && !destination_anchors.contains(&source_anchor) {
+            transaction.execute(
+                "DELETE FROM moment_human_labels
+                 WHERE project_id = ?1 AND anchor_asset_id = ?2",
+                params![project_id, source_anchor],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Rebind a right-side human label during an explicit merge. A photographer has to resolve
+/// conflicting names themselves; choosing one automatically would rewrite their authority.
+fn rebind_human_label_for_active_moment(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    source_anchor_asset_id: &str,
+    destination_anchor_asset_id: &str,
+    destination_moment_id: &str,
+) -> Result<Option<String>> {
+    if source_anchor_asset_id == destination_anchor_asset_id {
+        return Ok(None);
+    }
+    let source: Option<(String, String, String)> = transaction
+        .query_row(
+            "SELECT label, created_at, updated_at
+             FROM moment_human_labels
+             WHERE project_id = ?1 AND anchor_asset_id = ?2",
+            params![project_id.to_string(), source_anchor_asset_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((label, created_at, updated_at)) = source else {
+        return Ok(None);
+    };
+    let destination_label: Option<String> = transaction
+        .query_row(
+            "SELECT label FROM moment_human_labels
+             WHERE project_id = ?1 AND anchor_asset_id = ?2",
+            params![project_id.to_string(), destination_anchor_asset_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match destination_label.as_deref() {
+        Some(existing) if existing != label => {
+            return Err(PersistenceError::InvalidData(
+                "Cannot merge Moments with different human labels. Rename them to the same label first."
+                    .into(),
+            ));
+        }
+        Some(_) => {
+            // Keep the surviving card's timestamp/provenance when both cards already carry the
+            // same human name. Moving the right row's older timestamp backward would make a
+            // later generated remap choose the wrong otherwise-equivalent history.
+        }
+        None => {
+            transaction.execute(
+                "INSERT INTO moment_human_labels (id, project_id, anchor_asset_id, label, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![Uuid::new_v4().to_string(), project_id.to_string(), destination_anchor_asset_id, label, created_at, updated_at],
+            )?;
+        }
+    }
+    transaction.execute(
+        "DELETE FROM moment_human_labels
+         WHERE project_id = ?1 AND anchor_asset_id = ?2",
+        params![project_id.to_string(), source_anchor_asset_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at)
+         VALUES (?1, ?2, ?3, 'MOMENT_RENAMED', ?4, ?5)",
+        params![Uuid::new_v4().to_string(), project_id.to_string(), destination_moment_id, json(&serde_json::json!({"label": label, "previousAnchorAssetId": source_anchor_asset_id, "source": "merge_rebind"}))?, timestamp(&Utc::now())],
+    )?;
+    Ok(Some(label))
+}
+
+/// Rebind each currently displayable human representative to the active Moment containing the
+/// photographer-selected asset after a generated projection is replaced. Representative rows are
+/// keyed by the generated card's anchor, so leaving an old key in place would silently hide a
+/// valid human choice after resegmentation. If several prior cards resolve to one destination,
+/// the latest explicit selection wins deterministically; the original human events remain intact.
+fn remap_human_representatives_to_active_moments(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+) -> Result<()> {
+    let representatives = transaction
+        .prepare(
+            "SELECT anchor_asset_id, media_asset_id, selected_at
+             FROM moment_human_representatives
+             WHERE project_id = ?1
+             ORDER BY selected_at ASC, anchor_asset_id ASC",
+        )?
+        .query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // destination anchor -> (destination Moment ID, source anchor, selected asset, selected at)
+    let mut assignments = BTreeMap::<String, (String, String, String, String)>::new();
+    let mut source_destinations = Vec::<(String, String)>::new();
+    let mut destination_anchors = BTreeSet::<String>::new();
+    for (source_anchor, selected_asset_id, selected_at) in representatives {
+        let destination: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT record.id, record.anchor_asset_id
+                 FROM moment_memberships member
+                 JOIN moment_records record ON record.id = member.moment_id
+                 WHERE member.project_id = ?1
+                   AND member.media_asset_id = ?2
+                   AND member.active = 1
+                   AND member.membership_state = 'member'
+                   AND record.stale = 0
+                 ORDER BY member.ordinal ASC, member.id ASC
+                 LIMIT 1",
+                params![project_id, selected_asset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((destination_moment_id, destination_anchor)) = destination else {
+            // The asset is not part of the active projection. Preserve the durable human row,
+            // but do not claim it belongs to an unrelated replacement Moment.
+            continue;
+        };
+        destination_anchors.insert(destination_anchor.clone());
+        source_destinations.push((source_anchor.clone(), destination_anchor.clone()));
+        let replace_destination = assignments
+            .get(&destination_anchor)
+            .map(|(_, existing_source, _, existing_selected_at)| {
+                (selected_at.as_str(), source_anchor.as_str())
+                    >= (existing_selected_at.as_str(), existing_source.as_str())
+            })
+            .unwrap_or(true);
+        if replace_destination {
+            assignments.insert(
+                destination_anchor,
+                (
+                    destination_moment_id,
+                    source_anchor,
+                    selected_asset_id,
+                    selected_at,
+                ),
+            );
+        }
+    }
+
+    for (
+        destination_anchor,
+        (destination_moment_id, source_anchor, selected_asset_id, selected_at),
+    ) in assignments
+    {
+        transaction.execute(
+            "INSERT INTO moment_human_representatives (id, project_id, anchor_asset_id, media_asset_id, selected_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id, anchor_asset_id) DO UPDATE SET
+               media_asset_id = excluded.media_asset_id,
+               selected_at = excluded.selected_at",
+            params![Uuid::new_v4().to_string(), project_id, destination_anchor, selected_asset_id, selected_at],
+        )?;
+        if source_anchor != destination_anchor {
+            transaction.execute(
+                "INSERT INTO moment_events (id, project_id, moment_id, event_type, details_json, created_at)
+                 VALUES (?1, ?2, ?3, 'MOMENT_REPRESENTATIVE_CHANGED', ?4, ?5)",
+                params![Uuid::new_v4().to_string(), project_id, destination_moment_id, json(&serde_json::json!({"assetId": selected_asset_id, "previousAnchorAssetId": source_anchor, "source": "generated_projection_replaced"}))?, timestamp(&Utc::now())],
+            )?;
+        }
+    }
+    for (source_anchor, destination_anchor) in source_destinations {
+        if source_anchor != destination_anchor && !destination_anchors.contains(&source_anchor) {
+            transaction.execute(
+                "DELETE FROM moment_human_representatives
+                 WHERE project_id = ?1 AND anchor_asset_id = ?2",
+                params![project_id, source_anchor],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// A human representative must always belong to the active Moment shown in the UI. When a manual
+/// structural edit moves the selected asset into another active Moment, rebind the selection to
+/// that Moment's anchor. If prior history already has a representative for the destination
+/// anchor, the later explicit human choice wins; both choices remain represented by append-only
+/// Moment events. Returns the representative now displayed for the destination when the moved
+/// choice won.
+fn rebind_human_representative_for_active_moment(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    source_anchor_asset_id: &str,
+    destination_anchor_asset_id: &str,
+    destination_moment_id: &str,
+) -> Result<Option<String>> {
+    if source_anchor_asset_id == destination_anchor_asset_id {
+        return Ok(None);
+    }
+    let moved_selection: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT representative.media_asset_id, representative.selected_at
+             FROM moment_human_representatives representative
+             WHERE representative.project_id = ?1
+               AND representative.anchor_asset_id = ?2
+               AND EXISTS (
+                   SELECT 1
+                   FROM moment_memberships member
+                   WHERE member.project_id = representative.project_id
+                     AND member.moment_id = ?3
+                     AND member.media_asset_id = representative.media_asset_id
+                     AND member.active = 1
+                     AND member.membership_state = 'member'
+               )",
+            params![
+                project_id.to_string(),
+                source_anchor_asset_id,
+                destination_moment_id
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((asset_id, selected_at)) = moved_selection else {
+        return Ok(None);
+    };
+
+    transaction.execute(
+        "INSERT INTO moment_human_representatives (id, project_id, anchor_asset_id, media_asset_id, selected_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id, anchor_asset_id) DO UPDATE SET
+           media_asset_id = CASE
+             WHEN excluded.selected_at >= moment_human_representatives.selected_at
+             THEN excluded.media_asset_id
+             ELSE moment_human_representatives.media_asset_id
+           END,
+           selected_at = CASE
+             WHEN excluded.selected_at >= moment_human_representatives.selected_at
+             THEN excluded.selected_at
+             ELSE moment_human_representatives.selected_at
+           END",
+        params![Uuid::new_v4().to_string(), project_id.to_string(), destination_anchor_asset_id, asset_id, selected_at],
+    )?;
+    let displayed_asset_id: String = transaction.query_row(
+        "SELECT media_asset_id FROM moment_human_representatives
+         WHERE project_id = ?1 AND anchor_asset_id = ?2",
+        params![project_id.to_string(), destination_anchor_asset_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "DELETE FROM moment_human_representatives
+         WHERE project_id = ?1 AND anchor_asset_id = ?2",
+        params![project_id.to_string(), source_anchor_asset_id],
+    )?;
+    Ok((displayed_asset_id == asset_id).then_some(displayed_asset_id))
+}
+
+/// Returns the complete active display order. A project can contain a preserved incremental
+/// prefix and one or more newer tail runs, so structural edits must consider all active cards.
+fn active_moment_ids_for_project(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+) -> Result<Vec<String>> {
+    transaction
+        .prepare(
+            "SELECT id
+             FROM moment_records
+             WHERE project_id = ?1 AND stale = 0
+             ORDER BY ordinal ASC, id ASC",
+        )?
+        .query_map(params![project_id.to_string()], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Allocates a temporary ordinal outside the complete current run. It is used only while the
+/// surrounding transaction is assembling a split, before the run is atomically resequenced.
+fn next_moment_record_ordinal(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    run_id: &str,
+) -> Result<i64> {
+    let highest: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(ordinal), -1)
+         FROM moment_records
+         WHERE project_id = ?1 AND run_id = ?2",
+        params![project_id.to_string(), run_id],
+        |row| row.get(0),
+    )?;
+    highest.checked_add(1).ok_or_else(|| {
+        PersistenceError::InvalidData("Moment ordinal exceeds SQLite integer range".into())
+    })
+}
+
+/// Reassigns the complete active project projection to contiguous display ordinals. An
+/// incremental timeline can intentionally consist of a preserved older-run prefix and newer tail
+/// runs. If a structural edit changes the prefix length, every later active run must move with it
+/// in the same transaction rather than retaining a gap or colliding with the edited run.
+fn reindex_active_moment_projection(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    active_order: &[String],
+) -> Result<()> {
+    let active_rows = transaction
+        .prepare(
+            "SELECT id, run_id
+             FROM moment_records
+             WHERE project_id = ?1 AND stale = 0",
+        )?
+        .query_map(params![project_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let active_ids = active_rows
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    let requested_active_ids = active_order.iter().cloned().collect::<BTreeSet<_>>();
+    if requested_active_ids.len() != active_order.len() || active_ids != requested_active_ids {
+        return Err(PersistenceError::InvalidData(
+            "Moment ordinal repair received a stale or incomplete active projection".into(),
+        ));
+    }
+    let run_by_id = active_rows.into_iter().collect::<BTreeMap<_, _>>();
+    let mut targets_by_run = BTreeMap::<String, Vec<(String, i64)>>::new();
+    for (ordinal, moment_id) in active_order.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal).map_err(|_| {
+            PersistenceError::InvalidData("Moment count exceeds SQLite integer range".into())
+        })?;
+        let run_id = run_by_id.get(moment_id).ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "Moment ordinal repair received an inactive Moment ID".into(),
+            )
+        })?;
+        targets_by_run
+            .entry(run_id.clone())
+            .or_default()
+            .push((moment_id.clone(), ordinal));
+    }
+    for (run_id, active_targets) in targets_by_run {
+        reindex_moment_record_ordinals(transaction, project_id, &run_id, &active_targets)?;
+    }
+    Ok(())
+}
+
+/// Reassigns one run's ordinal namespace without ever colliding with its unique index. The
+/// caller supplies explicit global display ordinals for active cards; stale rows are placed
+/// deterministically after them by their prior ordinal and stable ID. The two-phase move is
+/// necessary because stale records participate in `UNIQUE(run_id, ordinal)` too.
+fn reindex_moment_record_ordinals(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    run_id: &str,
+    active_targets: &[(String, i64)],
+) -> Result<()> {
+    let rows = transaction
+        .prepare(
+            "SELECT id, stale, ordinal
+             FROM moment_records
+             WHERE project_id = ?1 AND run_id = ?2
+             ORDER BY stale ASC, ordinal ASC, id ASC",
+        )?
+        .query_map(params![project_id.to_string(), run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        if active_targets.is_empty() {
+            return Ok(());
+        }
+        return Err(PersistenceError::InvalidData(
+            "cannot order active Moments for an empty analysis run".into(),
+        ));
+    }
+
+    let active_ids = rows
+        .iter()
+        .filter(|(_, stale, _)| !stale)
+        .map(|(id, _, _)| id.as_str())
+        .collect::<BTreeSet<_>>();
+    let requested_active_ids = active_targets
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<BTreeSet<_>>();
+    let requested_ordinals = active_targets
+        .iter()
+        .map(|(_, ordinal)| *ordinal)
+        .collect::<BTreeSet<_>>();
+    if requested_active_ids.len() != active_targets.len()
+        || requested_ordinals.len() != active_targets.len()
+        || active_ids.len() != active_targets.len()
+        || active_ids != requested_active_ids
+    {
+        return Err(PersistenceError::InvalidData(
+            "Moment ordinal repair received a stale or incomplete active projection".into(),
+        ));
+    }
+
+    let mut target_ordinals = active_targets
+        .iter()
+        .map(|(id, ordinal)| (id.clone(), *ordinal))
+        .collect::<BTreeMap<_, _>>();
+    let stale_target_start = active_targets
+        .iter()
+        .map(|(_, ordinal)| *ordinal)
+        .max()
+        .unwrap_or(-1)
+        .checked_add(1)
+        .ok_or_else(|| {
+            PersistenceError::InvalidData("Moment ordinal exceeds SQLite integer range".into())
+        })?;
+    for (index, (id, _, _)) in rows.iter().filter(|(_, stale, _)| *stale).enumerate() {
+        let index = i64::try_from(index).map_err(|_| {
+            PersistenceError::InvalidData("Moment count exceeds SQLite integer range".into())
+        })?;
+        let ordinal = stale_target_start.checked_add(index).ok_or_else(|| {
+            PersistenceError::InvalidData("Moment ordinal exceeds SQLite integer range".into())
+        })?;
+        target_ordinals.insert(id.clone(), ordinal);
+    }
+    let lowest_ordinal = rows
+        .iter()
+        .map(|(_, _, ordinal)| *ordinal)
+        .min()
+        .unwrap_or(0);
+    let highest_ordinal = rows
+        .iter()
+        .map(|(_, _, ordinal)| *ordinal)
+        .max()
+        .unwrap_or(-1);
+    let final_highest_ordinal = target_ordinals.values().copied().max().unwrap_or(-1);
+    let staging_floor = highest_ordinal.max(final_highest_ordinal);
+    let staging_offset = staging_floor
+        .checked_sub(lowest_ordinal)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            PersistenceError::InvalidData("Moment ordinal exceeds SQLite integer range".into())
+        })?;
+    highest_ordinal.checked_add(staging_offset).ok_or_else(|| {
+        PersistenceError::InvalidData(
+            "Moment ordinal repair cannot allocate a collision-free staging range".into(),
+        )
+    })?;
+
+    // Every staged ordinal is strictly above both the current and final maximum. This bulk move
+    // therefore has a disjoint target range even while SQLite enforces uniqueness row by row.
+    transaction.execute(
+        "UPDATE moment_records
+         SET ordinal = ordinal + ?3
+         WHERE project_id = ?1 AND run_id = ?2",
+        params![project_id.to_string(), run_id, staging_offset],
+    )?;
+    for (moment_id, ordinal) in target_ordinals {
+        transaction.execute(
+            "UPDATE moment_records
+             SET ordinal = ?1
+             WHERE id = ?2 AND project_id = ?3 AND run_id = ?4",
+            params![ordinal, moment_id, project_id.to_string(), run_id],
+        )?;
+    }
+    Ok(())
+}
 fn intelligence_summary_for_asset(
     connection: &Connection,
     asset_id: &str,
@@ -7417,6 +9736,988 @@ fn culling_decision_for_asset(
         .map_or_else(|| Ok(CullingDecisionView::default()), Ok)
 }
 
+/// A source snapshot and a model artifact must share one compatibility identity. A future
+/// schema must be explicitly migrated/backfilled; old compact snapshots are never reinterpreted
+/// as new feature vectors merely because their JSON happens to parse.
+const STUDIO_FEATURE_SCHEMA_VERSION: &str = studio_brain::STUDIO_BRAIN_FEATURE_SCHEMA_VERSION;
+
+#[derive(Debug, Clone)]
+struct StudioHistoricalRow {
+    source_kind: String,
+    source_record_id: String,
+    project_id: String,
+    media_asset_id: Option<String>,
+    decision_type: String,
+    decision_value: Option<String>,
+    occurred_at: String,
+    review_session_id: Option<String>,
+    similarity_group_id: Option<String>,
+    moment_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StudioHistoricalSimilarityRow {
+    id: String,
+    project_id: String,
+    group_id: String,
+    chosen_asset_id: String,
+    alternative_asset_ids: Vec<String>,
+    generic_recommendation_json: serde_json::Value,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct StudioHistoricalMomentRow {
+    id: String,
+    project_id: String,
+    moment_id: String,
+    asset_id: String,
+    created_at: String,
+}
+
+fn ensure_studio_profile_exists(transaction: &Transaction<'_>, profile_id: &str) -> Result<()> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM studio_profiles WHERE id = ?1)",
+        params![profile_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(PersistenceError::InvalidData(
+            "Studio Profile does not exist locally".into(),
+        ));
+    }
+    Ok(())
+}
+
+// This is intentionally a direct field mapping for one append-only event row. Keeping the
+// optional foreign keys explicit makes call sites state their provenance rather than allowing a
+// lossy generic payload to conceal it.
+#[allow(clippy::too_many_arguments)]
+fn insert_studio_event(
+    transaction: &Transaction<'_>,
+    profile_id: &str,
+    project_id: Option<&str>,
+    run_id: Option<&str>,
+    model_id: Option<&str>,
+    event_type: &str,
+    details: &serde_json::Value,
+    created_at: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO studio_events (id, studio_profile_id, project_id, studio_training_run_id, studio_model_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![Uuid::new_v4().to_string(), profile_id, project_id, run_id, model_id, event_type, json(details)?, created_at],
+    )?;
+    Ok(())
+}
+
+fn mark_studio_profile_stale_if_active(
+    transaction: &Transaction<'_>,
+    profile_id: &str,
+    updated_at: &str,
+) -> Result<()> {
+    let has_active_model: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM studio_models WHERE studio_profile_id = ?1 AND state = 'active')",
+        params![profile_id],
+        |row| row.get(0),
+    )?;
+    if has_active_model {
+        transaction.execute(
+            "UPDATE studio_profiles SET training_status = 'stale', updated_at = ?2 WHERE id = ?1 AND training_status <> 'error'",
+            params![profile_id, updated_at],
+        )?;
+    }
+    Ok(())
+}
+
+/// Resolves exactly the action guard created atomically with a human authority write. It never
+/// clears another action's deferred guard, including one from a different project that is opted
+/// out of future training.
+fn finish_studio_source_materialization(
+    connection: &Connection,
+    profile_id: &str,
+    source_kind: &str,
+    source_record_id: &str,
+) -> Result<()> {
+    let transaction = moment_write_transaction(connection)?;
+    transaction.execute(
+        "DELETE FROM studio_source_materialization_guards
+         WHERE studio_profile_id = ?1 AND source_kind = ?2 AND source_record_id = ?3",
+        params![profile_id, source_kind, source_record_id],
+    )?;
+    transaction.execute(
+        "UPDATE studio_profiles SET updated_at = ?2 WHERE id = ?1",
+        params![profile_id, timestamp(&Utc::now())],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn studio_historical_decision_rows(connection: &Connection) -> Result<Vec<StudioHistoricalRow>> {
+    let mut statement = connection.prepare(
+        "SELECT id, project_id, media_asset_id, session_id, event_type, current_value_json, created_at
+         FROM decision_history
+         WHERE source = 'human' AND event_type IN ('DECISION_CHANGED', 'RATING_CHANGED', 'STAR_CHANGED')
+         ORDER BY created_at ASC, id ASC",
+    )?;
+    let mut rows = Vec::new();
+    for result in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })? {
+        let (id, project_id, media_asset_id, session_id, event_type, current_json, created_at) =
+            result?;
+        let value: serde_json::Value = from_json(&current_json)?;
+        let (decision_type, decision_value) = match event_type.as_str() {
+            "DECISION_CHANGED" => {
+                let Some(value) = value
+                    .as_str()
+                    .filter(|value| matches!(*value, "keep" | "review" | "reject"))
+                else {
+                    continue;
+                };
+                ("culling_decision".into(), Some(value.to_owned()))
+            }
+            "RATING_CHANGED" => {
+                let Some(value) = value.as_u64().filter(|value| *value <= 5) else {
+                    continue;
+                };
+                ("rating".into(), Some(value.to_string()))
+            }
+            "STAR_CHANGED" => {
+                let Some(value) = value.as_bool() else {
+                    continue;
+                };
+                ("star".into(), Some(value.to_string()))
+            }
+            _ => continue,
+        };
+        rows.push(StudioHistoricalRow {
+            source_kind: "decision_history".into(),
+            source_record_id: id,
+            project_id,
+            media_asset_id: Some(media_asset_id),
+            decision_type,
+            decision_value,
+            occurred_at: created_at,
+            review_session_id: session_id,
+            similarity_group_id: None,
+            moment_id: None,
+        });
+    }
+    Ok(rows)
+}
+
+fn studio_historical_override_rows(connection: &Connection) -> Result<Vec<StudioHistoricalRow>> {
+    let mut statement = connection.prepare(
+        "SELECT override_record.id, asset.project_id, override_record.media_asset_id, override_record.decision, override_record.decided_at
+         FROM intelligence_overrides override_record JOIN media_assets asset ON asset.id = override_record.media_asset_id
+         WHERE override_record.decision IN ('keep', 'review', 'reject')
+         ORDER BY override_record.decided_at ASC, override_record.id ASC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(StudioHistoricalRow {
+                source_kind: "m4_human_override".into(),
+                source_record_id: row.get(0)?,
+                project_id: row.get(1)?,
+                media_asset_id: Some(row.get(2)?),
+                decision_type: "culling_decision".into(),
+                decision_value: Some(row.get(3)?),
+                occurred_at: row.get(4)?,
+                review_session_id: None,
+                similarity_group_id: None,
+                moment_id: None,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn studio_historical_similarity_rows(
+    connection: &Connection,
+) -> Result<Vec<StudioHistoricalSimilarityRow>> {
+    let mut statement = connection.prepare(
+        "SELECT id, project_id, similarity_group_id, chosen_asset_id, compared_asset_ids_json, ai_recommendation_json, created_at
+         FROM preference_examples ORDER BY created_at ASC, id ASC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            let alternatives: Vec<String> = serde_json::from_str(&row.get::<_, String>(4)?)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let recommendation: serde_json::Value = serde_json::from_str(&row.get::<_, String>(5)?)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok(StudioHistoricalSimilarityRow {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                group_id: row.get(2)?,
+                chosen_asset_id: row.get(3)?,
+                alternative_asset_ids: alternatives,
+                generic_recommendation_json: recommendation,
+                created_at: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn studio_historical_moment_rows(
+    connection: &Connection,
+) -> Result<Vec<StudioHistoricalMomentRow>> {
+    let mut statement = connection.prepare(
+        "SELECT event.id, event.project_id, event.moment_id, json_extract(event.details_json, '$.assetId'), event.created_at
+         FROM moment_events event JOIN media_assets asset ON asset.id = json_extract(event.details_json, '$.assetId')
+         WHERE event.event_type = 'MOMENT_REPRESENTATIVE_CHANGED'
+         ORDER BY event.created_at ASC, event.id ASC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(StudioHistoricalMomentRow {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                moment_id: row.get(2)?,
+                asset_id: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+// The immutable row fields are deliberately explicit: callers must supply the captured feature
+// snapshot, generic evidence, displayed state, provenance, and timestamp separately.
+#[allow(clippy::too_many_arguments)]
+fn insert_studio_training_example(
+    transaction: &Transaction<'_>,
+    profile_id: &str,
+    row: &StudioHistoricalRow,
+    feature_snapshot: &serde_json::Value,
+    generic_recommendation: &serde_json::Value,
+    recommendation_shown: &str,
+    provenance: &str,
+    created_at: &str,
+) -> Result<bool> {
+    let changed = transaction.execute(
+        "INSERT OR IGNORE INTO studio_training_examples (id, studio_profile_id, project_id, media_asset_id, source_kind, source_record_id, decision_type, decision_value, occurred_at, review_session_id, similarity_group_id, moment_id, generic_recommendation_json, studio_recommendation_id_at_decision, recommendation_shown, provenance, feature_schema_version, feature_snapshot_json, training_eligible, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, ?16, ?17, 1, ?18)",
+        params![Uuid::new_v4().to_string(), profile_id, row.project_id, row.media_asset_id, row.source_kind, row.source_record_id, row.decision_type, row.decision_value, row.occurred_at, row.review_session_id, row.similarity_group_id, row.moment_id, json(generic_recommendation)?, recommendation_shown, provenance, STUDIO_FEATURE_SCHEMA_VERSION, json(feature_snapshot)?, created_at],
+    )?;
+    Ok(changed == 1)
+}
+
+fn studio_historical_row_from_live_decision(
+    history_id: &str,
+    project_id: &str,
+    asset_id: &str,
+    session_id: Option<&str>,
+    event_type: &str,
+    current: &serde_json::Value,
+    occurred_at: &str,
+) -> Option<StudioHistoricalRow> {
+    let (decision_type, decision_value) = match event_type {
+        "DECISION_CHANGED" => (
+            "culling_decision",
+            current
+                .as_str()
+                .filter(|value| matches!(*value, "keep" | "review" | "reject"))
+                .map(ToOwned::to_owned),
+        ),
+        "RATING_CHANGED" => (
+            "rating",
+            current
+                .as_u64()
+                .filter(|value| *value <= 5)
+                .map(|value| value.to_string()),
+        ),
+        "STAR_CHANGED" => ("star", current.as_bool().map(|value| value.to_string())),
+        _ => return None,
+    };
+    decision_value.map(|decision_value| StudioHistoricalRow {
+        source_kind: "decision_history".into(),
+        source_record_id: history_id.into(),
+        project_id: project_id.into(),
+        media_asset_id: Some(asset_id.into()),
+        decision_type: decision_type.into(),
+        decision_value: Some(decision_value),
+        occurred_at: occurred_at.into(),
+        review_session_id: session_id.map(ToOwned::to_owned),
+        similarity_group_id: None,
+        moment_id: None,
+    })
+}
+
+/// Project participation is intentionally evaluated at source-materialization time as well as
+/// at training-query time. This keeps an opted-out project from creating new preference records
+/// while retaining every underlying human decision unchanged in its normal M5 history.
+fn studio_project_training_is_included(
+    connection: &Connection,
+    profile_id: &str,
+    project_id: &str,
+) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT COALESCE((SELECT included
+                                FROM project_training_preferences
+                                WHERE studio_profile_id = ?1 AND project_id = ?2), 1)",
+            params![profile_id, project_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn materialize_live_studio_training_example(
+    connection: &Connection,
+    profile_id: &str,
+    row: &StudioHistoricalRow,
+) -> Result<()> {
+    // An opt-out controls contribution, not use of an already-active local model. Do not even
+    // materialize a new source row while the project is excluded; later re-inclusion can use
+    // the explicit, bounded historical backfill during a requested training run.
+    if !studio_project_training_is_included(connection, profile_id, &row.project_id)? {
+        return Ok(());
+    }
+    let asset_id = row.media_asset_id.as_deref().ok_or_else(|| {
+        PersistenceError::InvalidData("live Studio signal requires a media asset".into())
+    })?;
+    let snapshot = studio_feature_snapshot(connection, &row.project_id, asset_id)?;
+    let row = studio_historical_row_with_snapshot_context(row.clone(), &snapshot);
+    let generic = studio_generic_recommendation_snapshot(connection, asset_id)?;
+    let transaction = moment_write_transaction(connection)?;
+    let inserted = insert_studio_training_example(
+        &transaction,
+        profile_id,
+        &row,
+        &snapshot,
+        &generic,
+        "unknown",
+        "explicit_human",
+        &row.occurred_at,
+    )?;
+    if inserted {
+        mark_studio_profile_stale_if_active(&transaction, profile_id, &row.occurred_at)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn studio_historical_row_with_snapshot_context(
+    mut row: StudioHistoricalRow,
+    snapshot: &serde_json::Value,
+) -> StudioHistoricalRow {
+    if row.similarity_group_id.is_none() {
+        row.similarity_group_id = snapshot
+            .get("similarityGroupId")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if row.moment_id.is_none() {
+        row.moment_id = snapshot
+            .get("momentId")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    row
+}
+
+// A representative source needs all of the chosen/alternative evidence to create immutable
+// pairwise references; grouping these into an opaque JSON argument would weaken validation.
+#[allow(clippy::too_many_arguments)]
+fn materialize_live_similarity_representative(
+    connection: &Connection,
+    profile_id: &str,
+    preference_example_id: &str,
+    project_id: &str,
+    group_id: &str,
+    chosen_asset_id: &str,
+    alternatives: &[String],
+    generic_recommendation_json: &str,
+    occurred_at: &str,
+) -> Result<()> {
+    if !studio_project_training_is_included(connection, profile_id, project_id)? {
+        return Ok(());
+    }
+    let snapshot = studio_feature_snapshot(connection, project_id, chosen_asset_id)?;
+    let generic: serde_json::Value = from_json(generic_recommendation_json)?;
+    let source = StudioHistoricalRow {
+        source_kind: "similar_set_representative".into(),
+        source_record_id: preference_example_id.into(),
+        project_id: project_id.into(),
+        media_asset_id: Some(chosen_asset_id.into()),
+        decision_type: "similar_set_representative".into(),
+        decision_value: None,
+        occurred_at: occurred_at.into(),
+        review_session_id: None,
+        similarity_group_id: Some(group_id.into()),
+        moment_id: None,
+    };
+    let transaction = moment_write_transaction(connection)?;
+    let inserted = insert_studio_training_example(
+        &transaction,
+        profile_id,
+        &source,
+        &snapshot,
+        &generic,
+        "unknown",
+        "explicit_human",
+        occurred_at,
+    )?;
+    if inserted {
+        let example_id: String = transaction.query_row("SELECT id FROM studio_training_examples WHERE studio_profile_id = ?1 AND source_kind = ?2 AND source_record_id = ?3", params![profile_id, source.source_kind, source.source_record_id], |row| row.get(0))?;
+        transaction.execute("INSERT OR IGNORE INTO studio_training_example_references (studio_training_example_id, role, media_asset_id) VALUES (?1, 'chosen', ?2)", params![example_id, chosen_asset_id])?;
+        for alternative in alternatives {
+            transaction.execute("INSERT OR IGNORE INTO studio_training_example_references (studio_training_example_id, role, media_asset_id) VALUES (?1, 'alternative', ?2)", params![example_id, alternative])?;
+        }
+        mark_studio_profile_stale_if_active(&transaction, profile_id, occurred_at)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn materialize_live_moment_representative(
+    connection: &Connection,
+    profile_id: &str,
+    moment_event_id: &str,
+    project_id: &str,
+    moment_id: &str,
+    asset_id: &str,
+    occurred_at: &str,
+) -> Result<()> {
+    if !studio_project_training_is_included(connection, profile_id, project_id)? {
+        return Ok(());
+    }
+    let snapshot = studio_feature_snapshot(connection, project_id, asset_id)?;
+    let generic = studio_generic_recommendation_snapshot(connection, asset_id)?;
+    let source = StudioHistoricalRow {
+        source_kind: "moment_representative".into(),
+        source_record_id: moment_event_id.into(),
+        project_id: project_id.into(),
+        media_asset_id: Some(asset_id.into()),
+        decision_type: "moment_representative".into(),
+        decision_value: None,
+        occurred_at: occurred_at.into(),
+        review_session_id: None,
+        similarity_group_id: None,
+        moment_id: Some(moment_id.into()),
+    };
+    let transaction = moment_write_transaction(connection)?;
+    if insert_studio_training_example(
+        &transaction,
+        profile_id,
+        &source,
+        &snapshot,
+        &generic,
+        "unknown",
+        "explicit_human",
+        occurred_at,
+    )? {
+        mark_studio_profile_stale_if_active(&transaction, profile_id, occurred_at)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn json_value_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<serde_json::Value> {
+    serde_json::from_str(&row.get::<_, String>(index)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn studio_training_example_from_row(
+    row: &Row<'_>,
+) -> rusqlite::Result<StudioTrainingExampleRecord> {
+    Ok(StudioTrainingExampleRecord {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        project_id: row.get(2)?,
+        media_asset_id: row.get(3)?,
+        source_kind: row.get(4)?,
+        source_record_id: row.get(5)?,
+        decision_type: row.get(6)?,
+        decision_value: row.get(7)?,
+        occurred_at: row.get(8)?,
+        review_session_id: row.get(9)?,
+        similarity_group_id: row.get(10)?,
+        moment_id: row.get(11)?,
+        generic_recommendation_json: json_value_from_row(row, 12)?,
+        studio_recommendation_id_at_decision: row.get(13)?,
+        recommendation_shown: row.get(14)?,
+        provenance: row.get(15)?,
+        feature_schema_version: row.get(16)?,
+        feature_snapshot_json: json_value_from_row(row, 17)?,
+        training_eligible: row.get(18)?,
+        created_at: row.get(19)?,
+    })
+}
+
+fn studio_training_run_from_row(row: &Row<'_>) -> rusqlite::Result<StudioTrainingRunRecord> {
+    Ok(StudioTrainingRunRecord {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        background_job_id: row.get(2)?,
+        algorithm: row.get(3)?,
+        algorithm_version: row.get(4)?,
+        feature_schema_version: row.get(5)?,
+        parameters_json: json_value_from_row(row, 6)?,
+        snapshot_hash: row.get(7)?,
+        snapshot_count: row.get::<_, i64>(8)? as u64,
+        previous_active_model_id: row.get(9)?,
+        state: row.get(10)?,
+        error_message: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        finished_at: row.get(14)?,
+    })
+}
+
+fn studio_model_from_row(row: &Row<'_>) -> rusqlite::Result<StudioModelRecord> {
+    Ok(StudioModelRecord {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        training_run_id: row.get(2)?,
+        algorithm: row.get(3)?,
+        model_version: row.get(4)?,
+        feature_schema_version: row.get(5)?,
+        artifact_json: json_value_from_row(row, 6)?,
+        checksum: row.get(7)?,
+        artifact_size_bytes: row.get::<_, i64>(8)? as u64,
+        state: row.get(9)?,
+        metrics_json: json_value_from_row(row, 10)?,
+        created_at: row.get(11)?,
+        activated_at: row.get(12)?,
+    })
+}
+
+/// Store compact, queryable evaluation summaries beside the immutable candidate artifact. The
+/// complete structured report remains in `studio_models.metrics_json`; these rows deliberately
+/// contain no filenames, paths, notes, embeddings, decisions, or other preference source data.
+fn store_studio_model_metric_rows(
+    transaction: &Transaction<'_>,
+    record: &StudioModelRecord,
+) -> Result<()> {
+    let evaluation = record.metrics_json.get("evaluation");
+    let split_metadata = evaluation
+        .and_then(|value| value.get("split"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"strategy":"unavailable"}));
+    let metadata = serde_json::json!({
+        "source": "candidate_evaluation",
+        "algorithm": record.algorithm,
+        "featureSchemaVersion": record.feature_schema_version,
+        "split": split_metadata,
+    });
+    let model_metrics = [
+        ("personalized", "personalModel"),
+        ("generic", "genericBaseline"),
+        ("majority", "majorityBaseline"),
+    ];
+    let metric_fields = [
+        ("accuracy", "accuracy"),
+        ("macro_f1", "macroF1"),
+        ("log_loss", "logLoss"),
+        ("brier_score", "brierScore"),
+        ("expected_calibration_error", "expectedCalibrationError"),
+    ];
+    for (prefix, key) in model_metrics {
+        let Some(summary) = evaluation.and_then(|value| value.get(key)) else {
+            continue;
+        };
+        let sample_count = summary
+            .get("sampleCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .min(i64::MAX as u64) as i64;
+        for (metric_name, field) in metric_fields {
+            let Some(value) = summary
+                .get(field)
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite())
+            else {
+                continue;
+            };
+            transaction.execute(
+                "INSERT INTO studio_model_metrics (id, studio_model_id, split, metric_name, metric_value, sample_count, metadata_json, created_at)
+                 VALUES (?1, ?2, 'validation', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    record.id,
+                    format!("{prefix}_{metric_name}"),
+                    value,
+                    sample_count,
+                    json(&metadata)?,
+                    record.created_at,
+                ],
+            )?;
+        }
+    }
+    if let Some(temperature) = evaluation
+        .and_then(|value| value.get("calibration"))
+        .and_then(|value| value.get("temperature"))
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| value.is_finite())
+    {
+        transaction.execute(
+            "INSERT INTO studio_model_metrics (id, studio_model_id, split, metric_name, metric_value, sample_count, metadata_json, created_at)
+             VALUES (?1, ?2, 'validation', 'calibration_temperature', ?3, 0, ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                record.id,
+                temperature,
+                json(&metadata)?,
+                record.created_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Persistence validates the small structured artifact at its trust boundary as well as the
+/// core validating it before storage. This is corruption detection, not a claim of protection
+/// against a user who intentionally changes both a local database row and its checksum.
+fn verify_studio_model_artifact(record: &StudioModelRecord) -> Result<()> {
+    if record.feature_schema_version != studio_brain::STUDIO_BRAIN_FEATURE_SCHEMA_VERSION {
+        return Err(PersistenceError::InvalidData(
+            "Studio model feature schema is incompatible with this build".into(),
+        ));
+    }
+    let encoded = VerifiedModelArtifact {
+        artifact_json: serde_json::to_string(&record.artifact_json)?,
+        checksum: record.checksum.clone(),
+    };
+    let artifact = decode_verified_model_artifact(&encoded).map_err(|error| {
+        PersistenceError::InvalidData(format!("Studio model artifact validation failed: {error}"))
+    })?;
+    if artifact.feature_schema_version != record.feature_schema_version {
+        return Err(PersistenceError::InvalidData(
+            "Studio model artifact and persisted feature schema differ".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn invalidate_corrupt_active_studio_model(
+    connection: &Connection,
+    record: &StudioModelRecord,
+) -> Result<()> {
+    let transaction = moment_write_transaction(connection)?;
+    let now = timestamp(&Utc::now());
+    let changed = transaction.execute(
+        "UPDATE studio_models SET state = 'invalid' WHERE id = ?1 AND studio_profile_id = ?2 AND state = 'active'",
+        params![record.id, record.profile_id],
+    )?;
+    if changed > 0 {
+        transaction.execute(
+            "UPDATE studio_recommendations SET stale = 1, status = 'unavailable' WHERE studio_model_id = ?1 AND stale = 0",
+            params![record.id],
+        )?;
+        transaction.execute(
+            "UPDATE studio_profiles SET training_status = 'error', last_error = ?2, updated_at = ?3 WHERE id = ?1",
+            params![record.profile_id, "A local Studio Brain model could not be validated. Generic technical evidence remains available.", now],
+        )?;
+        insert_studio_event(
+            &transaction,
+            &record.profile_id,
+            None,
+            Some(&record.training_run_id),
+            Some(&record.id),
+            "STUDIO_MODEL_INVALIDATED",
+            &serde_json::json!({"reason":"artifact_validation_failed","genericFallbackAvailable":true}),
+            &now,
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Feature snapshots include only bounded technical, anonymous face/eye availability, generic
+/// recommendation, Similar Set, Moment, and semantic-availability signals. When any of those
+/// derived inputs changes, the old advisory projection remains historical but is never shown as
+/// current. A later explicit Studio update rebuilds it from the active model and fresh evidence.
+fn mark_studio_recommendations_stale_for_asset(
+    connection: &Connection,
+    asset_id: &str,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE studio_recommendations SET stale = 1, status = 'stale' WHERE media_asset_id = ?1 AND stale = 0",
+        params![asset_id],
+    )?;
+    Ok(())
+}
+
+fn mark_studio_recommendations_stale_for_project(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE studio_recommendations SET stale = 1, status = 'stale' WHERE project_id = ?1 AND stale = 0",
+        params![project_id],
+    )?;
+    Ok(())
+}
+
+/// M8 source materialization is deliberately fail-open relative to an already-committed human
+/// action. The next explicit, idempotent historical backfill can recover the source row; until
+/// then an active profile is marked stale rather than pretending it contains the new choice.
+/// This is best effort because it runs on the error path and must never turn a valid M4/M5/M7
+/// action into a reported failure.
+fn mark_studio_source_capture_deferred(connection: &Connection, profile_id: &str) {
+    let _ = connection.execute(
+        "UPDATE studio_profiles
+         SET source_revision = source_revision + 1,
+             training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') THEN 'stale' ELSE training_status END,
+             readiness_json = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') THEN '{\"state\":\"stale\",\"reasons\":[\"A local training source will be recovered during your next explicit Studio Brain update.\"]}' ELSE readiness_json END,
+             last_error = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') THEN NULL ELSE last_error END,
+             updated_at = ?2
+         WHERE id = ?1",
+        params![profile_id, timestamp(&Utc::now())],
+    );
+}
+
+fn studio_generic_recommendation_snapshot(
+    connection: &Connection,
+    asset_id: &str,
+) -> Result<serde_json::Value> {
+    let value = connection.query_row(
+        "SELECT label, confidence, id FROM analysis_recommendations WHERE media_asset_id = ?1 AND stale = 0 AND status = 'ready' ORDER BY generated_at DESC, id DESC LIMIT 1",
+        params![asset_id],
+        |row| Ok(serde_json::json!({"label": row.get::<_, String>(0)?, "confidence": row.get::<_, f64>(1)?, "id": row.get::<_, String>(2)?})),
+    ).optional()?;
+    Ok(value.unwrap_or_else(|| serde_json::json!({"status":"unavailable"})))
+}
+
+/// Reconstructs only the *alternative* side of an M5 `PreferenceExample` from that example's
+/// immutable compact evidence. It deliberately never consults the current asset record: a
+/// changed technical analysis, Similar Set, or Moment must not rewrite historic training data.
+fn studio_pairwise_snapshot_from_evidence(
+    technical_evidence: &serde_json::Value,
+    generic_recommendation: &serde_json::Value,
+    similarity_group_id: &str,
+    asset_id: &str,
+) -> Option<serde_json::Value> {
+    let members = technical_evidence.as_array()?;
+    let member = members.iter().find(|candidate| {
+        candidate.get("assetId").and_then(serde_json::Value::as_str) == Some(asset_id)
+    })?;
+    let technical_score = member
+        .get("technicalQualityScore")
+        .and_then(serde_json::Value::as_f64);
+    let higher_technical_peers = technical_score.map(|score| {
+        members
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .get("technicalQualityScore")
+                    .and_then(serde_json::Value::as_f64)
+            })
+            .filter(|candidate_score| *candidate_score > score)
+            .count()
+    });
+    let generic_asset_id = generic_recommendation
+        .get("assetId")
+        .and_then(serde_json::Value::as_str);
+    let generic_label = member
+        .get("aiRecommendation")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            generic_recommendation
+                .get("recommendation")
+                .and_then(serde_json::Value::as_str)
+        });
+    Some(serde_json::json!({
+        "schemaVersion": STUDIO_FEATURE_SCHEMA_VERSION,
+        "technicalQualityScore": technical_score,
+        "globalSharpness": member.get("globalSharpness").and_then(serde_json::Value::as_f64),
+        "directionalBlurRatio": serde_json::Value::Null,
+        "similarityGroupId": similarity_group_id,
+        "similarityGroupSize": members.len(),
+        "isGenericRepresentative": generic_asset_id == Some(asset_id),
+        "higherTechnicalPeers": higher_technical_peers,
+        "genericRecommendation": generic_label,
+        "semanticEvidenceAvailable": false,
+    }))
+}
+
+/// Builds only compact M8 permitted features. Missing values remain `null` and each is paired
+/// with an explicit availability flag by the model crate; zero is never used to silently mean
+/// missing. The query does not select originals, paths, notes, raw embeddings, or identities.
+fn studio_feature_snapshot(
+    connection: &Connection,
+    project_id: &str,
+    asset_id: &str,
+) -> Result<serde_json::Value> {
+    let row = connection.query_row(
+        "SELECT
+           (SELECT technical_quality_score FROM technical_quality q WHERE q.media_asset_id = a.id AND q.stale = 0 AND q.status = 'ready' ORDER BY q.generated_at DESC LIMIT 1),
+           (SELECT global_sharpness FROM technical_quality q WHERE q.media_asset_id = a.id AND q.stale = 0 AND q.status = 'ready' ORDER BY q.generated_at DESC LIMIT 1),
+           (SELECT directional_blur_ratio FROM technical_quality q WHERE q.media_asset_id = a.id AND q.stale = 0 AND q.status = 'ready' ORDER BY q.generated_at DESC LIMIT 1),
+           CASE WHEN EXISTS (
+             SELECT 1 FROM analysis_artifacts face_artifact
+             WHERE face_artifact.media_asset_id = a.id
+               AND face_artifact.artifact_type = 'face_detection'
+               AND face_artifact.stale = 0
+               AND face_artifact.status = 'ready'
+               AND COALESCE(json_extract(face_artifact.payload_json, '$.input_preview_fingerprint'), face_artifact.input_fingerprint) = (
+                 SELECT current_artifact.input_fingerprint FROM analysis_artifacts current_artifact
+                 WHERE current_artifact.media_asset_id = a.id
+                   AND current_artifact.artifact_type = 'capture_intelligence'
+                   AND current_artifact.stale = 0
+                 ORDER BY current_artifact.generated_at DESC, current_artifact.id DESC LIMIT 1
+               )
+           ) THEN (
+             SELECT COUNT(*) FROM face_analyses face
+             WHERE face.media_asset_id = a.id
+               AND face.input_fingerprint = (
+                 SELECT face_artifact.input_fingerprint FROM analysis_artifacts face_artifact
+                 WHERE face_artifact.media_asset_id = a.id
+                   AND face_artifact.artifact_type = 'face_detection'
+                   AND face_artifact.stale = 0
+                   AND face_artifact.status = 'ready'
+                   AND COALESCE(json_extract(face_artifact.payload_json, '$.input_preview_fingerprint'), face_artifact.input_fingerprint) = (
+                     SELECT current_artifact.input_fingerprint FROM analysis_artifacts current_artifact
+                     WHERE current_artifact.media_asset_id = a.id
+                       AND current_artifact.artifact_type = 'capture_intelligence'
+                       AND current_artifact.stale = 0
+                     ORDER BY current_artifact.generated_at DESC, current_artifact.id DESC LIMIT 1
+                   )
+                 ORDER BY face_artifact.generated_at DESC, face_artifact.id DESC LIMIT 1
+               )
+           ) ELSE NULL END,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM analysis_artifacts face_artifact
+             WHERE face_artifact.media_asset_id = a.id
+               AND face_artifact.artifact_type = 'face_detection'
+               AND face_artifact.stale = 0
+               AND face_artifact.status = 'ready'
+               AND COALESCE(json_extract(face_artifact.payload_json, '$.input_preview_fingerprint'), face_artifact.input_fingerprint) = (
+                 SELECT current_artifact.input_fingerprint FROM analysis_artifacts current_artifact
+                 WHERE current_artifact.media_asset_id = a.id
+                   AND current_artifact.artifact_type = 'capture_intelligence'
+                   AND current_artifact.stale = 0
+                 ORDER BY current_artifact.generated_at DESC, current_artifact.id DESC LIMIT 1
+               )
+           ) THEN (
+             SELECT COUNT(*) FROM face_analyses face
+             WHERE face.media_asset_id = a.id AND face.eye_state = 'open'
+               AND face.input_fingerprint = (
+                 SELECT face_artifact.input_fingerprint FROM analysis_artifacts face_artifact
+                 WHERE face_artifact.media_asset_id = a.id
+                   AND face_artifact.artifact_type = 'face_detection'
+                   AND face_artifact.stale = 0
+                   AND face_artifact.status = 'ready'
+                   AND COALESCE(json_extract(face_artifact.payload_json, '$.input_preview_fingerprint'), face_artifact.input_fingerprint) = (
+                     SELECT current_artifact.input_fingerprint FROM analysis_artifacts current_artifact
+                     WHERE current_artifact.media_asset_id = a.id
+                       AND current_artifact.artifact_type = 'capture_intelligence'
+                       AND current_artifact.stale = 0
+                     ORDER BY current_artifact.generated_at DESC, current_artifact.id DESC LIMIT 1
+                   )
+                 ORDER BY face_artifact.generated_at DESC, face_artifact.id DESC LIMIT 1
+               )
+           ) ELSE NULL END,
+           (SELECT g.id FROM similarity_groups g JOIN similarity_group_members gm ON gm.group_id = g.id WHERE gm.media_asset_id = a.id AND g.project_id = a.project_id AND g.stale = 0 ORDER BY g.created_at DESC, g.id DESC LIMIT 1),
+           CASE WHEN EXISTS (SELECT 1 FROM similarity_groups selected JOIN similarity_group_members selected_member ON selected_member.group_id = selected.id WHERE selected_member.media_asset_id = a.id AND selected.project_id = a.project_id AND selected.stale = 0) THEN (SELECT COUNT(*) FROM similarity_group_members gm JOIN similarity_groups g ON g.id = gm.group_id WHERE g.id = (SELECT selected.id FROM similarity_groups selected JOIN similarity_group_members selected_member ON selected_member.group_id = selected.id WHERE selected_member.media_asset_id = a.id AND selected.project_id = a.project_id AND selected.stale = 0 ORDER BY selected.created_at DESC, selected.id DESC LIMIT 1)) ELSE NULL END,
+           (SELECT gm.is_representative FROM similarity_group_members gm JOIN similarity_groups g ON g.id = gm.group_id WHERE gm.media_asset_id = a.id AND g.project_id = a.project_id AND g.stale = 0 ORDER BY g.created_at DESC, g.id DESC LIMIT 1),
+           CASE WHEN EXISTS (SELECT 1 FROM similarity_groups selected JOIN similarity_group_members selected_member ON selected_member.group_id = selected.id WHERE selected_member.media_asset_id = a.id AND selected.project_id = a.project_id AND selected.stale = 0) THEN (SELECT COUNT(*) FROM similarity_group_members peer JOIN technical_quality peer_quality ON peer_quality.media_asset_id = peer.media_asset_id AND peer_quality.stale = 0 AND peer_quality.status = 'ready' WHERE peer.group_id = (SELECT selected.id FROM similarity_groups selected JOIN similarity_group_members selected_member ON selected_member.group_id = selected.id WHERE selected_member.media_asset_id = a.id AND selected.project_id = a.project_id AND selected.stale = 0 ORDER BY selected.created_at DESC, selected.id DESC LIMIT 1) AND peer_quality.technical_quality_score > COALESCE((SELECT technical_quality_score FROM technical_quality own_quality WHERE own_quality.media_asset_id = a.id AND own_quality.stale = 0 AND own_quality.status = 'ready' ORDER BY own_quality.generated_at DESC LIMIT 1), -1.0)) ELSE NULL END,
+           (SELECT mm.moment_id FROM moment_memberships mm WHERE mm.project_id = a.project_id AND mm.media_asset_id = a.id AND mm.active = 1 AND mm.membership_state = 'member' ORDER BY mm.ordinal ASC, mm.id ASC LIMIT 1),
+           CASE WHEN EXISTS (SELECT 1 FROM moment_memberships mm WHERE mm.project_id = a.project_id AND mm.media_asset_id = a.id AND mm.active = 1 AND mm.membership_state = 'member') THEN (SELECT COUNT(*) FROM moment_memberships member WHERE member.project_id = a.project_id AND member.moment_id = (SELECT mm.moment_id FROM moment_memberships mm WHERE mm.project_id = a.project_id AND mm.media_asset_id = a.id AND mm.active = 1 AND mm.membership_state = 'member' ORDER BY mm.ordinal ASC, mm.id ASC LIMIT 1) AND member.active = 1 AND member.membership_state = 'member') ELSE NULL END,
+           (SELECT mm.ordinal FROM moment_memberships mm WHERE mm.project_id = a.project_id AND mm.media_asset_id = a.id AND mm.active = 1 AND mm.membership_state = 'member' ORDER BY mm.ordinal ASC, mm.id ASC LIMIT 1),
+           (SELECT label FROM analysis_recommendations recommendation WHERE recommendation.media_asset_id = a.id AND recommendation.stale = 0 AND recommendation.status = 'ready' ORDER BY recommendation.generated_at DESC, recommendation.id DESC LIMIT 1),
+           (SELECT confidence FROM analysis_recommendations recommendation WHERE recommendation.media_asset_id = a.id AND recommendation.stale = 0 AND recommendation.status = 'ready' ORDER BY recommendation.generated_at DESC, recommendation.id DESC LIMIT 1),
+           EXISTS(SELECT 1 FROM semantic_embeddings embedding WHERE embedding.media_asset_id = a.id AND embedding.status = 'ready' AND embedding.stale = 0),
+           a.captured_at
+         FROM media_assets a WHERE a.id = ?1 AND a.project_id = ?2",
+        params![asset_id, project_id],
+        |row| Ok(serde_json::json!({
+            "schemaVersion": STUDIO_FEATURE_SCHEMA_VERSION,
+            "technicalQualityScore": row.get::<_, Option<f64>>(0)?,
+            "globalSharpness": row.get::<_, Option<f64>>(1)?,
+            "directionalBlurRatio": row.get::<_, Option<f64>>(2)?,
+            "anonymousFaceCount": row.get::<_, Option<i64>>(3)?,
+            "openEyesCount": row.get::<_, Option<i64>>(4)?,
+            "similarityGroupId": row.get::<_, Option<String>>(5)?,
+            "similarityGroupSize": row.get::<_, Option<i64>>(6)?,
+            "isGenericRepresentative": row.get::<_, Option<bool>>(7)?,
+            "higherTechnicalPeers": row.get::<_, Option<i64>>(8)?,
+            "momentId": row.get::<_, Option<String>>(9)?,
+            "momentSize": row.get::<_, Option<i64>>(10)?,
+            "momentOrdinal": row.get::<_, Option<i64>>(11)?,
+            "genericRecommendation": row.get::<_, Option<String>>(12)?,
+            "genericConfidence": row.get::<_, Option<f64>>(13)?,
+            "semanticEvidenceAvailable": row.get::<_, bool>(14)?,
+            "capturedAt": row.get::<_, Option<String>>(15)?,
+        })),
+    ).optional()?;
+    row.ok_or_else(|| {
+        PersistenceError::InvalidData(
+            "Studio feature asset does not belong to the selected project".into(),
+        )
+    })
+}
+
+/// Recommendation rows are a cache of this compact evidence projection, never a second source
+/// of truth. Recomputing the same canonical JSON hash at read time prevents a candidate written
+/// just before an analysis/Similar Set/Moment update from being presented as current even if its
+/// asynchronous stale-marking write has not happened yet.
+fn studio_feature_fingerprint(snapshot: &serde_json::Value) -> Result<String> {
+    Ok(blake3::hash(&serde_json::to_vec(snapshot)?)
+        .to_hex()
+        .to_string())
+}
+
+fn studio_recommendation_for_asset(
+    connection: &Connection,
+    project_id: &ProjectId,
+    asset_id: &str,
+) -> Result<Option<StudioRecommendationView>> {
+    let feature_snapshot = studio_feature_snapshot(connection, &project_id.to_string(), asset_id)?;
+    let feature_fingerprint = studio_feature_fingerprint(&feature_snapshot)?;
+    let row = connection.query_row(
+        "SELECT recommendation.recommendation, recommendation.confidence_band, model.model_version, recommendation.explanation_json, recommendation.generic_recommendation_json, recommendation.agreement, recommendation.generated_at
+         FROM studio_recommendations recommendation
+         JOIN studio_models model ON model.id = recommendation.studio_model_id AND model.state = 'active'
+         JOIN studio_profiles profile ON profile.id = recommendation.studio_profile_id AND profile.profile_key = 'local-default' AND profile.personalization_enabled = 1
+         WHERE recommendation.project_id = ?1 AND recommendation.media_asset_id = ?2
+           AND recommendation.feature_schema_version = ?3
+           AND recommendation.feature_fingerprint = ?4
+           AND recommendation.status = 'ready' AND recommendation.stale = 0
+         ORDER BY recommendation.generated_at DESC, recommendation.id DESC LIMIT 1",
+        params![project_id.to_string(), asset_id, STUDIO_FEATURE_SCHEMA_VERSION, feature_fingerprint],
+        |row| {
+            let explanation: serde_json::Value = json_value_from_row(row, 3)?;
+            let factors = explanation.get("factors").and_then(serde_json::Value::as_array)
+                .map(|values| values.iter().filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect())
+                .unwrap_or_default();
+            let generic: serde_json::Value = json_value_from_row(row, 4)?;
+            Ok(StudioRecommendationView {
+                recommendation: row.get(0)?, confidence_band: row.get(1)?, model_version: row.get(2)?, explanation_factors: factors,
+                generic_recommendation: generic.get("label").and_then(serde_json::Value::as_str).map(ToOwned::to_owned),
+                agreement: row.get(5)?, generated_at: row.get(6)?,
+            })
+        },
+    ).optional()?;
+    Ok(row)
+}
+
 fn culling_progress(connection: &Connection, project_id: &ProjectId) -> Result<CullingProgress> {
     let mut progress = connection.query_row(
         "SELECT COUNT(*),
@@ -7490,10 +10791,83 @@ fn culling_group_summaries(
                 reviewed_count: row.get::<_, i64>(7)? as u64,
                 completed: completion_kind.is_some(),
                 completion_kind,
+                studio_starting_point_asset_id: None,
+                studio_starting_point_reason: None,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut rows = rows;
+    for summary in &mut rows {
+        if let Some((asset_id, explanation)) =
+            current_studio_similar_set_starting_point(connection, project_id, &summary.id)?
+        {
+            summary.studio_starting_point_asset_id = Some(asset_id);
+            summary.studio_starting_point_reason =
+                studio_similar_set_starting_point_reason(&explanation);
+        }
+    }
     Ok(rows)
+}
+
+/// Similar Set advice must pass the exact same current-feature check as the per-asset culling
+/// card. A cached candidate rank is never allowed to become a visible starting point after its
+/// technical, generic, semantic-availability, Similar Set, or Moment context changed.
+fn current_studio_similar_set_starting_point(
+    connection: &Connection,
+    project_id: &ProjectId,
+    group_id: &str,
+) -> Result<Option<(String, String)>> {
+    let candidates = connection
+        .prepare(
+            "SELECT suggestion.media_asset_id, suggestion.feature_fingerprint, suggestion.explanation_json
+             FROM studio_recommendations suggestion
+             JOIN studio_models studio_model
+               ON studio_model.id = suggestion.studio_model_id AND studio_model.state = 'active'
+             JOIN studio_profiles studio_profile
+               ON studio_profile.id = suggestion.studio_profile_id
+              AND studio_profile.profile_key = 'local-default'
+              AND studio_profile.personalization_enabled = 1
+             JOIN similarity_group_members suggested_member
+               ON suggested_member.media_asset_id = suggestion.media_asset_id
+              AND suggested_member.group_id = ?2
+             WHERE suggestion.project_id = ?1
+               AND suggestion.feature_schema_version = ?3
+               AND suggestion.status = 'ready'
+               AND suggestion.stale = 0
+               AND json_extract(suggestion.explanation_json, '$.similarSetRank') IS NOT NULL
+             ORDER BY CAST(json_extract(suggestion.explanation_json, '$.similarSetRank') AS INTEGER) ASC,
+                      suggestion.generated_at DESC, suggestion.id DESC",
+        )?
+        .query_map(
+            params![project_id.to_string(), group_id, STUDIO_FEATURE_SCHEMA_VERSION],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (asset_id, stored_fingerprint, explanation) in candidates {
+        let snapshot = studio_feature_snapshot(connection, &project_id.to_string(), &asset_id)?;
+        if studio_feature_fingerprint(&snapshot)? == stored_fingerprint {
+            return Ok(Some((asset_id, explanation)));
+        }
+    }
+    Ok(None)
+}
+
+fn studio_similar_set_starting_point_reason(value: &str) -> Option<String> {
+    let explanation = serde_json::from_str::<serde_json::Value>(value).ok()?;
+    let factor = explanation
+        .get("pairwiseFactors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(serde_json::Value::as_str)?;
+    Some(format!(
+        "A local comparable-set model ranked this non-binding starting point because {factor}."
+    ))
 }
 
 fn completed_group_count(connection: &Connection, project_id: &ProjectId) -> Result<u64> {
@@ -8854,6 +12228,455 @@ CREATE TABLE capture_time_observations (
 );
 CREATE INDEX idx_capture_time_observations_asset
   ON capture_time_observations(media_asset_id, capture_time_source, captured_at_local);
+COMMIT;
+"#;
+
+// M8 Studio Brain is an additive, local-only derived-data layer. Human decisions and all M0–M7
+// records remain the durable source of authority; models and recommendations are rebuildable.
+const MIGRATION_014: &str = r#"
+BEGIN;
+CREATE TABLE studio_profiles (
+  id TEXT PRIMARY KEY,
+  profile_key TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL,
+  training_status TEXT NOT NULL CHECK (training_status IN ('not_ready', 'learning', 'ready', 'stale', 'error')),
+  personalization_enabled INTEGER NOT NULL DEFAULT 1 CHECK (personalization_enabled IN (0, 1)),
+  training_settings_json TEXT NOT NULL,
+  readiness_json TEXT NOT NULL,
+  last_trained_at TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE project_training_preferences (
+  studio_profile_id TEXT NOT NULL REFERENCES studio_profiles(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  included INTEGER NOT NULL CHECK (included IN (0, 1)),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(studio_profile_id, project_id)
+);
+CREATE TABLE studio_training_examples (
+  id TEXT PRIMARY KEY,
+  studio_profile_id TEXT NOT NULL REFERENCES studio_profiles(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  media_asset_id TEXT REFERENCES media_assets(id),
+  source_kind TEXT NOT NULL,
+  source_record_id TEXT NOT NULL,
+  decision_type TEXT NOT NULL,
+  decision_value TEXT,
+  occurred_at TEXT NOT NULL,
+  review_session_id TEXT REFERENCES review_sessions(id),
+  similarity_group_id TEXT REFERENCES similarity_groups(id),
+  moment_id TEXT,
+  generic_recommendation_json TEXT NOT NULL,
+  studio_recommendation_id_at_decision TEXT,
+  recommendation_shown TEXT NOT NULL CHECK (recommendation_shown IN ('shown', 'not_shown', 'unknown')),
+  provenance TEXT NOT NULL CHECK (provenance IN ('explicit_human', 'historical_backfill')),
+  feature_schema_version TEXT NOT NULL,
+  feature_snapshot_json TEXT NOT NULL,
+  training_eligible INTEGER NOT NULL DEFAULT 1 CHECK (training_eligible IN (0, 1)),
+  created_at TEXT NOT NULL,
+  UNIQUE(studio_profile_id, source_kind, source_record_id)
+);
+CREATE TABLE studio_training_example_references (
+  studio_training_example_id TEXT NOT NULL REFERENCES studio_training_examples(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (role IN ('chosen', 'alternative', 'moment_member')),
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  PRIMARY KEY(studio_training_example_id, role, media_asset_id)
+);
+CREATE TABLE decision_training_exclusions (
+  studio_profile_id TEXT NOT NULL REFERENCES studio_profiles(id) ON DELETE CASCADE,
+  studio_training_example_id TEXT NOT NULL REFERENCES studio_training_examples(id) ON DELETE CASCADE,
+  excluded_at TEXT NOT NULL,
+  PRIMARY KEY(studio_profile_id, studio_training_example_id)
+);
+CREATE TABLE studio_training_runs (
+  id TEXT PRIMARY KEY,
+  studio_profile_id TEXT NOT NULL REFERENCES studio_profiles(id) ON DELETE CASCADE,
+  background_job_id TEXT NOT NULL REFERENCES background_jobs(id),
+  algorithm TEXT NOT NULL,
+  algorithm_version TEXT NOT NULL,
+  feature_schema_version TEXT NOT NULL,
+  parameters_json TEXT NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  snapshot_count INTEGER NOT NULL CHECK (snapshot_count >= 0),
+  previous_active_model_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('queued', 'training', 'evaluating', 'persisting', 'completed', 'failed', 'interrupted', 'not_activated')),
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE TABLE studio_training_run_examples (
+  studio_training_run_id TEXT NOT NULL REFERENCES studio_training_runs(id) ON DELETE CASCADE,
+  studio_training_example_id TEXT NOT NULL REFERENCES studio_training_examples(id),
+  split TEXT NOT NULL CHECK (split IN ('train', 'validation', 'holdout', 'excluded')),
+  feature_snapshot_json TEXT NOT NULL,
+  label TEXT,
+  PRIMARY KEY(studio_training_run_id, studio_training_example_id)
+);
+CREATE TABLE studio_models (
+  id TEXT PRIMARY KEY,
+  studio_profile_id TEXT NOT NULL REFERENCES studio_profiles(id) ON DELETE CASCADE,
+  studio_training_run_id TEXT NOT NULL REFERENCES studio_training_runs(id) ON DELETE CASCADE,
+  algorithm TEXT NOT NULL,
+  model_version TEXT NOT NULL,
+  feature_schema_version TEXT NOT NULL,
+  artifact_json TEXT NOT NULL,
+  checksum TEXT NOT NULL,
+  artifact_size_bytes INTEGER NOT NULL CHECK (artifact_size_bytes >= 0),
+  state TEXT NOT NULL CHECK (state IN ('candidate', 'active', 'previous', 'invalid', 'reset')),
+  metrics_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  activated_at TEXT
+);
+CREATE TABLE studio_model_metrics (
+  id TEXT PRIMARY KEY,
+  studio_model_id TEXT NOT NULL REFERENCES studio_models(id) ON DELETE CASCADE,
+  split TEXT NOT NULL,
+  metric_name TEXT NOT NULL,
+  metric_value REAL,
+  sample_count INTEGER NOT NULL CHECK (sample_count >= 0),
+  metadata_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE studio_recommendations (
+  id TEXT PRIMARY KEY,
+  studio_profile_id TEXT NOT NULL REFERENCES studio_profiles(id) ON DELETE CASCADE,
+  studio_model_id TEXT NOT NULL REFERENCES studio_models(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id),
+  feature_schema_version TEXT NOT NULL,
+  feature_fingerprint TEXT NOT NULL,
+  recommendation TEXT NOT NULL CHECK (recommendation IN ('likely_keep', 'likely_review', 'likely_reject', 'not_enough_evidence')),
+  confidence_band TEXT NOT NULL CHECK (confidence_band IN ('high', 'moderate', 'low', 'unavailable')),
+  explanation_json TEXT NOT NULL,
+  generic_recommendation_json TEXT NOT NULL,
+  agreement TEXT NOT NULL CHECK (agreement IN ('agrees', 'differs', 'unavailable')),
+  status TEXT NOT NULL CHECK (status IN ('ready', 'stale', 'unavailable', 'error')),
+  stale INTEGER NOT NULL DEFAULT 0 CHECK (stale IN (0, 1)),
+  generated_at TEXT NOT NULL,
+  UNIQUE(studio_model_id, media_asset_id, feature_fingerprint)
+);
+CREATE TABLE studio_events (
+  id TEXT PRIMARY KEY,
+  studio_profile_id TEXT NOT NULL REFERENCES studio_profiles(id) ON DELETE CASCADE,
+  project_id TEXT REFERENCES projects(id),
+  studio_training_run_id TEXT REFERENCES studio_training_runs(id),
+  studio_model_id TEXT REFERENCES studio_models(id),
+  event_type TEXT NOT NULL,
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_studio_examples_profile_project
+  ON studio_training_examples(studio_profile_id, project_id, occurred_at);
+CREATE INDEX idx_studio_examples_asset
+  ON studio_training_examples(studio_profile_id, media_asset_id, occurred_at);
+CREATE INDEX idx_studio_runs_profile_updated
+  ON studio_training_runs(studio_profile_id, updated_at DESC);
+CREATE INDEX idx_studio_recommendations_project_asset
+  ON studio_recommendations(studio_profile_id, project_id, media_asset_id, stale, status);
+CREATE INDEX idx_studio_events_profile_created
+  ON studio_events(studio_profile_id, created_at DESC);
+CREATE UNIQUE INDEX idx_studio_models_one_active
+  ON studio_models(studio_profile_id) WHERE state = 'active';
+CREATE UNIQUE INDEX idx_studio_runs_one_inflight
+  ON studio_training_runs(studio_profile_id)
+  WHERE state IN ('queued', 'training', 'evaluating', 'persisting');
+COMMIT;
+"#;
+
+// M8.1 closes the final candidate-activation race without changing any human source record.
+// Triggers advance only when the eligible source set can change; activation checks the value
+// while it holds the same IMMEDIATE SQLite transaction that makes a model visible.
+const MIGRATION_015: &str = r#"
+BEGIN;
+ALTER TABLE studio_profiles ADD COLUMN source_revision INTEGER NOT NULL DEFAULT 0;
+CREATE TRIGGER studio_source_revision_example_insert
+AFTER INSERT ON studio_training_examples
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1
+  WHERE id = NEW.studio_profile_id;
+END;
+CREATE TRIGGER studio_source_revision_example_delete
+AFTER DELETE ON studio_training_examples
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1
+  WHERE id = OLD.studio_profile_id;
+END;
+CREATE TRIGGER studio_source_revision_exclusion_insert
+AFTER INSERT ON decision_training_exclusions
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1
+  WHERE id = NEW.studio_profile_id;
+END;
+CREATE TRIGGER studio_source_revision_exclusion_delete
+AFTER DELETE ON decision_training_exclusions
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1
+  WHERE id = OLD.studio_profile_id;
+END;
+CREATE TRIGGER studio_source_revision_project_preference_insert
+AFTER INSERT ON project_training_preferences
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1
+  WHERE id = NEW.studio_profile_id;
+END;
+CREATE TRIGGER studio_source_revision_project_preference_update
+AFTER UPDATE OF included ON project_training_preferences
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1
+  WHERE id = NEW.studio_profile_id;
+END;
+CREATE TRIGGER studio_source_revision_project_preference_delete
+AFTER DELETE ON project_training_preferences
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1
+  WHERE id = OLD.studio_profile_id;
+END;
+COMMIT;
+"#;
+
+// M8.2 records an in-progress authoritative source append. A training snapshot must not begin
+// between an intentional human write and its immutable history/source materialization.
+const MIGRATION_016: &str = r#"
+BEGIN;
+ALTER TABLE studio_profiles
+  ADD COLUMN source_materialization_pending INTEGER NOT NULL DEFAULT 0
+  CHECK (source_materialization_pending >= 0);
+COMMIT;
+"#;
+
+// M8.3 records the source-append guard in the same SQLite statement/transaction as each
+// authority-bearing human action. This closes the gap between a visible human choice and its
+// later compact feature snapshot without ever making a Studio snapshot failure rewrite or
+// reject that choice. The pending counter is cleared only after successful source capture or a
+// complete explicit historical reconciliation.
+const MIGRATION_017: &str = r#"
+BEGIN;
+CREATE TRIGGER studio_source_guard_m4_override
+AFTER INSERT ON intelligence_overrides
+BEGIN
+  INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at)
+  VALUES (lower(hex(randomblob(16))), 'local-default', 'Local Studio Profile', 'not_ready', 1, '{"mode":"explicit_retrain","algorithm":"studio-linear-v1"}', '{"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      source_materialization_pending = source_materialization_pending + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = (SELECT project_id FROM media_assets WHERE id = NEW.media_asset_id)), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_culling_insert
+AFTER INSERT ON media_decisions
+WHEN NEW.source = 'human' AND (NEW.decision IS NOT NULL OR NEW.rating <> 0 OR NEW.starred <> 0)
+BEGIN
+  INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at)
+  VALUES (lower(hex(randomblob(16))), 'local-default', 'Local Studio Profile', 'not_ready', 1, '{"mode":"explicit_retrain","algorithm":"studio-linear-v1"}', '{"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      source_materialization_pending = source_materialization_pending + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_culling_update
+AFTER UPDATE OF decision, rating, starred ON media_decisions
+WHEN NEW.source = 'human'
+ AND (NEW.decision IS NOT OLD.decision OR NEW.rating IS NOT OLD.rating OR NEW.starred IS NOT OLD.starred)
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      source_materialization_pending = source_materialization_pending + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_group_representative_insert
+AFTER INSERT ON group_human_representatives
+BEGIN
+  INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at)
+  VALUES (lower(hex(randomblob(16))), 'local-default', 'Local Studio Profile', 'not_ready', 1, '{"mode":"explicit_retrain","algorithm":"studio-linear-v1"}', '{"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      source_materialization_pending = source_materialization_pending + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_group_representative_update
+AFTER UPDATE OF media_asset_id ON group_human_representatives
+WHEN NEW.media_asset_id IS NOT OLD.media_asset_id
+BEGIN
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      source_materialization_pending = source_materialization_pending + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_moment_representative_event
+AFTER INSERT ON moment_events
+WHEN NEW.event_type = 'MOMENT_REPRESENTATIVE_CHANGED'
+ AND json_extract(NEW.details_json, '$.source') IS NULL
+BEGIN
+  INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at)
+  VALUES (lower(hex(randomblob(16))), 'local-default', 'Local Studio Profile', 'not_ready', 1, '{"mode":"explicit_retrain","algorithm":"studio-linear-v1"}', '{"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      source_materialization_pending = source_materialization_pending + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+COMMIT;
+"#;
+
+// M8.4 makes each pending marker action-scoped. A profile-wide counter cannot distinguish a
+// failed capture in one project from a later opted-out action in another; deleting only the
+// matching durable guard makes reconciliation and activation fail closed without blocking the
+// underlying human action.
+const MIGRATION_018: &str = r#"
+BEGIN;
+DROP TRIGGER studio_source_guard_m4_override;
+DROP TRIGGER studio_source_guard_culling_insert;
+DROP TRIGGER studio_source_guard_culling_update;
+DROP TRIGGER studio_source_guard_group_representative_insert;
+DROP TRIGGER studio_source_guard_group_representative_update;
+DROP TRIGGER studio_source_guard_moment_representative_event;
+CREATE TABLE studio_source_materialization_guards (
+  studio_profile_id TEXT NOT NULL REFERENCES studio_profiles(id) ON DELETE CASCADE,
+  source_kind TEXT NOT NULL,
+  source_record_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(studio_profile_id, source_kind, source_record_id)
+);
+CREATE INDEX idx_studio_source_guards_profile
+  ON studio_source_materialization_guards(studio_profile_id, created_at);
+CREATE TRIGGER studio_source_guard_m4_override
+AFTER INSERT ON intelligence_overrides
+BEGIN
+  INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at)
+  VALUES (lower(hex(randomblob(16))), 'local-default', 'Local Studio Profile', 'not_ready', 1, '{"mode":"explicit_retrain","algorithm":"studio-linear-v1"}', '{"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  INSERT OR IGNORE INTO studio_source_materialization_guards (studio_profile_id, source_kind, source_record_id, created_at)
+  SELECT profile.id, 'm4_human_override', NEW.id, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  FROM studio_profiles profile
+  WHERE profile.profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = profile.id AND preference.project_id = (SELECT project_id FROM media_assets WHERE id = NEW.media_asset_id)), 1) = 1;
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = (SELECT project_id FROM media_assets WHERE id = NEW.media_asset_id)), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_culling_insert
+AFTER INSERT ON media_decisions
+WHEN NEW.source = 'human' AND (NEW.decision IS NOT NULL OR NEW.rating <> 0 OR NEW.starred <> 0)
+BEGIN
+  INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at)
+  VALUES (lower(hex(randomblob(16))), 'local-default', 'Local Studio Profile', 'not_ready', 1, '{"mode":"explicit_retrain","algorithm":"studio-linear-v1"}', '{"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  INSERT OR IGNORE INTO studio_source_materialization_guards (studio_profile_id, source_kind, source_record_id, created_at)
+  SELECT profile.id, 'm5_culling', NEW.id || ':' || NEW.updated_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  FROM studio_profiles profile
+  WHERE profile.profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = profile.id AND preference.project_id = NEW.project_id), 1) = 1;
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_culling_update
+AFTER UPDATE OF decision, rating, starred ON media_decisions
+WHEN NEW.source = 'human'
+ AND (NEW.decision IS NOT OLD.decision OR NEW.rating IS NOT OLD.rating OR NEW.starred IS NOT OLD.starred)
+BEGIN
+  INSERT OR IGNORE INTO studio_source_materialization_guards (studio_profile_id, source_kind, source_record_id, created_at)
+  SELECT profile.id, 'm5_culling', NEW.id || ':' || NEW.updated_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  FROM studio_profiles profile
+  WHERE profile.profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = profile.id AND preference.project_id = NEW.project_id), 1) = 1;
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_group_representative_insert
+AFTER INSERT ON group_human_representatives
+BEGIN
+  INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at)
+  VALUES (lower(hex(randomblob(16))), 'local-default', 'Local Studio Profile', 'not_ready', 1, '{"mode":"explicit_retrain","algorithm":"studio-linear-v1"}', '{"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  INSERT OR IGNORE INTO studio_source_materialization_guards (studio_profile_id, source_kind, source_record_id, created_at)
+  SELECT profile.id, 'similar_set_representative', NEW.group_id || ':' || NEW.selected_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  FROM studio_profiles profile
+  WHERE profile.profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = profile.id AND preference.project_id = NEW.project_id), 1) = 1;
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_group_representative_update
+AFTER UPDATE OF media_asset_id ON group_human_representatives
+WHEN NEW.media_asset_id IS NOT OLD.media_asset_id
+BEGIN
+  INSERT OR IGNORE INTO studio_source_materialization_guards (studio_profile_id, source_kind, source_record_id, created_at)
+  SELECT profile.id, 'similar_set_representative', NEW.group_id || ':' || NEW.selected_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  FROM studio_profiles profile
+  WHERE profile.profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = profile.id AND preference.project_id = NEW.project_id), 1) = 1;
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+CREATE TRIGGER studio_source_guard_moment_representative_event
+AFTER INSERT ON moment_events
+WHEN NEW.event_type = 'MOMENT_REPRESENTATIVE_CHANGED'
+ AND json_extract(NEW.details_json, '$.source') IS NULL
+BEGIN
+  INSERT OR IGNORE INTO studio_profiles (id, profile_key, display_name, training_status, personalization_enabled, training_settings_json, readiness_json, created_at, updated_at)
+  VALUES (lower(hex(randomblob(16))), 'local-default', 'Local Studio Profile', 'not_ready', 1, '{"mode":"explicit_retrain","algorithm":"studio-linear-v1"}', '{"state":"not_ready","reasons":["No explicit human decision history has been materialized for training."]}', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+  INSERT OR IGNORE INTO studio_source_materialization_guards (studio_profile_id, source_kind, source_record_id, created_at)
+  SELECT profile.id, 'moment_representative', NEW.id, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  FROM studio_profiles profile
+  WHERE profile.profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = profile.id AND preference.project_id = NEW.project_id), 1) = 1;
+  UPDATE studio_profiles
+  SET source_revision = source_revision + 1,
+      training_status = CASE WHEN EXISTS (SELECT 1 FROM studio_models model WHERE model.studio_profile_id = studio_profiles.id AND model.state = 'active') AND training_status <> 'error' THEN 'stale' ELSE training_status END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE profile_key = 'local-default'
+    AND COALESCE((SELECT included FROM project_training_preferences preference WHERE preference.studio_profile_id = studio_profiles.id AND preference.project_id = NEW.project_id), 1) = 1;
+END;
+-- M17's counter was an intermediate implementation. All current pending state is represented by
+-- action-scoped rows above. Preserve any older unresolved counter as a recovery guard so it is
+-- reconciled by the next explicit history pass rather than becoming silently activatable.
+INSERT OR IGNORE INTO studio_source_materialization_guards (studio_profile_id, source_kind, source_record_id, created_at)
+SELECT id, 'legacy_m17_recovery', 'pre-m18', updated_at
+FROM studio_profiles
+WHERE source_materialization_pending > 0;
+UPDATE studio_profiles SET source_materialization_pending = 0;
 COMMIT;
 "#;
 
@@ -10818,6 +14641,14 @@ mod tests {
         let examples = repository.preference_examples(&project.id).unwrap();
         assert_eq!(examples.len(), 1);
         assert_eq!(examples[0].chosen_asset_id, human_choice.id.to_string());
+        let profile_id = repository.ensure_default_studio_profile().unwrap();
+        assert!(
+            !repository
+                .studio_training_source_state(&profile_id)
+                .unwrap()
+                .materialization_pending,
+            "a successful Similar Set representative capture clears its atomic source guard"
+        );
         let snapshot: String = repository
             .connection
             .query_row(
@@ -11339,9 +15170,123 @@ mod tests {
         }
     }
 
+    fn active_moment_ordinals(
+        repository: &SqliteRepository,
+        project_id: &ProjectId,
+    ) -> Vec<(String, i64)> {
+        repository
+            .connection
+            .prepare(
+                "SELECT id, ordinal
+                 FROM moment_records
+                 WHERE project_id = ?1 AND stale = 0
+                 ORDER BY ordinal ASC, id ASC",
+            )
+            .unwrap()
+            .query_map(params![project_id.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn assert_m7_projection_integrity(repository: &SqliteRepository, project_id: &ProjectId) {
+        let active_ordinals = active_moment_ordinals(repository, project_id);
+        assert_eq!(
+            active_ordinals
+                .iter()
+                .map(|(_, ordinal)| *ordinal)
+                .collect::<Vec<_>>(),
+            (0..i64::try_from(active_ordinals.len()).unwrap()).collect::<Vec<_>>(),
+            "active Moment ordinals must be contiguous and deterministic"
+        );
+        let active_membership_ordinals = repository
+            .connection
+            .prepare(
+                "SELECT ordinal
+                 FROM moment_memberships
+                 WHERE project_id = ?1 AND active = 1
+                 ORDER BY ordinal ASC, id ASC",
+            )
+            .unwrap()
+            .query_map(params![project_id.to_string()], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            active_membership_ordinals,
+            (0..i64::try_from(active_membership_ordinals.len()).unwrap()).collect::<Vec<_>>(),
+            "active Moment membership ordinals must be contiguous and deterministic"
+        );
+        let duplicate_ordinal_count: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM (
+                     SELECT run_id, ordinal
+                     FROM moment_records
+                     WHERE project_id = ?1
+                     GROUP BY run_id, ordinal
+                     HAVING COUNT(*) > 1
+                 )",
+                params![project_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(duplicate_ordinal_count, 0);
+        let invalid_active_memberships: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM moment_memberships membership
+                 LEFT JOIN moment_records moment ON moment.id = membership.moment_id
+                 WHERE membership.project_id = ?1
+                   AND membership.active = 1
+                   AND membership.membership_state = 'member'
+                   AND (moment.id IS NULL OR moment.stale <> 0 OR membership.run_id <> moment.run_id)",
+                params![project_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invalid_active_memberships, 0);
+        let orphaned_active_segments: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM timeline_segments segment
+                 WHERE segment.project_id = ?1
+                   AND segment.stale = 0
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM moment_records moment
+                       WHERE moment.project_id = segment.project_id
+                         AND moment.segment_id = segment.id
+                         AND moment.stale = 0
+                   )",
+                params![project_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphaned_active_segments, 0);
+        let foreign_key_issue: Option<String> = repository
+            .connection
+            .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+            .optional()
+            .unwrap();
+        assert!(foreign_key_issue.is_none());
+        let integrity: String = repository
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
     #[test]
     fn m7_incremental_window_and_tail_replacement_preserve_active_projection_and_human_history() {
-        let repository = SqliteRepository::open_in_memory().unwrap();
+        let directory = tempdir().unwrap();
+        let catalog = directory.path().join("m7-tail-replacement.sqlite3");
+        let repository = SqliteRepository::open(&catalog).unwrap();
         let project = project();
         repository.insert_project(&project).unwrap();
         repository.insert_storage_volume(&volume()).unwrap();
@@ -11515,6 +15460,34 @@ mod tests {
             .rename_moment(&project.id, "m7-moment-1", "Human tail label")
             .unwrap();
         repository
+            .set_moment_human_representative(&project.id, "m7-moment-1", &asset_ids[3])
+            .unwrap();
+        let profile_id = repository.ensure_default_studio_profile().unwrap();
+        assert!(
+            !repository
+                .studio_training_source_state(&profile_id)
+                .unwrap()
+                .materialization_pending,
+            "a successful Moment representative capture clears its atomic source guard"
+        );
+        repository
+            .create_coverage_checklist_item(&CoverageChecklistItemRecord {
+                id: "m7-tail-checklist".into(),
+                project_id: project.id.to_string(),
+                text: "Photographer-confirmed tail coverage".into(),
+                created_at: timestamp(&now()),
+            })
+            .unwrap();
+        repository
+            .update_coverage_confirmation(
+                &project.id,
+                "m7-tail-checklist",
+                "confirmed_covered",
+                Some("m7-moment-1"),
+                Some(&asset_ids[2]),
+            )
+            .unwrap();
+        repository
             .connection
             .execute(
                 "INSERT INTO moment_override_operations (id, project_id, operation, left_asset_id, right_asset_id, created_at, active)
@@ -11533,8 +15506,8 @@ mod tests {
         let tail_timeline = m7_test_timeline(&project.id, timeline_id, initial_run_id);
         let tail_run = m7_test_run(&project.id, timeline_id, tail_run_id, 5);
         let tail_segments = vec![
-            m7_test_segment(&project.id, tail_run_id, "m7-tail-segment-1", 1, 2),
-            m7_test_segment(&project.id, tail_run_id, "m7-tail-segment-2", 2, 3),
+            m7_test_segment(&project.id, tail_run_id, "m7-tail-segment-1", 1, 1),
+            m7_test_segment(&project.id, tail_run_id, "m7-tail-segment-2", 2, 4),
         ];
         let tail_moments = vec![
             m7_test_moment(
@@ -11545,7 +15518,7 @@ mod tests {
                 "m7-tail-moment-1",
                 &asset_ids[2],
                 1,
-                2,
+                1,
             ),
             m7_test_moment(
                 &project.id,
@@ -11553,9 +15526,9 @@ mod tests {
                 tail_run_id,
                 "m7-tail-segment-2",
                 "m7-tail-moment-2",
-                &asset_ids[4],
+                &asset_ids[3],
                 2,
-                3,
+                4,
             ),
         ];
         let tail_memberships = vec![
@@ -11572,7 +15545,7 @@ mod tests {
                 &project.id,
                 tail_run_id,
                 "m7-tail-member-3",
-                Some("m7-tail-moment-1"),
+                Some("m7-tail-moment-2"),
                 &asset_ids[3],
                 3,
                 "member",
@@ -11609,14 +15582,83 @@ mod tests {
             id: "m7-tail-boundary-4".into(),
             project_id: project.id.to_string(),
             run_id: tail_run_id.into(),
-            left_asset_id: asset_ids[3].clone(),
-            right_asset_id: asset_ids[4].clone(),
+            left_asset_id: asset_ids[2].clone(),
+            right_asset_id: asset_ids[3].clone(),
             ordinal: 0,
             category: "strong".into(),
             components: serde_json::json!({"test": "tail boundary"}),
             explanation: "Local structural evidence supports this boundary.".into(),
             created_at: timestamp(&now()),
         }];
+        // A direct persistence caller cannot leave a valid-looking tail with a gap between the
+        // preserved prefix and its replacement cards. The local tail ordinals are contiguous,
+        // so this specifically exercises the combined active-projection check.
+        let mut malformed_tail_segments = tail_segments.clone();
+        malformed_tail_segments[0].ordinal = 3;
+        malformed_tail_segments[1].ordinal = 4;
+        let mut malformed_tail_moments = tail_moments.clone();
+        malformed_tail_moments[0].ordinal = 3;
+        malformed_tail_moments[1].ordinal = 4;
+        let malformed_tail_error = repository
+            .replace_active_moment_analysis_tail(
+                &tail_timeline,
+                &tail_run,
+                window.affected_tail_start_ordinal,
+                &malformed_tail_segments,
+                &malformed_tail_moments,
+                &tail_memberships,
+                &tail_boundaries,
+            )
+            .unwrap_err();
+        assert!(malformed_tail_error
+            .to_string()
+            .contains("active Moment ordinals must be contiguous from 0"));
+        assert_eq!(
+            repository
+                .moment_timeline_status(&project.id)
+                .unwrap()
+                .unwrap()
+                .active_run_id
+                .as_deref(),
+            Some(initial_run_id),
+            "a rejected direct tail payload must leave the prior timeline active"
+        );
+        let mut duplicate_head_tail_memberships = tail_memberships.clone();
+        duplicate_head_tail_memberships.push(m7_test_membership(
+            &project.id,
+            tail_run_id,
+            "m7-tail-duplicate-preserved-head",
+            Some("m7-tail-moment-2"),
+            &asset_ids[0],
+            7,
+            "member",
+        ));
+        let mut duplicate_head_tail_moments = tail_moments.clone();
+        duplicate_head_tail_moments[1].asset_count = 5;
+        let duplicate_head_error = repository
+            .replace_active_moment_analysis_tail(
+                &tail_timeline,
+                &tail_run,
+                window.affected_tail_start_ordinal,
+                &tail_segments,
+                &duplicate_head_tail_moments,
+                &duplicate_head_tail_memberships,
+                &tail_boundaries,
+            )
+            .unwrap_err();
+        assert!(duplicate_head_error
+            .to_string()
+            .contains("repeats a preserved active media asset"));
+        assert_eq!(
+            repository
+                .moment_timeline_status(&project.id)
+                .unwrap()
+                .unwrap()
+                .active_run_id
+                .as_deref(),
+            Some(initial_run_id),
+            "a duplicate preserved asset must roll back the attempted tail replacement"
+        );
         repository
             .replace_active_moment_analysis_tail(
                 &tail_timeline,
@@ -11675,6 +15717,16 @@ mod tests {
             .unwrap();
         assert_eq!(renamed_tail.display_label, "Human tail label");
         assert!(renamed_tail.human_override_present);
+        assert_eq!(renamed_tail.human_representative_asset_id, None);
+        let remapped_tail_confirmation = repository.coverage_checklist_items(&project.id).unwrap();
+        assert_eq!(
+            remapped_tail_confirmation[0].moment_id.as_deref(),
+            Some("m7-tail-moment-1")
+        );
+        assert_eq!(
+            remapped_tail_confirmation[0].media_asset_id.as_deref(),
+            Some(asset_ids[2].as_str())
+        );
         let boundary_tail = page
             .moments
             .iter()
@@ -11685,6 +15737,96 @@ mod tests {
             boundary_tail.boundary_explanation.as_deref(),
             Some("Local structural evidence supports this boundary.")
         );
+        assert_eq!(
+            boundary_tail.human_representative_asset_id.as_deref(),
+            Some(asset_ids[3].as_str()),
+            "a generated tail replacement follows the photographer-selected asset to its new card"
+        );
+
+        // A local tail can preserve an older-run prefix. Editing that prefix must atomically
+        // shift the newer tail block too; reindexing only the old run would leave 0, 2, 3 or
+        // collide with the tail on a subsequent split.
+        repository
+            .split_moment(&project.id, "m7-moment-0", &asset_ids[0])
+            .unwrap();
+        let split_prefix_moment_id: String = repository
+            .connection
+            .query_row(
+                "SELECT id FROM moment_records
+                 WHERE project_id = ?1 AND stale = 0 AND anchor_asset_id = ?2",
+                params![project.id.to_string(), asset_ids[1]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_moment_ordinals(&repository, &project.id),
+            vec![
+                ("m7-moment-0".into(), 0),
+                (split_prefix_moment_id.clone(), 1),
+                ("m7-tail-moment-1".into(), 2),
+                ("m7-tail-moment-2".into(), 3),
+            ]
+        );
+        repository
+            .merge_adjacent_moments(&project.id, "m7-moment-0", &split_prefix_moment_id)
+            .unwrap();
+        assert_eq!(
+            active_moment_ordinals(&repository, &project.id),
+            vec![
+                ("m7-moment-0".into(), 0),
+                ("m7-tail-moment-1".into(), 1),
+                ("m7-tail-moment-2".into(), 2),
+            ]
+        );
+        assert_m7_projection_integrity(&repository, &project.id);
+
+        // The active projection is deliberately composed from preserved `m7-moment-0` in the
+        // original run and this new tail run. Reordering the tail must retain its display base
+        // of 1; resetting it to 0 would collide with the preserved prefix in the timeline UI.
+        let cross_run_error = repository
+            .merge_adjacent_moments(&project.id, "m7-moment-0", "m7-tail-moment-1")
+            .unwrap_err()
+            .to_string();
+        assert!(cross_run_error.contains("different local analysis runs"));
+        repository
+            .merge_adjacent_moments(&project.id, "m7-tail-moment-1", "m7-tail-moment-2")
+            .unwrap();
+        assert_eq!(
+            active_moment_ordinals(&repository, &project.id),
+            vec![("m7-moment-0".into(), 0), ("m7-tail-moment-1".into(), 1),]
+        );
+        assert_m7_projection_integrity(&repository, &project.id);
+
+        // This was the production failure shape: a stale absorbed tail row still occupies the
+        // run's old ordinal, then a split has to insert immediately after the surviving card.
+        // The two-phase reindex keeps the tail range at 1.. rather than causing duplicate 0s.
+        repository
+            .split_moment(&project.id, "m7-tail-moment-1", &asset_ids[3])
+            .unwrap();
+        let split_tail_moment_id: String = repository
+            .connection
+            .query_row(
+                "SELECT id FROM moment_records
+                 WHERE project_id = ?1 AND stale = 0 AND anchor_asset_id = ?2",
+                params![project.id.to_string(), asset_ids[4]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_moment_ordinals(&repository, &project.id),
+            vec![
+                ("m7-moment-0".into(), 0),
+                ("m7-tail-moment-1".into(), 1),
+                (split_tail_moment_id, 2),
+            ]
+        );
+        assert_m7_projection_integrity(&repository, &project.id);
+        let post_edit_window = repository
+            .moment_incremental_analysis_window(&project.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(post_edit_window.affected_tail_start_ordinal, 2);
+        assert_eq!(post_edit_window.moment_ordinal_base, 1);
         let rename_event_count: i64 = repository
             .connection
             .query_row(
@@ -11694,6 +15836,178 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rename_event_count, 1);
+
+        // Reopen before a real second tail replacement: the persisted tail base, label,
+        // representative, and coverage confirmation must all remain usable after restart.
+        drop(repository);
+        let repository = SqliteRepository::open(&catalog).unwrap();
+        let reopened_window = repository
+            .moment_incremental_analysis_window(&project.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened_window.affected_tail_start_ordinal, 2);
+        assert_eq!(reopened_window.moment_ordinal_base, 1);
+        let second_tail_run_id = "m7-tail-replacement-run-2";
+        let second_tail_timeline = m7_test_timeline(&project.id, timeline_id, tail_run_id);
+        let second_tail_run = m7_test_run(&project.id, timeline_id, second_tail_run_id, 5);
+        let second_tail_segments = vec![
+            m7_test_segment(&project.id, second_tail_run_id, "m7-tail-2-segment-1", 1, 2),
+            m7_test_segment(&project.id, second_tail_run_id, "m7-tail-2-segment-2", 2, 3),
+        ];
+        let second_tail_moments = vec![
+            m7_test_moment(
+                &project.id,
+                timeline_id,
+                second_tail_run_id,
+                "m7-tail-2-segment-1",
+                "m7-tail-2-moment-1",
+                &asset_ids[2],
+                1,
+                2,
+            ),
+            m7_test_moment(
+                &project.id,
+                timeline_id,
+                second_tail_run_id,
+                "m7-tail-2-segment-2",
+                "m7-tail-2-moment-2",
+                &asset_ids[4],
+                2,
+                3,
+            ),
+        ];
+        let second_tail_memberships = vec![
+            m7_test_membership(
+                &project.id,
+                second_tail_run_id,
+                "m7-tail-2-member-2",
+                Some("m7-tail-2-moment-1"),
+                &asset_ids[2],
+                2,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                second_tail_run_id,
+                "m7-tail-2-member-3",
+                Some("m7-tail-2-moment-1"),
+                &asset_ids[3],
+                3,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                second_tail_run_id,
+                "m7-tail-2-member-4",
+                Some("m7-tail-2-moment-2"),
+                &asset_ids[4],
+                4,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                second_tail_run_id,
+                "m7-tail-2-member-5",
+                Some("m7-tail-2-moment-2"),
+                &asset_ids[5],
+                5,
+                "member",
+            ),
+            m7_test_membership(
+                &project.id,
+                second_tail_run_id,
+                "m7-tail-2-member-6",
+                Some("m7-tail-2-moment-2"),
+                &asset_ids[6],
+                6,
+                "member",
+            ),
+        ];
+        repository
+            .replace_active_moment_analysis_tail(
+                &second_tail_timeline,
+                &second_tail_run,
+                reopened_window.affected_tail_start_ordinal,
+                &second_tail_segments,
+                &second_tail_moments,
+                &second_tail_memberships,
+                &[MomentBoundaryEvidenceRecord {
+                    id: "m7-tail-2-boundary-4".into(),
+                    project_id: project.id.to_string(),
+                    run_id: second_tail_run_id.into(),
+                    left_asset_id: asset_ids[3].clone(),
+                    right_asset_id: asset_ids[4].clone(),
+                    ordinal: 0,
+                    category: "strong".into(),
+                    components: serde_json::json!({"test": "second tail boundary"}),
+                    explanation: "Local structural evidence supports this boundary.".into(),
+                    created_at: timestamp(&now()),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .moment_timeline_status(&project.id)
+                .unwrap()
+                .unwrap()
+                .active_run_id
+                .as_deref(),
+            Some(second_tail_run_id)
+        );
+        assert_eq!(
+            active_moment_ordinals(&repository, &project.id),
+            vec![
+                ("m7-moment-0".into(), 0),
+                ("m7-tail-2-moment-1".into(), 1),
+                ("m7-tail-2-moment-2".into(), 2),
+            ]
+        );
+        let second_tail_page = repository.moment_timeline_page(&project.id, 10, 0).unwrap();
+        let second_tail_first = second_tail_page
+            .moments
+            .iter()
+            .find(|moment| moment.id == "m7-tail-2-moment-1")
+            .unwrap();
+        assert_eq!(second_tail_first.display_label, "Human tail label");
+        assert_eq!(
+            second_tail_first.human_representative_asset_id.as_deref(),
+            Some(asset_ids[3].as_str())
+        );
+        let second_tail_confirmation = repository.coverage_checklist_items(&project.id).unwrap();
+        assert_eq!(
+            second_tail_confirmation[0].moment_id.as_deref(),
+            Some("m7-tail-2-moment-1")
+        );
+        assert_eq!(
+            second_tail_confirmation[0].media_asset_id.as_deref(),
+            Some(asset_ids[2].as_str())
+        );
+        let stale_confirmation_refs: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM coverage_confirmations confirmation
+                 JOIN moment_records moment ON moment.id = confirmation.moment_id
+                 WHERE confirmation.project_id = ?1 AND moment.stale = 1",
+                params![project.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_confirmation_refs, 0);
+        assert_m7_projection_integrity(&repository, &project.id);
+
+        drop(repository);
+        let reopened = SqliteRepository::open(&catalog).unwrap();
+        assert_eq!(
+            reopened
+                .moment_timeline_status(&project.id)
+                .unwrap()
+                .unwrap()
+                .active_run_id
+                .as_deref(),
+            Some(second_tail_run_id)
+        );
+        assert_m7_projection_integrity(&reopened, &project.id);
     }
 
     #[test]
@@ -11702,24 +16016,39 @@ mod tests {
 
         let repository = SqliteRepository::open_in_memory().unwrap();
         let project = project();
-        let anchor = asset(project.id.clone());
         repository.insert_project(&project).unwrap();
-        repository.insert_media_asset(&anchor).unwrap();
         let timeline_id = "m7-search-large-timeline";
         let run_id = "m7-search-large-run";
         let timeline = m7_test_timeline(&project.id, timeline_id, run_id);
         let run = m7_test_run(&project.id, timeline_id, run_id, MOMENT_COUNT as u64);
         let mut segments = Vec::with_capacity(MOMENT_COUNT);
         let mut moments = Vec::with_capacity(MOMENT_COUNT);
+        let mut memberships = Vec::with_capacity(MOMENT_COUNT);
         for ordinal in 0..MOMENT_COUNT {
             let segment_id = format!("m7-search-segment-{ordinal:05}");
             let moment_id = format!("m7-search-moment-{ordinal:05}");
+            let timeline_asset = MediaAsset {
+                id: id(1_000_000 + ordinal as u128, MediaAssetId::from_uuid),
+                project_id: project.id.clone(),
+                media_type: MediaType::RawPhoto,
+                display_name: format!("SEARCH_{ordinal:05}.ARW"),
+                extension: Some("arw".into()),
+                captured_at: Some(now()),
+                fingerprint: MediaFingerprint {
+                    fast_fingerprint: Some(format!("search-fast-{ordinal}")),
+                    byte_size: Some(10),
+                    ..Default::default()
+                },
+                created_at: now(),
+            };
+            repository.insert_media_asset(&timeline_asset).unwrap();
+            let asset_id = timeline_asset.id.to_string();
             segments.push(m7_test_segment(
                 &project.id,
                 run_id,
                 &segment_id,
                 ordinal as u64,
-                0,
+                1,
             ));
             let mut moment = m7_test_moment(
                 &project.id,
@@ -11727,16 +16056,25 @@ mod tests {
                 run_id,
                 &segment_id,
                 &moment_id,
-                &anchor.id.to_string(),
+                &asset_id,
                 ordinal as u64,
-                0,
+                1,
             );
             moment.centroid = Some(vec![1.0, 0.0]);
             moment.centroid_dimensions = Some(2);
             moments.push(moment);
+            memberships.push(m7_test_membership(
+                &project.id,
+                run_id,
+                &format!("m7-search-membership-{ordinal:05}"),
+                Some(&moment_id),
+                &asset_id,
+                ordinal as u64,
+                "member",
+            ));
         }
         repository
-            .replace_active_moment_analysis(&timeline, &run, &segments, &moments, &[], &[])
+            .replace_active_moment_analysis(&timeline, &run, &segments, &moments, &memberships, &[])
             .unwrap();
 
         let candidates = repository
@@ -11939,7 +16277,1123 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(human_event_count, 5);
+        // The representative follows the selected asset through split and merge. Each rebind is
+        // preserved as an additional append-only human event rather than rewriting the original
+        // representative choice out of history.
+        assert_eq!(human_event_count, 7);
+    }
+
+    #[test]
+    fn m7_structural_edits_rebind_human_representatives_and_stale_absorbed_segments() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let asset_ids = (0_u128..4)
+            .map(|offset| {
+                culling_asset(&repository, &project.id, 94_000 + offset)
+                    .id
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let timeline_id = "m7-representative-timeline";
+        let run_id = "m7-representative-run";
+        repository
+            .replace_active_moment_analysis(
+                &m7_test_timeline(&project.id, timeline_id, run_id),
+                &m7_test_run(&project.id, timeline_id, run_id, 4),
+                &[
+                    m7_test_segment(&project.id, run_id, "m7-representative-segment-0", 0, 2),
+                    m7_test_segment(&project.id, run_id, "m7-representative-segment-1", 1, 2),
+                ],
+                &[
+                    m7_test_moment(
+                        &project.id,
+                        timeline_id,
+                        run_id,
+                        "m7-representative-segment-0",
+                        "m7-representative-moment-0",
+                        &asset_ids[0],
+                        0,
+                        2,
+                    ),
+                    m7_test_moment(
+                        &project.id,
+                        timeline_id,
+                        run_id,
+                        "m7-representative-segment-1",
+                        "m7-representative-moment-1",
+                        &asset_ids[2],
+                        1,
+                        2,
+                    ),
+                ],
+                &[
+                    m7_test_membership(
+                        &project.id,
+                        run_id,
+                        "m7-representative-member-0",
+                        Some("m7-representative-moment-0"),
+                        &asset_ids[0],
+                        0,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        run_id,
+                        "m7-representative-member-1",
+                        Some("m7-representative-moment-0"),
+                        &asset_ids[1],
+                        1,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        run_id,
+                        "m7-representative-member-2",
+                        Some("m7-representative-moment-1"),
+                        &asset_ids[2],
+                        2,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        run_id,
+                        "m7-representative-member-3",
+                        Some("m7-representative-moment-1"),
+                        &asset_ids[3],
+                        3,
+                        "member",
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+
+        repository
+            .rename_moment(
+                &project.id,
+                "m7-representative-moment-0",
+                "Left-side human label",
+            )
+            .unwrap();
+        repository
+            .rename_moment(
+                &project.id,
+                "m7-representative-moment-1",
+                "Right-side human label",
+            )
+            .unwrap();
+        let before_conflicting_label_merge_events: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1",
+                params![project.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let conflicting_label_merge = repository
+            .merge_adjacent_moments(
+                &project.id,
+                "m7-representative-moment-0",
+                "m7-representative-moment-1",
+            )
+            .unwrap_err();
+        assert!(conflicting_label_merge
+            .to_string()
+            .contains("Cannot merge Moments with different human labels"));
+        assert_eq!(
+            active_moment_ordinals(&repository, &project.id),
+            vec![
+                ("m7-representative-moment-0".into(), 0),
+                ("m7-representative-moment-1".into(), 1),
+            ],
+            "a conflicting label merge must not change the active projection"
+        );
+        let after_conflicting_label_merge_events: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1",
+                params![project.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_conflicting_label_merge_events, before_conflicting_label_merge_events,
+            "a rejected label merge must not append an override or event"
+        );
+
+        repository
+            .set_moment_human_representative(
+                &project.id,
+                "m7-representative-moment-0",
+                &asset_ids[1],
+            )
+            .unwrap();
+        repository
+            .split_moment(&project.id, "m7-representative-moment-0", &asset_ids[0])
+            .unwrap();
+        let split_moment_id: String = repository
+            .connection
+            .query_row(
+                "SELECT id FROM moment_records
+                 WHERE project_id = ?1 AND stale = 0 AND anchor_asset_id = ?2",
+                params![project.id.to_string(), asset_ids[1]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let after_split = repository.moment_timeline_page(&project.id, 10, 0).unwrap();
+        assert_eq!(
+            after_split
+                .moments
+                .iter()
+                .find(|moment| moment.id == "m7-representative-moment-0")
+                .unwrap()
+                .human_representative_asset_id,
+            None
+        );
+        assert_eq!(
+            after_split
+                .moments
+                .iter()
+                .find(|moment| moment.id == split_moment_id)
+                .unwrap()
+                .human_representative_asset_id
+                .as_deref(),
+            Some(asset_ids[1].as_str())
+        );
+
+        // The destination currently has no representative, so a human choice on the absorbed
+        // right card must rebind to the surviving left card during merge.
+        repository
+            .connection
+            .execute(
+                "DELETE FROM moment_human_representatives WHERE project_id = ?1 AND anchor_asset_id = ?2",
+                params![project.id.to_string(), asset_ids[1]],
+            )
+            .unwrap();
+        repository
+            .set_moment_human_representative(
+                &project.id,
+                "m7-representative-moment-1",
+                &asset_ids[3],
+            )
+            .unwrap();
+        repository
+            .rename_moment(
+                &project.id,
+                "m7-representative-moment-1",
+                "Right-side human label",
+            )
+            .unwrap();
+        repository
+            .merge_adjacent_moments(&project.id, &split_moment_id, "m7-representative-moment-1")
+            .unwrap();
+        let after_merge = repository.moment_timeline_page(&project.id, 10, 0).unwrap();
+        assert_eq!(
+            after_merge
+                .moments
+                .iter()
+                .find(|moment| moment.id == split_moment_id)
+                .unwrap()
+                .human_representative_asset_id
+                .as_deref(),
+            Some(asset_ids[3].as_str())
+        );
+        assert_eq!(
+            after_merge
+                .moments
+                .iter()
+                .find(|moment| moment.id == split_moment_id)
+                .unwrap()
+                .display_label,
+            "Right-side human label",
+            "a right-side human label must move to the surviving card during a merge"
+        );
+        let absorbed_segment_stale: bool = repository
+            .connection
+            .query_row(
+                "SELECT stale FROM timeline_segments WHERE id = 'm7-representative-segment-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(absorbed_segment_stale);
+        assert_m7_projection_integrity(&repository, &project.id);
+    }
+
+    #[test]
+    fn m7_full_replacement_rebinds_a_resegmented_human_representative() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let asset_ids = (0_u128..4)
+            .map(|offset| {
+                culling_asset(&repository, &project.id, 95_000 + offset)
+                    .id
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let timeline_id = "m7-full-representative-timeline";
+        let initial_run_id = "m7-full-representative-run-1";
+        repository
+            .replace_active_moment_analysis(
+                &m7_test_timeline(&project.id, timeline_id, initial_run_id),
+                &m7_test_run(&project.id, timeline_id, initial_run_id, 4),
+                &[
+                    m7_test_segment(
+                        &project.id,
+                        initial_run_id,
+                        "m7-full-representative-segment-0",
+                        0,
+                        2,
+                    ),
+                    m7_test_segment(
+                        &project.id,
+                        initial_run_id,
+                        "m7-full-representative-segment-1",
+                        1,
+                        2,
+                    ),
+                ],
+                &[
+                    m7_test_moment(
+                        &project.id,
+                        timeline_id,
+                        initial_run_id,
+                        "m7-full-representative-segment-0",
+                        "m7-full-representative-moment-0",
+                        &asset_ids[0],
+                        0,
+                        2,
+                    ),
+                    m7_test_moment(
+                        &project.id,
+                        timeline_id,
+                        initial_run_id,
+                        "m7-full-representative-segment-1",
+                        "m7-full-representative-moment-1",
+                        &asset_ids[2],
+                        1,
+                        2,
+                    ),
+                ],
+                &[
+                    m7_test_membership(
+                        &project.id,
+                        initial_run_id,
+                        "m7-full-representative-member-0",
+                        Some("m7-full-representative-moment-0"),
+                        &asset_ids[0],
+                        0,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        initial_run_id,
+                        "m7-full-representative-member-1",
+                        Some("m7-full-representative-moment-0"),
+                        &asset_ids[1],
+                        1,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        initial_run_id,
+                        "m7-full-representative-member-2",
+                        Some("m7-full-representative-moment-1"),
+                        &asset_ids[2],
+                        2,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        initial_run_id,
+                        "m7-full-representative-member-3",
+                        Some("m7-full-representative-moment-1"),
+                        &asset_ids[3],
+                        3,
+                        "member",
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+        repository
+            .set_moment_human_representative(
+                &project.id,
+                "m7-full-representative-moment-0",
+                &asset_ids[1],
+            )
+            .unwrap();
+        repository
+            .rename_moment(
+                &project.id,
+                "m7-full-representative-moment-1",
+                "Resegmented human label",
+            )
+            .unwrap();
+        repository
+            .rename_moment(
+                &project.id,
+                "m7-full-representative-moment-0",
+                "Conflicting human label",
+            )
+            .unwrap();
+        let conflicting_rebuild_run_id = "m7-full-representative-conflicting-run";
+        let conflicting_rebuild_error = repository
+            .replace_active_moment_analysis(
+                &m7_test_timeline(&project.id, timeline_id, conflicting_rebuild_run_id),
+                &m7_test_run(&project.id, timeline_id, conflicting_rebuild_run_id, 4),
+                &[m7_test_segment(
+                    &project.id,
+                    conflicting_rebuild_run_id,
+                    "m7-full-representative-conflicting-segment",
+                    0,
+                    4,
+                )],
+                &[m7_test_moment(
+                    &project.id,
+                    timeline_id,
+                    conflicting_rebuild_run_id,
+                    "m7-full-representative-conflicting-segment",
+                    "m7-full-representative-conflicting-moment",
+                    &asset_ids[0],
+                    0,
+                    4,
+                )],
+                &[
+                    m7_test_membership(
+                        &project.id,
+                        conflicting_rebuild_run_id,
+                        "m7-full-representative-conflicting-member-0",
+                        Some("m7-full-representative-conflicting-moment"),
+                        &asset_ids[0],
+                        0,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        conflicting_rebuild_run_id,
+                        "m7-full-representative-conflicting-member-1",
+                        Some("m7-full-representative-conflicting-moment"),
+                        &asset_ids[1],
+                        1,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        conflicting_rebuild_run_id,
+                        "m7-full-representative-conflicting-member-2",
+                        Some("m7-full-representative-conflicting-moment"),
+                        &asset_ids[2],
+                        2,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        conflicting_rebuild_run_id,
+                        "m7-full-representative-conflicting-member-3",
+                        Some("m7-full-representative-conflicting-moment"),
+                        &asset_ids[3],
+                        3,
+                        "member",
+                    ),
+                ],
+                &[],
+            )
+            .unwrap_err();
+        assert!(conflicting_rebuild_error
+            .to_string()
+            .contains("multiple human Moment labels would converge"));
+        assert_eq!(
+            repository
+                .moment_timeline_status(&project.id)
+                .unwrap()
+                .unwrap()
+                .active_run_id
+                .as_deref(),
+            Some(initial_run_id),
+            "a conflicting generated resegmentation must preserve the previous active run"
+        );
+        repository
+            .rename_moment(
+                &project.id,
+                "m7-full-representative-moment-0",
+                "Resegmented human label",
+            )
+            .unwrap();
+        repository
+            .create_coverage_checklist_item(&CoverageChecklistItemRecord {
+                id: "m7-full-representative-checklist".into(),
+                project_id: project.id.to_string(),
+                text: "Anchor-only photographer coverage".into(),
+                created_at: timestamp(&now()),
+            })
+            .unwrap();
+        repository
+            .update_coverage_confirmation(
+                &project.id,
+                "m7-full-representative-checklist",
+                "confirmed_covered",
+                Some("m7-full-representative-moment-0"),
+                None,
+            )
+            .unwrap();
+
+        // The selected asset moves away from the source anchor when a full local rebuild
+        // resegments the cards. The photographer's current representative must follow it.
+        let replacement_run_id = "m7-full-representative-run-2";
+        repository
+            .replace_active_moment_analysis(
+                &m7_test_timeline(&project.id, timeline_id, replacement_run_id),
+                &m7_test_run(&project.id, timeline_id, replacement_run_id, 4),
+                &[
+                    m7_test_segment(
+                        &project.id,
+                        replacement_run_id,
+                        "m7-full-representative-replacement-segment-0",
+                        0,
+                        1,
+                    ),
+                    m7_test_segment(
+                        &project.id,
+                        replacement_run_id,
+                        "m7-full-representative-replacement-segment-1",
+                        1,
+                        3,
+                    ),
+                ],
+                &[
+                    m7_test_moment(
+                        &project.id,
+                        timeline_id,
+                        replacement_run_id,
+                        "m7-full-representative-replacement-segment-0",
+                        "m7-full-representative-replacement-moment-0",
+                        &asset_ids[0],
+                        0,
+                        1,
+                    ),
+                    m7_test_moment(
+                        &project.id,
+                        timeline_id,
+                        replacement_run_id,
+                        "m7-full-representative-replacement-segment-1",
+                        "m7-full-representative-replacement-moment-1",
+                        &asset_ids[1],
+                        1,
+                        3,
+                    ),
+                ],
+                &[
+                    m7_test_membership(
+                        &project.id,
+                        replacement_run_id,
+                        "m7-full-representative-replacement-member-0",
+                        Some("m7-full-representative-replacement-moment-0"),
+                        &asset_ids[0],
+                        0,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        replacement_run_id,
+                        "m7-full-representative-replacement-member-1",
+                        Some("m7-full-representative-replacement-moment-1"),
+                        &asset_ids[1],
+                        1,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        replacement_run_id,
+                        "m7-full-representative-replacement-member-2",
+                        Some("m7-full-representative-replacement-moment-1"),
+                        &asset_ids[2],
+                        2,
+                        "member",
+                    ),
+                    m7_test_membership(
+                        &project.id,
+                        replacement_run_id,
+                        "m7-full-representative-replacement-member-3",
+                        Some("m7-full-representative-replacement-moment-1"),
+                        &asset_ids[3],
+                        3,
+                        "member",
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+        let page = repository.moment_timeline_page(&project.id, 10, 0).unwrap();
+        assert_eq!(
+            page.moments
+                .iter()
+                .find(|moment| moment.id == "m7-full-representative-replacement-moment-0")
+                .unwrap()
+                .human_representative_asset_id,
+            None
+        );
+        assert_eq!(
+            page.moments
+                .iter()
+                .find(|moment| moment.id == "m7-full-representative-replacement-moment-1")
+                .unwrap()
+                .human_representative_asset_id
+                .as_deref(),
+            Some(asset_ids[1].as_str())
+        );
+        assert_eq!(
+            page.moments
+                .iter()
+                .find(|moment| moment.id == "m7-full-representative-replacement-moment-1")
+                .unwrap()
+                .display_label,
+            "Resegmented human label",
+            "a human label must follow its anchor asset through a full resegmentation"
+        );
+        let source_anchor_row_count: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM moment_human_representatives
+                 WHERE project_id = ?1 AND anchor_asset_id = ?2",
+                params![project.id.to_string(), asset_ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_anchor_row_count, 0);
+        let anchor_only_confirmation = repository.coverage_checklist_items(&project.id).unwrap();
+        assert_eq!(
+            anchor_only_confirmation[0].moment_id.as_deref(),
+            Some("m7-full-representative-replacement-moment-0"),
+            "a confirmation without a selected asset uses the stale card anchor conservatively"
+        );
+        assert_eq!(anchor_only_confirmation[0].media_asset_id, None);
+        assert_m7_projection_integrity(&repository, &project.id);
+    }
+
+    #[test]
+    fn m7_manual_structural_sequences_resequence_ordinals_and_rollback_safely() {
+        let directory = tempdir().unwrap();
+        let catalog = directory.path().join("m7-ordinal-repair.sqlite3");
+        let (project_id, asset_ids, timeline_id, run_id) = {
+            let repository = SqliteRepository::open(&catalog).unwrap();
+            let project = project();
+            repository.insert_project(&project).unwrap();
+            repository.insert_storage_volume(&volume()).unwrap();
+            let assets = (0_u128..6)
+                .map(|offset| culling_asset(&repository, &project.id, 93_000 + offset))
+                .collect::<Vec<_>>();
+            let asset_ids = assets
+                .iter()
+                .map(|asset| asset.id.to_string())
+                .collect::<Vec<_>>();
+            let timeline_id = "m7-ordinal-timeline";
+            let run_id = "m7-ordinal-run";
+            let timeline = m7_test_timeline(&project.id, timeline_id, run_id);
+            let run = m7_test_run(&project.id, timeline_id, run_id, 6);
+            let segments = (0..3)
+                .map(|ordinal| {
+                    m7_test_segment(
+                        &project.id,
+                        run_id,
+                        &format!("m7-ordinal-segment-{ordinal}"),
+                        ordinal,
+                        2,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let moments = (0..3)
+                .map(|ordinal| {
+                    m7_test_moment(
+                        &project.id,
+                        timeline_id,
+                        run_id,
+                        &format!("m7-ordinal-segment-{ordinal}"),
+                        &format!("m7-ordinal-moment-{ordinal}"),
+                        &asset_ids[ordinal * 2],
+                        ordinal as u64,
+                        2,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let memberships = (0..6)
+                .map(|ordinal| {
+                    m7_test_membership(
+                        &project.id,
+                        run_id,
+                        &format!("m7-ordinal-membership-{ordinal}"),
+                        Some(&format!("m7-ordinal-moment-{}", ordinal / 2)),
+                        &asset_ids[ordinal],
+                        ordinal as u64,
+                        "member",
+                    )
+                })
+                .collect::<Vec<_>>();
+            repository
+                .replace_active_moment_analysis(
+                    &timeline,
+                    &run,
+                    &segments,
+                    &moments,
+                    &memberships,
+                    &[],
+                )
+                .unwrap();
+            repository
+                .rename_moment(&project.id, "m7-ordinal-moment-0", "Photographer first")
+                .unwrap();
+            repository
+                .set_moment_human_representative(&project.id, "m7-ordinal-moment-0", &asset_ids[0])
+                .unwrap();
+            repository
+                .create_coverage_checklist_item(&CoverageChecklistItemRecord {
+                    id: "m7-ordinal-checklist".into(),
+                    project_id: project.id.to_string(),
+                    text: "Photographer-provided moment".into(),
+                    created_at: timestamp(&now()),
+                })
+                .unwrap();
+            repository
+                .update_coverage_confirmation(
+                    &project.id,
+                    "m7-ordinal-checklist",
+                    "confirmed_covered",
+                    Some("m7-ordinal-moment-1"),
+                    Some(&asset_ids[2]),
+                )
+                .unwrap();
+
+            // A + B + C becomes AB + C. The right record is preserved as stale history, but
+            // the active display ordinal space is immediately compacted to 0, 1.
+            repository
+                .merge_adjacent_moments(&project.id, "m7-ordinal-moment-0", "m7-ordinal-moment-1")
+                .unwrap();
+            assert_eq!(
+                active_moment_ordinals(&repository, &project.id),
+                vec![
+                    ("m7-ordinal-moment-0".into(), 0),
+                    ("m7-ordinal-moment-2".into(), 1),
+                ]
+            );
+            assert_m7_projection_integrity(&repository, &project.id);
+
+            // This is the production regression: the stale absorbed record formerly retained
+            // ordinal 1 and caused the next split to violate UNIQUE(run_id, ordinal).
+            repository
+                .split_moment(&project.id, "m7-ordinal-moment-0", &asset_ids[0])
+                .unwrap();
+            let split_moment_id: String = repository
+                .connection
+                .query_row(
+                    "SELECT id FROM moment_records
+                     WHERE project_id = ?1 AND stale = 0 AND anchor_asset_id = ?2",
+                    params![project.id.to_string(), asset_ids[1]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                active_moment_ordinals(&repository, &project.id),
+                vec![
+                    ("m7-ordinal-moment-0".into(), 0),
+                    (split_moment_id.clone(), 1),
+                    ("m7-ordinal-moment-2".into(), 2),
+                ]
+            );
+            let checklist = repository.coverage_checklist_items(&project.id).unwrap();
+            assert_eq!(
+                checklist[0].moment_id.as_deref(),
+                Some(split_moment_id.as_str()),
+                "the existing human confirmation follows its selected asset through a split"
+            );
+            assert_m7_projection_integrity(&repository, &project.id);
+
+            // Exercise both structural orderings: split -> merge -> split. Every pass must keep
+            // active ordinals contiguous while the old generated rows remain available as stale
+            // provenance in the same unique run namespace.
+            repository
+                .merge_adjacent_moments(&project.id, "m7-ordinal-moment-0", &split_moment_id)
+                .unwrap();
+            assert_eq!(
+                active_moment_ordinals(&repository, &project.id),
+                vec![
+                    ("m7-ordinal-moment-0".into(), 0),
+                    ("m7-ordinal-moment-2".into(), 1),
+                ]
+            );
+            repository
+                .split_moment(&project.id, "m7-ordinal-moment-0", &asset_ids[0])
+                .unwrap();
+            assert_eq!(
+                active_moment_ordinals(&repository, &project.id)
+                    .into_iter()
+                    .map(|(_, ordinal)| ordinal)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_m7_projection_integrity(&repository, &project.id);
+
+            // Abort after merge has recorded its override and reassigned memberships, but before
+            // the absorbed Moment can be marked stale. The immediate transaction must roll every
+            // preceding write back together.
+            let fresh_split_moment_id: String = repository
+                .connection
+                .query_row(
+                    "SELECT id FROM moment_records
+                     WHERE project_id = ?1 AND stale = 0 AND anchor_asset_id = ?2",
+                    params![project.id.to_string(), asset_ids[1]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let before_failed_merge = active_moment_ordinals(&repository, &project.id);
+            let before_failed_merge_events: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1",
+                    params![project.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let before_failed_merge_overrides: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_override_operations WHERE project_id = ?1 AND active = 1",
+                    params![project.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let before_failed_merge_asset_moment: String = repository
+                .connection
+                .query_row(
+                    "SELECT moment_id FROM moment_memberships
+                     WHERE project_id = ?1 AND media_asset_id = ?2 AND active = 1",
+                    params![project.id.to_string(), asset_ids[4]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            repository
+                .connection
+                .execute_batch(
+                    "CREATE TRIGGER m7_force_merge_failure
+                     BEFORE UPDATE OF stale ON moment_records
+                     WHEN NEW.id = 'm7-ordinal-moment-2' AND NEW.stale = 1
+                     BEGIN
+                       SELECT RAISE(ABORT, 'forced Moment merge transaction failure');
+                     END;",
+                )
+                .unwrap();
+            assert!(repository
+                .merge_adjacent_moments(&project.id, &fresh_split_moment_id, "m7-ordinal-moment-2",)
+                .is_err());
+            assert_eq!(
+                active_moment_ordinals(&repository, &project.id),
+                before_failed_merge
+            );
+            let after_failed_merge_events: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1",
+                    params![project.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let after_failed_merge_overrides: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_override_operations WHERE project_id = ?1 AND active = 1",
+                    params![project.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let after_failed_merge_asset_moment: String = repository
+                .connection
+                .query_row(
+                    "SELECT moment_id FROM moment_memberships
+                     WHERE project_id = ?1 AND media_asset_id = ?2 AND active = 1",
+                    params![project.id.to_string(), asset_ids[4]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(after_failed_merge_events, before_failed_merge_events);
+            assert_eq!(after_failed_merge_overrides, before_failed_merge_overrides);
+            assert_eq!(
+                after_failed_merge_asset_moment,
+                before_failed_merge_asset_moment
+            );
+            repository
+                .connection
+                .execute_batch("DROP TRIGGER m7_force_merge_failure")
+                .unwrap();
+            assert_m7_projection_integrity(&repository, &project.id);
+
+            let before_failed_split = active_moment_ordinals(&repository, &project.id);
+            let before_failed_split_events: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1",
+                    params![project.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            repository
+                .connection
+                .execute_batch(
+                    "CREATE TRIGGER m7_force_split_failure
+                     BEFORE INSERT ON moment_records
+                     WHEN NEW.run_id = 'm7-ordinal-run' AND NEW.stale = 0
+                     BEGIN
+                       SELECT RAISE(ABORT, 'forced Moment split transaction failure');
+                     END;",
+                )
+                .unwrap();
+            assert!(repository
+                .split_moment(&project.id, "m7-ordinal-moment-2", &asset_ids[4])
+                .is_err());
+            assert_eq!(
+                active_moment_ordinals(&repository, &project.id),
+                before_failed_split
+            );
+            let after_failed_split_events: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1",
+                    params![project.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(after_failed_split_events, before_failed_split_events);
+            repository
+                .connection
+                .execute_batch("DROP TRIGGER m7_force_split_failure")
+                .unwrap();
+            assert_m7_projection_integrity(&repository, &project.id);
+
+            let previous_status = repository
+                .moment_timeline_status(&project.id)
+                .unwrap()
+                .unwrap();
+            let failed_run_id = "m7-ordinal-rollback-run";
+            let failed_timeline = m7_test_timeline(&project.id, timeline_id, failed_run_id);
+            let failed_run = m7_test_run(&project.id, timeline_id, failed_run_id, 2);
+            let failed_segments = vec![
+                m7_test_segment(&project.id, failed_run_id, "m7-rollback-segment-0", 0, 1),
+                m7_test_segment(&project.id, failed_run_id, "m7-rollback-segment-1", 1, 1),
+            ];
+            let failed_moments = vec![
+                m7_test_moment(
+                    &project.id,
+                    timeline_id,
+                    failed_run_id,
+                    "m7-rollback-segment-0",
+                    "m7-rollback-moment-0",
+                    &asset_ids[0],
+                    0,
+                    1,
+                ),
+                m7_test_moment(
+                    &project.id,
+                    timeline_id,
+                    failed_run_id,
+                    "m7-rollback-segment-1",
+                    "m7-rollback-moment-1",
+                    &asset_ids[1],
+                    1,
+                    1,
+                ),
+            ];
+            let failed_memberships = vec![
+                m7_test_membership(
+                    &project.id,
+                    failed_run_id,
+                    "m7-rollback-membership-0",
+                    Some("m7-rollback-moment-0"),
+                    &asset_ids[0],
+                    0,
+                    "member",
+                ),
+                m7_test_membership(
+                    &project.id,
+                    failed_run_id,
+                    "m7-rollback-membership-1",
+                    Some("m7-rollback-moment-1"),
+                    &asset_ids[1],
+                    1,
+                    "member",
+                ),
+            ];
+            // Full replacement callers must likewise provide a complete 0..n Moment
+            // projection. Reject a malformed direct payload before it can stale the previous
+            // timeline or consume its analysis-run ID.
+            let mut malformed_full_moments = failed_moments.clone();
+            malformed_full_moments[1].ordinal = 2;
+            let mut malformed_full_segments = failed_segments.clone();
+            malformed_full_segments[1].ordinal = 2;
+            let malformed_full_error = repository
+                .replace_active_moment_analysis(
+                    &failed_timeline,
+                    &failed_run,
+                    &malformed_full_segments,
+                    &malformed_full_moments,
+                    &failed_memberships,
+                    &[],
+                )
+                .unwrap_err();
+            assert!(malformed_full_error
+                .to_string()
+                .contains("ordinals must be contiguous from 0"));
+            assert_eq!(
+                repository
+                    .moment_timeline_status(&project.id)
+                    .unwrap()
+                    .unwrap()
+                    .active_run_id,
+                previous_status.active_run_id,
+                "a rejected direct full payload must leave the prior timeline active"
+            );
+            assert_eq!(
+                active_moment_ordinals(&repository, &project.id),
+                before_failed_split
+            );
+            let mut malformed_anchor_moments = failed_moments.clone();
+            malformed_anchor_moments[0].anchor_asset_id = asset_ids[2].clone();
+            let malformed_anchor_error = repository
+                .replace_active_moment_analysis(
+                    &failed_timeline,
+                    &failed_run,
+                    &failed_segments,
+                    &malformed_anchor_moments,
+                    &failed_memberships,
+                    &[],
+                )
+                .unwrap_err();
+            assert!(malformed_anchor_error
+                .to_string()
+                .contains("Moment anchor asset must be a member"));
+            let mut duplicate_segment_ordinals = failed_segments.clone();
+            duplicate_segment_ordinals[1].ordinal = 0;
+            let duplicate_segment_error = repository
+                .replace_active_moment_analysis(
+                    &failed_timeline,
+                    &failed_run,
+                    &duplicate_segment_ordinals,
+                    &failed_moments,
+                    &failed_memberships,
+                    &[],
+                )
+                .unwrap_err();
+            assert!(duplicate_segment_error
+                .to_string()
+                .contains("duplicate timeline segment IDs or ordinals"));
+            let before_failed_replacement_events: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1",
+                    params![project.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            repository
+                .connection
+                .execute_batch(
+                    "CREATE TRIGGER m7_force_rebuild_failure
+                     BEFORE INSERT ON moment_records
+                     WHEN NEW.id = 'm7-rollback-moment-1'
+                     BEGIN
+                       SELECT RAISE(ABORT, 'forced Moment rebuild transaction failure');
+                     END;",
+                )
+                .unwrap();
+            assert!(repository
+                .replace_active_moment_analysis(
+                    &failed_timeline,
+                    &failed_run,
+                    &failed_segments,
+                    &failed_moments,
+                    &failed_memberships,
+                    &[],
+                )
+                .is_err());
+            repository
+                .connection
+                .execute_batch("DROP TRIGGER m7_force_rebuild_failure")
+                .unwrap();
+            let status_after_failed_replacement = repository
+                .moment_timeline_status(&project.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                status_after_failed_replacement.active_run_id,
+                previous_status.active_run_id
+            );
+            assert_eq!(
+                active_moment_ordinals(&repository, &project.id),
+                before_failed_split
+            );
+            let failed_run_count: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_analysis_runs WHERE id = ?1",
+                    params![failed_run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(failed_run_count, 0);
+            let after_failed_replacement_events: i64 = repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM moment_events WHERE project_id = ?1",
+                    params![project.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                after_failed_replacement_events, before_failed_replacement_events,
+                "the first staged Moment event must roll back with the failed replacement"
+            );
+            assert_m7_projection_integrity(&repository, &project.id);
+
+            (
+                project.id,
+                asset_ids,
+                timeline_id.to_owned(),
+                run_id.to_owned(),
+            )
+        };
+
+        let reopened = SqliteRepository::open(&catalog).unwrap();
+        assert_eq!(
+            active_moment_ordinals(&reopened, &project_id)
+                .into_iter()
+                .map(|(_, ordinal)| ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            reopened
+                .moment_timeline_status(&project_id)
+                .unwrap()
+                .unwrap()
+                .active_run_id
+                .as_deref(),
+            Some(run_id.as_str())
+        );
+        let first = reopened
+            .moment_timeline_page(&project_id, 10, 0)
+            .unwrap()
+            .moments
+            .into_iter()
+            .find(|moment| moment.id == "m7-ordinal-moment-0")
+            .unwrap();
+        assert_eq!(first.display_label, "Photographer first");
+        assert_eq!(
+            first.human_representative_asset_id.as_deref(),
+            Some(asset_ids[0].as_str())
+        );
+        assert_eq!(timeline_id, "m7-ordinal-timeline");
+        assert_m7_projection_integrity(&reopened, &project_id);
     }
 
     #[test]
@@ -12165,5 +17619,360 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn studio_brain_materializes_only_explicit_human_signals_and_opt_out_preserves_decisions() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = repository.create_project("Studio fixture").unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let asset = culling_asset(&repository, &project.id, 910_001);
+        let initial = repository.studio_brain_project_status(&project.id).unwrap();
+        assert_eq!(initial.training_status, "not_ready");
+        assert_eq!(initial.eligible_decision_count, 0);
+        let profile_id = initial.profile_id.clone();
+        let initial_source_revision = repository
+            .studio_training_source_revision(&profile_id)
+            .unwrap();
+
+        repository
+            .update_culling_decision(
+                &project.id,
+                &asset.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: Some(5),
+                    starred: Some(true),
+                    note: Some("Client requested this one".into()),
+                    flags: Some(vec!["client".into()]),
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            repository.ensure_default_studio_profile().unwrap(),
+            profile_id
+        );
+        let examples = repository.studio_training_examples(&profile_id).unwrap();
+        assert_eq!(
+            examples.len(),
+            3,
+            "decision, rating, and star are explicit signals"
+        );
+        assert!(examples
+            .iter()
+            .all(|example| example.feature_snapshot_json.get("note").is_none()));
+        assert!(examples
+            .iter()
+            .all(|example| example.decision_type != "note"));
+        assert!(examples
+            .iter()
+            .all(|example| example.decision_type != "flags"));
+        assert!(examples
+            .iter()
+            .all(|example| example.recommendation_shown == "unknown"));
+        assert!(examples.iter().all(|example| {
+            example.feature_snapshot_json.get("anonymousFaceCount")
+                == Some(&serde_json::Value::Null)
+                && example.feature_snapshot_json.get("similarityGroupSize")
+                    == Some(&serde_json::Value::Null)
+                && example.feature_snapshot_json.get("momentSize") == Some(&serde_json::Value::Null)
+        }));
+        assert_eq!(
+            repository
+                .studio_training_source_revision(&profile_id)
+                .unwrap(),
+            initial_source_revision + 4,
+            "the authoritative human action and each newly materialized explicit source advance the activation guard"
+        );
+        assert!(
+            !repository
+                .studio_training_source_state(&profile_id)
+                .unwrap()
+                .materialization_pending,
+            "a successful M5 decision/rating/star capture clears its single atomic source guard"
+        );
+
+        let individually_excluded = examples[0].id.clone();
+        let before_decision_exclusion = repository
+            .studio_training_source_revision(&profile_id)
+            .unwrap();
+        repository
+            .set_studio_training_example_excluded(&profile_id, &individually_excluded, true)
+            .unwrap();
+        assert!(repository
+            .studio_training_examples(&profile_id)
+            .unwrap()
+            .iter()
+            .any(|example| example.id == individually_excluded && !example.training_eligible));
+        assert_eq!(
+            repository
+                .studio_training_source_revision(&profile_id)
+                .unwrap(),
+            before_decision_exclusion + 1
+        );
+        repository
+            .set_studio_training_example_excluded(&profile_id, &individually_excluded, false)
+            .unwrap();
+
+        let before_project_opt_out = repository
+            .studio_training_source_revision(&profile_id)
+            .unwrap();
+        repository
+            .set_project_training_included(&profile_id, &project.id, false)
+            .unwrap();
+        assert_eq!(
+            repository
+                .studio_training_source_revision(&profile_id)
+                .unwrap(),
+            before_project_opt_out + 1
+        );
+        assert!(repository
+            .studio_training_examples(&profile_id)
+            .unwrap()
+            .iter()
+            .all(|example| !example.training_eligible));
+        let opted_out_asset = culling_asset(&repository, &project.id, 910_002);
+        repository
+            .update_culling_decision(
+                &project.id,
+                &opted_out_asset.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Reject),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .studio_training_examples(&profile_id)
+                .unwrap()
+                .len(),
+            3,
+            "an excluded project cannot materialize a new live Studio source"
+        );
+        // Existing legacy history is retained as a normal human decision, but explicit
+        // backfill must also honor the current opt-out rather than materializing it later.
+        repository
+            .connection
+            .execute(
+                "DELETE FROM studio_training_examples WHERE studio_profile_id = ?1",
+                params![profile_id],
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .materialize_historical_studio_training_examples(&profile_id)
+                .unwrap(),
+            0,
+            "historical opt-out prevents source-row creation as well as fitting"
+        );
+        assert!(repository
+            .studio_training_examples(&profile_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repository
+                .culling_workspace(&project.id, &CullingQuery::default())
+                .unwrap()
+                .items
+                .first()
+                .and_then(|row| row.decision.decision.as_deref()),
+            Some("keep"),
+            "training opt-out must not alter a human culling decision"
+        );
+
+        repository
+            .reset_studio_personalization(&profile_id)
+            .unwrap();
+        assert_eq!(
+            culling_decision_for_asset(&repository.connection, &project.id, &asset.id.to_string())
+                .unwrap()
+                .decision
+                .as_deref(),
+            Some("keep"),
+            "reset removes only derived Studio Brain artifacts"
+        );
+        let foreign_key_issues: i64 = repository
+            .connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_issues, 0);
+    }
+
+    #[test]
+    fn studio_activation_refuses_a_candidate_when_explicit_sources_changed() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = repository
+            .create_project("Studio activation race fixture")
+            .unwrap();
+        let profile_id = repository.ensure_default_studio_profile().unwrap();
+        let source_revision = repository
+            .studio_training_source_revision(&profile_id)
+            .unwrap();
+        let created_at = now();
+        let mut job = BackgroundJob {
+            id: JobId::new(),
+            state: WorkflowRunState::Running,
+            stage: JobStage::StudioTraining,
+            items_completed: 0,
+            items_total: Some(0),
+            files_discovered: 0,
+            files_processed: 0,
+            error_count: 0,
+            project_id: Some(project.id.clone()),
+            index_root_id: None,
+            error_message: None,
+            resume_metadata: Some(serde_json::json!({"pipeline":"studio-training"})),
+            created_at,
+            updated_at: created_at,
+            finished_at: None,
+        };
+        repository.insert_background_job(&job).unwrap();
+        let run_id = "m8-stale-source-run";
+        let model_id = "m8-stale-source-candidate";
+        let now_text = timestamp(&created_at);
+        repository.connection.execute(
+            "INSERT INTO studio_training_runs (id, studio_profile_id, background_job_id, algorithm, algorithm_version, feature_schema_version, parameters_json, snapshot_hash, snapshot_count, previous_active_model_id, state, error_message, created_at, updated_at, finished_at) VALUES (?1, ?2, ?3, 'test', 'test', 'studio-feature-v1', '{}', 'snapshot', 0, NULL, 'training', NULL, ?4, ?4, NULL)",
+            params![run_id, profile_id, job.id.to_string(), now_text],
+        ).unwrap();
+        repository.connection.execute(
+            "INSERT INTO studio_models (id, studio_profile_id, studio_training_run_id, algorithm, model_version, feature_schema_version, artifact_json, checksum, artifact_size_bytes, state, metrics_json, created_at, activated_at) VALUES (?1, ?2, ?3, 'test', 'test', 'studio-feature-v1', '{}', 'not-read-because-source-is-stale', 0, 'candidate', '{}', ?4, NULL)",
+            params![model_id, profile_id, run_id, timestamp(&created_at)],
+        ).unwrap();
+
+        // This preference update stands in for a human source arriving after the candidate's
+        // snapshot. Its trigger advances the profile generation before activation can swap
+        // visibility.
+        repository
+            .set_project_training_included(&profile_id, &project.id, false)
+            .unwrap();
+        job.state = WorkflowRunState::Completed;
+        job.stage = JobStage::Finalize;
+        job.finished_at = Some(created_at);
+        assert_eq!(
+            repository
+                .activate_studio_model(&profile_id, model_id, source_revision, &job)
+                .unwrap(),
+            StudioModelActivationOutcome::SourceSnapshotStale
+        );
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT state FROM studio_models WHERE id = ?1",
+                    params![model_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "candidate"
+        );
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT state FROM studio_training_runs WHERE id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "training"
+        );
+        assert_eq!(
+            repository
+                .get_background_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            WorkflowRunState::Running
+        );
+    }
+
+    #[test]
+    fn studio_action_scoped_guards_survive_an_unrelated_opted_out_review() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let included_project = repository
+            .create_project("Included Studio project")
+            .unwrap();
+        let opted_out_project = repository
+            .create_project("Opted-out Studio project")
+            .unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let opted_out_asset = culling_asset(&repository, &opted_out_project.id, 920_001);
+        let profile_id = repository.ensure_default_studio_profile().unwrap();
+        repository
+            .set_project_training_included(&profile_id, &opted_out_project.id, false)
+            .unwrap();
+
+        // This models an included action whose live compact capture failed after its authority
+        // row committed. The guard belongs to that action alone until explicit reconciliation.
+        repository
+            .connection
+            .execute(
+                "INSERT INTO studio_source_materialization_guards (studio_profile_id, source_kind, source_record_id, created_at) VALUES (?1, 'm5_culling', 'deferred-included-action', ?2)",
+                params![profile_id, timestamp(&now())],
+            )
+            .unwrap();
+        assert!(
+            repository
+                .studio_training_source_state(&profile_id)
+                .unwrap()
+                .materialization_pending
+        );
+
+        repository
+            .update_culling_decision(
+                &opted_out_project.id,
+                &opted_out_asset.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        assert!(repository
+            .studio_training_source_state(&profile_id)
+            .unwrap()
+            .materialization_pending,
+            "an opted-out action has no matching guard and cannot clear another action's deferred source"
+        );
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM studio_source_materialization_guards WHERE studio_profile_id = ?1 AND source_record_id = 'deferred-included-action'",
+                    params![profile_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            repository
+                .culling_workspace(&opted_out_project.id, &CullingQuery::default())
+                .unwrap()
+                .items
+                .first()
+                .and_then(|item| item.decision.decision.as_deref()),
+            Some("keep"),
+            "Studio guard state never prevents the photographer's authoritative M5 decision"
+        );
+        assert!(repository
+            .get_project(&included_project.id)
+            .unwrap()
+            .is_some());
     }
 }

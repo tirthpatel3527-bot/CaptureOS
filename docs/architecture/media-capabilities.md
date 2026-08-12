@@ -69,3 +69,16 @@ Moment Brain uses existing local still-photo catalog evidence. It does not intro
 | MOV / MP4 / WAV / MP3 / sidecars | Not eligible for M7 timeline/semantic analysis | Not applicable | Existing Milestone 3 behavior remains unchanged |
 
 Moment Brain uses capture cadence, compatible visual continuity, and weak local metadata transitions to propose structural review units. It is not an event detector, person/relationship recognizer, emotion/creative model, or missing-shot checker. It never rewrites EXIF/source timestamps; a possible camera time offset is advisory local evidence only. See [Moment Brain architecture](moment-brain.md).
+
+## Studio Brain eligibility (Milestone 8)
+
+Studio Brain does not decode media or require an original. It consumes only compact durable evidence already allowed by M4–M7 and can make recommendations while external originals are offline when that evidence remains current. It is still-photo culling advice only; it does not extend any visual decoder or semantic capability.
+
+| Family | Studio advisory feature use | Honest fallback |
+| --- | --- | --- |
+| JPEG / PNG / TIFF | Existing technical, anonymous face/eye, Similar Set, Moment, generic-recommendation, and semantic-availability summaries where available | Missing evidence is explicitly unavailable; model may abstain |
+| HEIC / HEIF | Same only where existing local providers produced durable evidence | No fabricated score or preference if a platform provider is unavailable |
+| RAW families | Existing durable catalog/technical context only; no new RAW decode | Missing/unsupported evidence remains unavailable; no full RAW claim |
+| MOV / MP4 / WAV / MP3 / sidecars | Not eligible for Studio Brain I | Existing Milestone 3 behavior remains unchanged |
+
+The model receives no original bytes, filenames, paths, notes, raw embeddings, identity data, or semantic object claims. See [Studio Brain architecture](studio-brain.md).

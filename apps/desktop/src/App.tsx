@@ -42,6 +42,8 @@ import type {
   SemanticIndexProgress,
   SemanticResourceMode,
   SimilarityGroupView,
+  StudioBrainProgress,
+  StudioBrainProjectStatus,
   VisualMediaFilter,
   VisualMediaPage,
   VisualMediaQuery,
@@ -63,9 +65,10 @@ const filters: { id: MediaFilter; label: string }[] = [
   { id: "unknown", label: "Unknown" },
 ];
 
-type ProjectSurface = "media" | "ingest" | "cull" | "timeline";
+type ProjectSurface = "media" | "ingest" | "cull" | "timeline" | "studio";
 type AppRoute = { kind: "home" } | { kind: "project"; projectId: string; surface: ProjectSurface; momentId?: string };
 type ProjectScopedEvent<T> = { projectId: string; progress: T };
+type StudioProfileScopedEvent<T> = { projectId: string; profileId: string; progress: T };
 
 function routeHash(route: AppRoute) {
   if (route.kind === "home") return "#/";
@@ -76,6 +79,8 @@ function routeHash(route: AppRoute) {
       ? `/cull${momentSuffix}`
       : route.surface === "timeline"
         ? `/timeline${momentSuffix}`
+        : route.surface === "studio"
+          ? "/studio"
         : "";
   return `#/project/${encodeURIComponent(route.projectId)}${suffix}`;
 }
@@ -89,6 +94,8 @@ function readRoute(): AppRoute {
       ? "cull"
       : segments[2] === "timeline"
         ? "timeline"
+        : segments[2] === "studio"
+          ? "studio"
         : "media";
   return {
     kind: "project",
@@ -320,11 +327,12 @@ export function App() {
       {error ? <p className="error" role="alert">{error}</p> : null}
       {showCreateProject ? <ProjectCreation onCancel={() => setShowCreateProject(false)} name={newProjectName} onName={setNewProjectName} onSubmit={createProject} /> : null}
       {route.kind === "home" ? <ProjectLibrary projects={projects} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onCreate={() => setShowCreateProject(true)} /> : null}
-      {project && route.kind === "project" ? <ProjectHeader project={project} projects={projects} surface={route.surface} isIndexing={isIndexing} isIngesting={isIngesting} onHome={() => navigate({ kind: "home" })} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} /> : null}
-      {project && route.kind === "project" && route.surface === "media" && activeHome ? <ProjectWorkspace key={project.id} home={activeHome} cullingProgress={cullingProgress} job={liveJob} filter={filter} onFilter={changeFilter} hasMoreMedia={hasMoreMedia} isLoadingMore={isLoadingMore} onLoadMore={loadMoreMedia} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onMoments={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} /> : null}
+      {project && route.kind === "project" ? <ProjectHeader project={project} projects={projects} surface={route.surface} isIndexing={isIndexing} isIngesting={isIngesting} onHome={() => navigate({ kind: "home" })} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} /> : null}
+      {project && route.kind === "project" && route.surface === "media" && activeHome ? <ProjectWorkspace key={project.id} home={activeHome} cullingProgress={cullingProgress} job={liveJob} filter={filter} onFilter={changeFilter} hasMoreMedia={hasMoreMedia} isLoadingMore={isLoadingMore} onLoadMore={loadMoreMedia} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onMoments={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} /> : null}
       {project && route.kind === "project" && route.surface === "ingest" ? <IngestWorkspace key={project.id} project={project} history={ingestHistory} report={ingestReport} isIngesting={isIngesting} onReport={setIngestReport} onHistory={setIngestHistory} onIngesting={setIsIngesting} onError={setError} /> : null}
       {project && route.kind === "project" && route.surface === "cull" ? <CullingWorkspace key={`${project.id}:${route.momentId ?? "all"}`} project={project} momentId={route.momentId} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: route.momentId ? "timeline" : "media", ...(route.momentId ? { momentId: route.momentId } : {}) })} onError={setError} /> : null}
       {project && route.kind === "project" && route.surface === "timeline" ? <MomentTimelineWorkspace key={`${project.id}:${route.momentId ?? "timeline"}`} project={project} initialMomentId={route.momentId} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} onShowTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onOpenMoment={(momentId) => navigate({ kind: "project", projectId: project.id, surface: "timeline", momentId })} onCullMoment={(momentId) => navigate({ kind: "project", projectId: project.id, surface: "cull", momentId })} onError={setError} /> : null}
+      {project && route.kind === "project" && route.surface === "studio" ? <StudioBrainWorkspace key={project.id} project={project} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} /> : null}
     </main>
   );
 }
@@ -337,15 +345,17 @@ function ProjectLibrary({ projects, onOpen, onCreate }: { projects: ProjectLibra
   return <section className="project-library"><div className="library-hero"><div><p className="eyebrow">CAPTUREOS</p><h1>Your shoots</h1><p className="lede">A local library for every production. Choose a project, or start a clean one.</p></div><button className="primary library-create" onClick={onCreate}>New Project</button></div><div className="library-heading"><h2>Recent projects</h2><small>{projects.length === 1 ? "1 project" : `${projects.length} projects`}</small></div>{projects.length ? <div className="project-cards">{projects.map((item) => <button className="project-card" key={item.id} onClick={() => onOpen(item.id)} aria-label={`Open ${item.name}`}><span className="project-cover" aria-hidden="true">COS</span><strong>{item.name}</strong><span className="project-card-meta"><span>Media <b>{item.mediaAssetCount}</b></span><span>{item.storageVolumeCount ? `${item.storageVolumeCount} storage volume${item.storageVolumeCount === 1 ? "" : "s"}` : "No storage indexed"}</span><span>Protection {protectionLabel(item.protectionState)}</span></span><small>Last activity {formatProjectDate(item.lastActivityAt)}</small></button>)}</div> : <StatusCard><div className="project-empty"><p className="eyebrow">YOUR SHOOT STARTS HERE</p><h2>There are no projects yet.</h2><p className="muted">Index existing media or ingest camera cards after you create your first project.</p><button className="primary" onClick={onCreate}>New Project</button></div></StatusCard>}</section>;
 }
 
-function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, onHome, onOpen, onIndex, onIngest, onCull, onTimeline }: { project: ProjectView; projects: ProjectLibraryItem[]; surface: ProjectSurface; isIndexing: boolean; isIngesting: boolean; onHome: () => void; onOpen: (projectId: string) => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onTimeline: () => void }) {
+function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, onHome, onOpen, onIndex, onIngest, onCull, onTimeline, onStudio }: { project: ProjectView; projects: ProjectLibraryItem[]; surface: ProjectSurface; isIndexing: boolean; isIngesting: boolean; onHome: () => void; onOpen: (projectId: string) => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onTimeline: () => void; onStudio: () => void }) {
   const lede = surface === "ingest"
     ? "Safe ingest remains attached to this project."
     : surface === "cull"
       ? "A local, non-destructive workspace for your human review decisions."
-      : surface === "timeline"
-        ? "A local structural timeline. Suggested labels are evidence-grounded; your edits remain authoritative."
+    : surface === "timeline"
+      ? "A local structural timeline. Suggested labels are evidence-grounded; your edits remain authoritative."
+      : surface === "studio"
+        ? "Local, explainable preference modeling from your explicit human decisions."
         : "Index and analyze local media in this selected project.";
-  return <section className="project-header"><div><button className="back-link" onClick={onHome}>← All Projects</button><p className="eyebrow">PROJECT WORKSPACE</p><h1>{project.name}</h1><p className="lede">{lede}</p></div><div className="project-actions"><select aria-label="Switch project" value={project.id} onChange={(event) => onOpen(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className={surface === "timeline" ? "primary" : "secondary"} onClick={onTimeline}>Moments</button><button className={surface === "cull" ? "primary" : "secondary"} onClick={onCull}>Smart Cull</button><button className={surface === "ingest" ? "primary" : "secondary"} disabled={isIngesting} onClick={onIngest}>Ingest Shoot</button><button className={surface === "media" ? "primary" : "secondary"} disabled={isIndexing} onClick={onIndex}>{isIndexing ? "Indexing…" : "Index Folder"}</button></div></section>;
+  return <section className="project-header"><div><button className="back-link" onClick={onHome}>← All Projects</button><p className="eyebrow">PROJECT WORKSPACE</p><h1>{project.name}</h1><p className="lede">{lede}</p></div><div className="project-actions"><select aria-label="Switch project" value={project.id} onChange={(event) => onOpen(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className={surface === "timeline" ? "primary" : "secondary"} onClick={onTimeline}>Moments</button><button className={surface === "cull" ? "primary" : "secondary"} onClick={onCull}>Smart Cull</button><button className={surface === "studio" ? "primary" : "secondary"} onClick={onStudio}>Studio Brain</button><button className={surface === "ingest" ? "primary" : "secondary"} disabled={isIngesting} onClick={onIngest}>Ingest Shoot</button><button className={surface === "media" ? "primary" : "secondary"} disabled={isIndexing} onClick={onIndex}>{isIndexing ? "Indexing…" : "Index Folder"}</button></div></section>;
 }
 
 function formatProjectDate(value: string) {
@@ -359,7 +369,7 @@ function protectionLabel(value: string) {
   return "not recorded";
 }
 
-function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMoreMedia, isLoadingMore, onLoadMore, onIndex, onIngest, onCull, onMoments }: { home: ProjectHome; cullingProgress: CullingProgress | null; job: JobView | null; filter: MediaFilter; onFilter: (filter: MediaFilter) => void; hasMoreMedia: boolean; isLoadingMore: boolean; onLoadMore: () => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onMoments: () => void }) {
+function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMoreMedia, isLoadingMore, onLoadMore, onIndex, onIngest, onCull, onMoments, onStudio }: { home: ProjectHome; cullingProgress: CullingProgress | null; job: JobView | null; filter: MediaFilter; onFilter: (filter: MediaFilter) => void; hasMoreMedia: boolean; isLoadingMore: boolean; onLoadMore: () => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onMoments: () => void; onStudio: () => void }) {
   const [visual, setVisual] = useState<VisualMediaPage | null>(null);
   const [visualFilter, setVisualFilter] = useState<VisualMediaFilter>("all");
   const [visualSort, setVisualSort] = useState<VisualMediaSort>("captureTime");
@@ -784,6 +794,7 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
       />
       <section className="culling-entry" aria-label="Moments timeline entry"><div><p className="section-label">Moment Brain</p><h2>Moments timeline</h2><p className="muted">{home.summary.momentCount ? `${home.summary.momentCount.toLocaleString()} local Moment${home.summary.momentCount === 1 ? "" : "s"} detected. ` : "No Moment analysis yet. "}Review a local structural timeline built from capture evidence. It never starts analysis while this project opens, never changes Similar Sets, and keeps your labels and split/merge choices authoritative.</p></div><button className="secondary" onClick={onMoments}>Open Moments</button></section>
       <section className="culling-entry" aria-label="Culling workspace entry"><div><p className="section-label">Human review</p><h2>Smart Culling Workspace</h2><p className="muted">{cullingProgress ? `${cullingProgress.reviewed.toLocaleString()} / ${cullingProgress.total.toLocaleString()} reviewed · Keep ${cullingProgress.keep.toLocaleString()} · Review ${cullingProgress.review.toLocaleString()} · Reject ${cullingProgress.reject.toLocaleString()}. ` : ""}AI technical evidence can help you begin, but Keep, Reject, Review, stars, ratings, notes, and representatives remain your local decisions.</p></div><button className="primary" onClick={onCull}>{cullingProgress?.reviewed ? "Resume Culling" : "Cull Photos"}</button></section>
+      <StudioBrainEntry projectId={home.project.id} onOpen={onStudio} />
       {intelligenceError ? <p className="error intelligence-error" role="alert">{intelligenceError}</p> : null}
 
       <section className="visual-toolbar" aria-label="Visual media controls">
@@ -854,6 +865,127 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
 const momentTimelinePageSize = 60;
 const momentDetailPageSize = 120;
 
+function StudioBrainEntry({ projectId, onOpen }: { projectId: string; onOpen: () => void }) {
+  const [status, setStatus] = useState<StudioBrainProjectStatus | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<StudioBrainProjectStatus>("studio_brain_status_command", { projectId })
+      .then((next) => { if (!cancelled) setStatus(next); })
+      // A Studio status is additive. Project Home remains usable even if a future catalog needs
+      // recovery, so this card shows an honest unavailable state rather than a raw DB string.
+      .catch(() => { if (!cancelled) setStatus(null); });
+    return () => { cancelled = true; };
+  }, [projectId]);
+  const state = status?.trainingStatus ?? "not_ready";
+  const message = state === "ready"
+    ? `Ready locally${status?.activeModelVersion ? ` · ${status.activeModelVersion}` : ""}`
+    : state === "stale"
+      ? "Update recommended"
+      : state === "learning"
+        ? "Learning from explicit decisions"
+        : "Not enough evidence yet";
+  return <section className="culling-entry" aria-label="Studio Brain entry"><div><p className="section-label">Studio Brain</p><h2>Local preference learning</h2><p className="muted">{status ? `${status.eligibleDecisionCount.toLocaleString()} explicit culling decision${status.eligibleDecisionCount === 1 ? "" : "s"} · ${message}. ` : "Status is loading locally. "}Studio Brain is advisory, runs offline, and never changes Keep, Reject, Review, ratings, representatives, Moments, or media.</p></div><button className="secondary" onClick={onOpen}>View Studio Brain</button></section>;
+}
+
+function StudioBrainWorkspace({ project, onReturn }: { project: ProjectView; onReturn: () => void }) {
+  const [status, setStatus] = useState<StudioBrainProjectStatus | null>(null);
+  const [progress, setProgress] = useState<StudioBrainProgress | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isMutating, setIsMutating] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [developerError, setDeveloperError] = useState<string | null>(null);
+  const actionRef = useRef(false);
+
+  const load = useCallback(async () => {
+    const next = await invoke<StudioBrainProjectStatus>("studio_brain_status_command", { projectId: project.id });
+    setStatus(next);
+    return next;
+  }, [project.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void load().catch((reason) => {
+      if (!cancelled) {
+        setNotice("Studio Brain status could not be loaded. Project media and human decisions remain available.");
+        setDeveloperError(toMessage(reason));
+      }
+    }).finally(() => { if (!cancelled) setIsLoading(false); });
+    let unlisten: (() => void) | undefined;
+    void listen<StudioProfileScopedEvent<StudioBrainProgress>>("studio-brain-progress", ({ payload }) => {
+      if (payload.projectId !== project.id) return;
+      setStatus((current) => {
+        if (current && current.profileId !== payload.profileId) return current;
+        return current;
+      });
+      setProgress(payload.progress);
+      if (payload.progress.state === "error") {
+        setNotice(payload.progress.message ?? (payload.progress.activeModelVersion
+          ? "Studio Brain update could not be completed. Your previous personalized model is still active."
+          : "Studio Brain update could not be completed. No personalized model was activated; generic technical evidence remains available."));
+        setDeveloperError(payload.progress.lastError);
+      }
+      if (!payload.progress.active) void load().catch(() => undefined);
+    }).then((stop) => { unlisten = stop; });
+    return () => { cancelled = true; unlisten?.(); };
+  }, [load, project.id]);
+
+  const actionsBlocked = isLoading || isMutating || progress?.active === true;
+  const runMutation = useCallback(async (operation: () => Promise<StudioBrainProjectStatus>) => {
+    if (actionRef.current || actionsBlocked) return;
+    actionRef.current = true;
+    setIsMutating(true);
+    setNotice(null);
+    try {
+      setStatus(await operation());
+    } catch (reason) {
+      setNotice("Studio Brain settings could not be saved. Your human decisions and existing model remain unchanged.");
+      setDeveloperError(toMessage(reason));
+    } finally {
+      actionRef.current = false;
+      setIsMutating(false);
+    }
+  }, [actionsBlocked]);
+
+  async function startTraining() {
+    if (actionRef.current || actionsBlocked) return;
+    actionRef.current = true;
+    setIsMutating(true);
+    setNotice(null);
+    try {
+      const queued = await invoke<StudioBrainProgress>("start_studio_brain_training_command", { projectId: project.id });
+      setProgress(queued);
+      setNotice(queued.message);
+    } catch (reason) {
+      setNotice(status?.activeModelVersion
+        ? "Studio Brain update could not be started. Your previous personalized model is still active."
+        : "Studio Brain update could not be started. No personalized model was activated; generic technical evidence remains available.");
+      setDeveloperError(toMessage(reason));
+    } finally {
+      actionRef.current = false;
+      setIsMutating(false);
+    }
+  }
+
+  const readinessMessage = status?.readiness.message
+    ?? (status?.trainingStatus === "ready" ? "A local personalized model is active." : "Not enough explicit human evidence is available for personalization yet.");
+  const trainLabel = status?.activeModelVersion ? "Update Studio Brain" : "Train Studio Brain";
+  const progressLabel = progress?.active ? `${displayLabel(progress.stage)} · ${progress.completed.toLocaleString()} / ${progress.total.toLocaleString()}` : null;
+  return <section className="project-workspace studio-brain-workspace" aria-label="Studio Brain workspace">
+    <header className="workspace-heading"><div><p className="eyebrow">STUDIO BRAIN</p><h2>Local preference learning</h2><p className="muted">Uses only explicit local human decisions and representative choices. It is offline, explainable, reversible, and advisory; it never automatically culls or changes your media.</p></div><button className="secondary" onClick={onReturn}>Return to Project</button></header>
+    {notice ? <p className="preparation" role="status">{notice}</p> : null}
+    <section className="intelligence-controls" aria-label="Studio Brain status and controls">
+      <div className="intelligence-controls-copy"><p className="section-label">Local Studio Profile</p><h2>{status ? studioStatusLabel(status.trainingStatus) : "Loading"}</h2><p className="muted">{readinessMessage}</p></div>
+      <div className="intelligence-controls-actions"><button className="primary" disabled={actionsBlocked} onClick={() => void startTraining()}>{actionsBlocked && progress?.active ? "Training locally…" : trainLabel}</button></div>
+      <div className="intelligence-progress" role="status" aria-live="polite"><strong>{progress?.active ? "Training locally" : status ? studioStatusLabel(status.trainingStatus) : "Loading"}</strong><span>{progressLabel ?? `${(status?.eligibleDecisionCount ?? 0).toLocaleString()} eligible explicit decisions`}</span>{progress?.message ? <small>{progress.message}</small> : null}</div>
+    </section>
+    <section className="culling-entry"><div><p className="section-label">Training contribution</p><h2>Current project</h2><p className="muted">{status?.projectIncluded === false ? "This project's decisions are excluded from future Studio Brain training. They remain in Smart Cull unchanged." : "This project's explicit decisions may contribute to a future local training run. You can opt out without deleting any decisions."}</p></div><button className="secondary" disabled={actionsBlocked || !status} onClick={() => void runMutation(() => invoke<StudioBrainProjectStatus>("set_studio_brain_project_included_command", { projectId: project.id, included: !status?.projectIncluded }))}>{status?.projectIncluded === false ? "Include in learning" : "Exclude from learning"}</button></section>
+    <section className="culling-entry"><div><p className="section-label">Recommendation use</p><h2>Personalized advice</h2><p className="muted">{status?.personalizationEnabled === false ? "Personalized advice is disabled. Smart Cull shows only existing generic technical evidence." : "Personalized advice is enabled when a valid local model is ready. Human choices always remain separate."}</p></div><button className="secondary" disabled={actionsBlocked || !status} onClick={() => void runMutation(() => invoke<StudioBrainProjectStatus>("set_studio_brain_enabled_command", { projectId: project.id, enabled: !status?.personalizationEnabled }))}>{status?.personalizationEnabled === false ? "Enable advice" : "Disable advice"}</button></section>
+    <section className="culling-entry"><div><p className="section-label">Reset</p><h2>Reset personalization</h2><p className="muted">Removes only local Studio Brain models and advisory recommendations. It preserves all human decisions, ratings, stars, Similar Set representatives, Moments, technical evidence, previews, and original media.</p></div><button className="secondary" disabled={actionsBlocked || !status} onClick={() => { if (window.confirm("Reset local Studio Brain personalization? Human decisions will be preserved.")) void runMutation(() => invoke<StudioBrainProjectStatus>("reset_studio_brain_personalization_command", { projectId: project.id, confirmed: true })); }}>Reset personalization</button></section>
+    <section className="metrics-strip" aria-label="Studio Brain training data"><Metric label="Keep" value={status?.keepCount ?? 0} /><Metric label="Review" value={status?.reviewCount ?? 0} /><Metric label="Reject" value={status?.rejectCount ?? 0} /><Metric label="Ratings" value={status?.ratingCount ?? 0} /><Metric label="Stars" value={status?.starredCount ?? 0} /><Metric label="Representatives" value={status?.representativeCount ?? 0} /></section>
+    <details><summary>Developer Details</summary><p>Profile {status?.profileName ?? "unavailable"} · active model {status?.activeModelVersion ?? "none"} · contributing projects {status?.contributingProjectCount ?? 0}.</p>{status?.readiness.conditions?.length ? <ul>{status.readiness.conditions.map((condition) => <li key={condition.key}>{condition.met ? "Met" : "Not met"}: {condition.message}</li>)}</ul> : null}{developerError ? <pre>{developerError}</pre> : null}</details>
+  </section>;
+}
+
 function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTimeline, onOpenMoment, onCullMoment, onError }: {
   project: ProjectView;
   initialMomentId?: string;
@@ -870,6 +1002,8 @@ function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTim
   const [checklists, setChecklists] = useState<MomentChecklistView[]>([]);
   const [isStarting, setIsStarting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [momentStatusLoaded, setMomentStatusLoaded] = useState(false);
+  const [momentRecoveryMessage, setMomentRecoveryMessage] = useState<string | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResponse, setSearchResponse] = useState<MagicSearchResponse | null>(null);
@@ -881,10 +1015,13 @@ function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTim
   const [momentResourceMode, setMomentResourceMode] = useState<SemanticResourceMode>("balanced");
   const [humanLabel, setHumanLabel] = useState("");
   const [newChecklistPhrase, setNewChecklistPhrase] = useState("");
+  const analysisStartInFlight = useRef(false);
+  const momentMutationInFlight = useRef(false);
 
   const loadStatus = useCallback(async () => {
     const next = await invoke<MomentAnalysisProgress | null>("moment_timeline_status", { projectId: project.id });
     setProgress((current) => current?.active ? current : next);
+    setMomentStatusLoaded(true);
   }, [project.id]);
 
   const loadTimeline = useCallback(async () => {
@@ -954,97 +1091,129 @@ function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTim
     if (isSemanticResourceMode(progress?.resourceMode)) setMomentResourceMode(progress.resourceMode);
   }, [progress?.resourceMode]);
 
-  async function startAnalysis(rebuild: boolean) {
-    if (isStarting || progress?.active) return;
-    try {
+  const momentActionsBlocked = !momentStatusLoaded || isStarting || isSaving || Boolean(progress?.active);
+
+  function handleMomentActionError(reason: unknown) {
+    const message = toMessage(reason);
+    if (message.startsWith("Timeline update could not be saved.")) {
+      setMomentRecoveryMessage(message);
       onError(null);
+      return;
+    }
+    toError(onError)(reason);
+  }
+
+  async function startAnalysis(rebuild: boolean) {
+    if (momentActionsBlocked || analysisStartInFlight.current || momentMutationInFlight.current) return;
+    try {
+      analysisStartInFlight.current = true;
+      onError(null);
+      setMomentRecoveryMessage(null);
       setIsStarting(true);
       const next = await invoke<MomentAnalysisProgress>("start_moment_analysis", { projectId: project.id, rebuild, resourceMode: momentResourceMode });
       if (isSemanticResourceMode(next.resourceMode)) setMomentResourceMode(next.resourceMode);
       setProgress(next);
     } catch (reason) {
-      toError(onError)(reason);
+      handleMomentActionError(reason);
     } finally {
       setIsStarting(false);
+      analysisStartInFlight.current = false;
     }
   }
 
   async function renameMoment() {
-    if (!detail || !humanLabel.trim() || isSaving) return;
+    if (!detail || !humanLabel.trim() || momentActionsBlocked || momentMutationInFlight.current || analysisStartInFlight.current) return;
     try {
+      momentMutationInFlight.current = true;
       onError(null);
+      setMomentRecoveryMessage(null);
       setIsSaving(true);
       await invoke("rename_moment", { projectId: project.id, momentId: detail.moment.id, label: humanLabel.trim() });
       await refresh();
     } catch (reason) {
-      toError(onError)(reason);
+      handleMomentActionError(reason);
     } finally {
       setIsSaving(false);
+      momentMutationInFlight.current = false;
     }
   }
 
   async function chooseRepresentative(assetId: string) {
-    if (!detail || isSaving) return;
+    if (!detail || momentActionsBlocked || momentMutationInFlight.current || analysisStartInFlight.current) return;
     try {
+      momentMutationInFlight.current = true;
       onError(null);
+      setMomentRecoveryMessage(null);
       setIsSaving(true);
       await invoke("set_moment_human_representative", { projectId: project.id, momentId: detail.moment.id, assetId });
       await refresh();
     } catch (reason) {
-      toError(onError)(reason);
+      handleMomentActionError(reason);
     } finally {
       setIsSaving(false);
+      momentMutationInFlight.current = false;
     }
   }
 
   async function mergeMoments(leftMomentId: string, rightMomentId: string) {
-    if (isSaving || !window.confirm("Merge these adjacent Moments? Your structural override will be retained when local analysis is rebuilt.")) return;
+    if (momentActionsBlocked || momentMutationInFlight.current || analysisStartInFlight.current || !window.confirm("Merge these adjacent Moments? Your structural override will be retained when local analysis is rebuilt.")) return;
     try {
+      momentMutationInFlight.current = true;
       onError(null);
+      setMomentRecoveryMessage(null);
       setIsSaving(true);
       await invoke("merge_adjacent_moments", { projectId: project.id, leftMomentId, rightMomentId });
       onShowTimeline();
     } catch (reason) {
-      toError(onError)(reason);
+      handleMomentActionError(reason);
     } finally {
       setIsSaving(false);
+      momentMutationInFlight.current = false;
     }
   }
 
   async function splitMoment(afterAssetId: string) {
-    if (!detail || isSaving || !window.confirm("Split this Moment after the selected photo? Your structural override will remain protected on future analysis.")) return;
+    if (!detail || momentActionsBlocked || momentMutationInFlight.current || analysisStartInFlight.current || !window.confirm("Split this Moment after the selected photo? Your structural override will remain protected on future analysis.")) return;
     try {
+      momentMutationInFlight.current = true;
       onError(null);
+      setMomentRecoveryMessage(null);
       setIsSaving(true);
       await invoke("split_moment", { projectId: project.id, momentId: detail.moment.id, afterAssetId });
       onShowTimeline();
     } catch (reason) {
-      toError(onError)(reason);
+      handleMomentActionError(reason);
     } finally {
       setIsSaving(false);
+      momentMutationInFlight.current = false;
     }
   }
 
   async function addChecklistPhrase(event: FormEvent) {
     event.preventDefault();
-    if (!newChecklistPhrase.trim() || isSaving) return;
+    if (!newChecklistPhrase.trim() || momentActionsBlocked || momentMutationInFlight.current || analysisStartInFlight.current) return;
     try {
+      momentMutationInFlight.current = true;
       onError(null);
+      setMomentRecoveryMessage(null);
       setIsSaving(true);
       await invoke("create_coverage_checklist_item", { projectId: project.id, input: { phrase: newChecklistPhrase.trim() } });
       setNewChecklistPhrase("");
       await loadChecklists();
     } catch (reason) {
-      toError(onError)(reason);
+      handleMomentActionError(reason);
     } finally {
       setIsSaving(false);
+      momentMutationInFlight.current = false;
     }
   }
 
   async function updateCoverage(checklistItemId: string, state: CoverageConfirmationState) {
-    if (!detail || isSaving) return;
+    if (!detail || momentActionsBlocked || momentMutationInFlight.current || analysisStartInFlight.current) return;
     try {
+      momentMutationInFlight.current = true;
       onError(null);
+      setMomentRecoveryMessage(null);
       setIsSaving(true);
       await invoke("update_coverage_confirmation", {
         projectId: project.id,
@@ -1052,9 +1221,10 @@ function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTim
       });
       await loadChecklists();
     } catch (reason) {
-      toError(onError)(reason);
+      handleMomentActionError(reason);
     } finally {
       setIsSaving(false);
+      momentMutationInFlight.current = false;
     }
   }
 
@@ -1130,22 +1300,23 @@ function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTim
         <button className="secondary" onClick={onReturn}>Return to Project</button>
         {selectedMoment ? <button className="secondary" onClick={onShowTimeline}>All Moments</button> : null}
         <span className="resource-mode" role="group" aria-label="Moment analysis resource mode">
-          {([ ["eco", "ECO"], ["balanced", "BALANCED"], ["fast", "FAST"] ] as [SemanticResourceMode, string][]).map(([mode, label]) => <button key={mode} type="button" className={momentResourceMode === mode ? "active" : ""} aria-pressed={momentResourceMode === mode} disabled={isStarting || progress?.active} onClick={() => setMomentResourceMode(mode)}>{label}</button>)}
+          {([ ["eco", "ECO"], ["balanced", "BALANCED"], ["fast", "FAST"] ] as [SemanticResourceMode, string][]).map(([mode, label]) => <button key={mode} type="button" className={momentResourceMode === mode ? "active" : ""} aria-pressed={momentResourceMode === mode} disabled={momentActionsBlocked} onClick={() => setMomentResourceMode(mode)}>{label}</button>)}
         </span>
-        <button className="primary" disabled={isStarting || progress?.active} onClick={() => void startAnalysis(false)}>{isStarting ? "Starting…" : progress?.active ? "Analyzing locally…" : primaryActionLabel}</button>
-        {progress?.timelineReady ? <button className="secondary" disabled={isStarting || progress?.active} onClick={() => void startAnalysis(true)}>Rebuild AI timeline</button> : null}
+        <button className="primary" disabled={momentActionsBlocked} onClick={() => void startAnalysis(false)}>{isStarting ? "Starting…" : progress?.active ? "Analyzing locally…" : primaryActionLabel}</button>
+        {progress?.timelineReady ? <button className="secondary" disabled={momentActionsBlocked} onClick={() => void startAnalysis(true)}>Rebuild AI timeline</button> : null}
       </div>
     </section>
 
     <section className="status-card" aria-label="Moment analysis status">
       <div className="panel-heading"><div><p className="section-label">Local analysis status</p><h2>{momentAnalysisStatusLabel(progress)}</h2><p className="muted">Analysis runs in the background only after you request it. Opening this project never starts or blocks it.</p></div><span className={`badge ${progress?.active ? "running" : progress?.timelineReady ? "completed" : "idle"}`}>{progress?.stage ?? "not started"}</span></div>
-      {progress ? <div className="intelligence-progress" role="status" aria-live="polite"><span>{progress.message ?? (progress.timelineReady ? `${progress.momentCount.toLocaleString()} local Moments are ready.` : "No completed local Moment timeline is stored.")}</span>{progress.active ? <small>{progress.completed.toLocaleString()} / {progress.total.toLocaleString()} processed · {progress.errorCount.toLocaleString()} issues · {displayLabel(progress.resourceMode)}</small> : <small>{progress.momentCount.toLocaleString()} Moments · {progress.ungroupedAssetCount.toLocaleString()} photos with insufficient timeline evidence · {displayLabel(progress.resourceMode)}</small>}{progress.lastError ? <small>{progress.lastError}</small> : null}</div> : <p className="muted">Checking local Moment analysis status…</p>}
+      {momentRecoveryMessage ? <p className="error" role="alert">{momentRecoveryMessage}</p> : null}
+      {progress ? <><div className="intelligence-progress" role="status" aria-live="polite"><span>{progress.message ?? (progress.timelineReady ? `${progress.momentCount.toLocaleString()} local Moments are ready.` : "No completed local Moment timeline is stored.")}</span>{progress.active ? <small>{progress.completed.toLocaleString()} / {progress.total.toLocaleString()} processed · {progress.errorCount.toLocaleString()} issues · {displayLabel(progress.resourceMode)}</small> : <small>{progress.momentCount.toLocaleString()} Moments · {progress.ungroupedAssetCount.toLocaleString()} photos with insufficient timeline evidence · {displayLabel(progress.resourceMode)}</small>}</div>{progress.lastError ? <details className="advanced"><summary>Developer Details</summary><p>Local persistence diagnostic: {progress.lastError}</p></details> : null}</> : <p className="muted">Checking local Moment analysis status…</p>}
     </section>
 
     {!selectedMoment ? <>
       <section className="status-card" aria-label="Coverage checklist">
         <div className="panel-heading"><div><p className="section-label">Coverage checklist</p><h2>Photographer-provided expectations</h2><p className="muted">Checklist phrases remain local. They can supply optional label candidates; only you confirm coverage.</p></div></div>
-        <form className="visual-toolbar" onSubmit={addChecklistPhrase}><label className="search"><span className="sr-only">Add coverage checklist phrase</span><input value={newChecklistPhrase} onChange={(event) => setNewChecklistPhrase(event.target.value)} placeholder="Add a local checklist phrase" /></label><button className="secondary" type="submit" disabled={isSaving || !newChecklistPhrase.trim()}>Add checklist item</button></form>
+        <form className="visual-toolbar" onSubmit={addChecklistPhrase}><label className="search"><span className="sr-only">Add coverage checklist phrase</span><input value={newChecklistPhrase} onChange={(event) => setNewChecklistPhrase(event.target.value)} placeholder="Add a local checklist phrase" /></label><button className="secondary" type="submit" disabled={momentActionsBlocked || !newChecklistPhrase.trim()}>Add checklist item</button></form>
         {checklistItems.length ? <ul className="culling-reasons">{checklistItems.map((item) => <li key={item.id}><strong>{item.phrase}</strong> · {coverageStateLabel(item.state)}{item.checklistName ? ` · ${item.checklistName}` : ""}<div><button className="secondary" type="button" disabled={isChecklistSearching} onClick={() => void findChecklistCandidates(item.phrase)}>{isChecklistSearching ? "Finding candidates…" : "Find candidates"}</button></div></li>)}</ul> : <p className="muted">No checklist items yet. Add only the expectations you want to review; Moment Brain never invents missing coverage.</p>}
         {checklistCandidateSearch ? <section className="magic-search-results" aria-label="Checklist candidate results"><p className="section-label">Candidate lookup</p><h3>Local candidates for “{checklistCandidateSearch.phrase}”</h3><p className="muted">This is retrieval only. It does not assert coverage or change the checklist; confirm coverage yourself from a Moment.</p><MomentSearchResults response={checklistCandidateSearch.response} emptyMessage="No local candidate photos were returned for this checklist phrase." /></section> : null}
       </section>
@@ -1154,19 +1325,19 @@ function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTim
         <form className="visual-toolbar" onSubmit={searchAcrossMoments}><label className="search"><span className="sr-only">Search local Moments</span><input value={momentSearchQuery} onChange={(event) => setMomentSearchQuery(event.target.value)} placeholder="Describe a visual Moment" /></label><button className="secondary" type="submit" disabled={isMomentSearching || !momentSearchQuery.trim()}>{isMomentSearching ? "Searching…" : "Search Moments"}</button></form>
         {momentSearchResponse ? <MomentCardSearchResults response={momentSearchResponse} onOpen={onOpenMoment} /> : null}
       </section>
-      <section aria-label="Timeline moments"><div className="panel-heading"><div><p className="section-label">Timeline</p><h2>{moments.length ? `${timeline?.totalMoments.toLocaleString()} local Moments` : "No timeline ready"}</h2><p className="muted">Each card is a structural sequence, not a claim about a person, relationship, event, or creative quality.</p></div></div>{moments.length ? <div className="media-grid medium" aria-label="Moment cards">{moments.map((moment, index) => <MomentCard key={moment.id} moment={moment} previous={index ? moments[index - 1] : null} onOpen={onOpenMoment} onMerge={(leftMomentId, rightMomentId) => void mergeMoments(leftMomentId, rightMomentId)} disabled={isSaving} />)}</div> : <div className="empty">{progress?.active ? "Building the local structural timeline in the background…" : "Choose Analyze timeline when you are ready. This does not change media, decisions, or Similar Sets."}</div>}</section>
+      <section aria-label="Timeline moments"><div className="panel-heading"><div><p className="section-label">Timeline</p><h2>{moments.length ? `${timeline?.totalMoments.toLocaleString()} local Moments` : "No timeline ready"}</h2><p className="muted">Each card is a structural sequence, not a claim about a person, relationship, event, or creative quality.</p></div></div>{moments.length ? <div className="media-grid medium" aria-label="Moment cards">{moments.map((moment, index) => <MomentCard key={moment.id} moment={moment} previous={index ? moments[index - 1] : null} onOpen={onOpenMoment} onMerge={(leftMomentId, rightMomentId) => void mergeMoments(leftMomentId, rightMomentId)} disabled={momentActionsBlocked} />)}</div> : <div className="empty">{progress?.active ? "Building the local structural timeline in the background…" : "Choose Analyze timeline when you are ready. This does not change media, decisions, or Similar Sets."}</div>}</section>
       {timeline?.ungroupedAssetCount ? <p className="preparation">{timeline.ungroupedAssetCount.toLocaleString()} photo{timeline.ungroupedAssetCount === 1 ? " has" : "s have"} insufficient capture-time or local evidence for a Moment. They remain in the project and can be reviewed normally.</p> : null}
       {timeline?.timelineGaps.length ? <section className="status-card" aria-label="Observed timeline gaps"><div className="panel-heading"><div><p className="section-label">Observed timeline gaps</p><h3>No recorded capture activity</h3><p className="muted">These are factual intervals in the local capture timeline, not coverage conclusions.</p></div></div><ul className="culling-reasons">{timeline.timelineGaps.map((gap) => <li key={`${gap.startedAt}:${gap.endedAt}`}><strong>{formatDate(gap.startedAt)} – {formatDate(gap.endedAt)}</strong><small>{formatDuration(gap.durationSeconds * 1000)} · {gap.explanation}</small></li>)}</ul></section> : null}
       {timeline?.clockDiagnostics.length ? <details className="advanced"><summary>Camera time diagnostics</summary><p className="muted">These are advisory observations only. CaptureOS does not rewrite capture timestamps.</p>{timeline.clockDiagnostics.map((diagnostic) => <p key={`${diagnostic.cameraLabel}:${diagnostic.summary}`}><strong>{diagnostic.cameraLabel}</strong> · {diagnostic.summary}</p>)}</details> : null}
     </> : <section className="status-card" aria-label="Moment detail">
       <div className="panel-heading"><div><p className="section-label">Moment detail</p><h2>{selectedMoment.label.displayLabel}</h2><p className="muted">{formatMomentTimeRange(selectedMoment.capturedFrom, selectedMoment.capturedTo, selectedMoment.captureTimeState)} · {selectedMoment.assetCount.toLocaleString()} local photos</p></div><button className="primary" onClick={() => onCullMoment(selectedMoment.id)}>Cull this Moment</button></div>
       {selectedMoment.label.humanLabel ? <p className="human-override">Human label: {selectedMoment.label.humanLabel}. The original local suggestion is preserved in Developer Details.</p> : null}
-      <form className="visual-toolbar" onSubmit={(event) => { event.preventDefault(); void renameMoment(); }}><label className="search"><span className="sr-only">Human Moment label</span><input value={humanLabel} onChange={(event) => setHumanLabel(event.target.value)} placeholder="Name this Moment" /></label><button className="secondary" type="submit" disabled={isSaving || !humanLabel.trim()}>Save human label</button></form>
+      <form className="visual-toolbar" onSubmit={(event) => { event.preventDefault(); void renameMoment(); }}><label className="search"><span className="sr-only">Human Moment label</span><input value={humanLabel} onChange={(event) => setHumanLabel(event.target.value)} placeholder="Name this Moment" /></label><button className="secondary" type="submit" disabled={momentActionsBlocked || !humanLabel.trim()}>Save human label</button></form>
       {detail ? <>
-        {momentMedia?.items.length ? <section className="media-grid medium" aria-label="Moment photos">{momentMedia.items.map((item, index) => <article key={item.assetId}><MediaCard item={item} view="grid" density="medium" onOpen={() => undefined} /><div className="card-caption"><strong>{detail.moment.representative?.assetId === item.assetId && detail.moment.representative.source === "human" ? "Human representative" : detail.moment.representative?.assetId === item.assetId ? "Suggested starting point" : item.filename}</strong><div><button className="secondary" disabled={isSaving} onClick={() => void chooseRepresentative(item.assetId)}>Choose representative</button>{index < momentMedia.items.length - 1 ? <button className="secondary" disabled={isSaving} onClick={() => void splitMoment(item.assetId)}>Split after this photo</button> : null}</div></div></article>)}</section> : <p className="muted">No bounded local photo page is available for this Moment.</p>}
+        {momentMedia?.items.length ? <section className="media-grid medium" aria-label="Moment photos">{momentMedia.items.map((item, index) => <article key={item.assetId}><MediaCard item={item} view="grid" density="medium" onOpen={() => undefined} /><div className="card-caption"><strong>{detail.moment.representative?.assetId === item.assetId && detail.moment.representative.source === "human" ? "Human representative" : detail.moment.representative?.assetId === item.assetId ? "Suggested starting point" : item.filename}</strong><div><button className="secondary" disabled={momentActionsBlocked} onClick={() => void chooseRepresentative(item.assetId)}>Choose representative</button>{index < momentMedia.items.length - 1 ? <button className="secondary" disabled={momentActionsBlocked} onClick={() => void splitMoment(item.assetId)}>Split after this photo</button> : null}</div></div></article>)}</section> : <p className="muted">No bounded local photo page is available for this Moment.</p>}
         {momentMedia?.hasMore ? <p className="preparation">This Moment contains more photos than the current bounded page. Open Smart Cull or the visual grid to continue review without loading the entire catalog here.</p> : null}
         <section className="status-card" aria-label="Magic Search within this Moment"><div className="panel-heading"><div><p className="section-label">Magic Search</p><h3>Search this Moment locally</h3><p className="muted">This request is scoped to the current Moment. Similar Sets remain separate.</p></div></div><form className="visual-toolbar" onSubmit={searchWithinMoment}><label className="search"><span className="sr-only">Magic Search this Moment</span><input value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Describe a photo in this Moment" /></label><button className="secondary" type="submit" disabled={isSearching || !searchQuery.trim()}>{isSearching ? "Searching…" : "Search this Moment"}</button></form>{searchResponse ? <MomentSearchResults response={searchResponse} /> : null}</section>
-        <section className="status-card" aria-label="Moment coverage checklist"><div className="panel-heading"><div><p className="section-label">Coverage confirmation</p><h3>Human confirmation only</h3><p className="muted">A result or label is not proof of coverage. Confirm, review, or mark not covered yourself.</p></div></div>{checklistItems.length ? <ul className="culling-reasons">{checklistItems.map((item) => <li key={item.id}><strong>{item.phrase}</strong> · {coverageStateLabel(item.state)}<div><button className="secondary" disabled={isSaving} onClick={() => void updateCoverage(item.id, "confirmed_covered")}>Confirm covered here</button><button className="secondary" disabled={isSaving} onClick={() => void updateCoverage(item.id, "needs_review")}>Needs review</button><button className="secondary" disabled={isSaving} onClick={() => void updateCoverage(item.id, "not_covered")}>Not covered</button></div></li>)}</ul> : <p className="muted">Add checklist phrases from the timeline overview before confirming coverage.</p>}</section>
+        <section className="status-card" aria-label="Moment coverage checklist"><div className="panel-heading"><div><p className="section-label">Coverage confirmation</p><h3>Human confirmation only</h3><p className="muted">A result or label is not proof of coverage. Confirm, review, or mark not covered yourself.</p></div></div>{checklistItems.length ? <ul className="culling-reasons">{checklistItems.map((item) => <li key={item.id}><strong>{item.phrase}</strong> · {coverageStateLabel(item.state)}<div><button className="secondary" disabled={momentActionsBlocked} onClick={() => void updateCoverage(item.id, "confirmed_covered")}>Confirm covered here</button><button className="secondary" disabled={momentActionsBlocked} onClick={() => void updateCoverage(item.id, "needs_review")}>Needs review</button><button className="secondary" disabled={momentActionsBlocked} onClick={() => void updateCoverage(item.id, "not_covered")}>Not covered</button></div></li>)}</ul> : <p className="muted">Add checklist phrases from the timeline overview before confirming coverage.</p>}</section>
         <details className="advanced"><summary>Developer Details</summary><p><strong>Displayed label:</strong> {detail.moment.label.displayLabel}</p><p><strong>AI suggested label:</strong> {detail.moment.label.aiSuggestedLabel ?? "No supported suggestion — Untitled Moment."}</p><p><strong>Label source:</strong> {displayLabel(detail.moment.label.source)}</p><p><strong>Suggestion support:</strong> {displayLabel(detail.moment.label.strength)}</p>{detail.moment.label.evidence.length ? <ul>{detail.moment.label.evidence.map((evidence) => <li key={evidence}>{evidence}</li>)}</ul> : <p>No label evidence is available.</p>}{detail.boundaryEvidence.map((boundary, index) => <div key={`${boundary.summary}:${index}`}><strong>{displayLabel(boundary.strength)} boundary evidence</strong><p>{boundary.summary}</p>{boundary.signals.length ? <ul>{boundary.signals.map((signal) => <li key={signal}>{signal}</li>)}</ul> : null}</div>)}<p>Structural analysis uses local metadata and compatible local embeddings only. It does not identify people or claim an event occurred.</p></details>
       </> : <div className="empty">Loading local Moment details…</div>}
     </section>}
@@ -1185,7 +1356,7 @@ function MomentCard({ moment, previous, onOpen, onMerge, disabled }: { moment: M
       <small>{moment.keepCount.toLocaleString()} Keep · {moment.rejectCount.toLocaleString()} Reject · {moment.reviewCount.toLocaleString()} Review · {moment.unreviewedCount.toLocaleString()} unreviewed · {moment.technicalIssueCount.toLocaleString()} technical issue{moment.technicalIssueCount === 1 ? "" : "s"}</small>
       {moment.boundaryBefore ? <small>{displayLabel(moment.boundaryBefore.strength)} boundary · {moment.boundaryBefore.summary}</small> : null}
       {moment.hasHumanStructureOverride ? <small>Human split/merge override protected</small> : null}
-      <div><button className="secondary" onClick={() => onOpen(moment.id)}>Open Moment</button>{previous ? <button className="secondary" disabled={disabled} onClick={() => onMerge(previous.id, moment.id)}>Merge with previous</button> : null}</div>
+      <div><button className="secondary" onClick={() => onOpen(moment.id)}>Open Moment</button>{previous ? moment.canMergeWithPrevious ? <button className="secondary" disabled={disabled} onClick={() => onMerge(previous.id, moment.id)}>Merge with previous</button> : <span className="muted">These adjacent Moments are from different local analysis runs. Rebuild AI timeline before merging across this boundary.</span> : null}</div>
     </div>
   </article>;
 }
@@ -1445,7 +1616,7 @@ function CullingWorkspace({ project, momentId, onReturn, onError }: { project: P
     <p className="agreement" aria-label="AI and human agreement">AI/Human Agreement · strong candidate → kept {workspace.progress.strongCandidateKept} · technical issue → kept {workspace.progress.technicalIssueKept} · strong candidate → rejected {workspace.progress.strongCandidateRejected}. These are local workflow observations, not accuracy.</p>
     <nav className="culling-filters" aria-label="Culling filters">{cullingFilters.map((item) => <button key={item.id} className={filter === item.id ? "active" : ""} onClick={() => { setFilter(item.id); setCurrentIndex(0); }}>{item.label}</button>)}<label className="auto-advance"><input type="checkbox" checked={autoAdvance} onChange={(event) => setAutoAdvance(event.target.checked)} /> Auto Advance</label></nav>
     {mode === "similar_sets" ? <aside className="set-queue" aria-label="Similar sets"><p className="section-label">Similar Sets</p>{workspace.groups.length ? workspace.groups.map((candidate) => <button key={candidate.id} className={groupId === candidate.id ? "active" : ""} onClick={() => { setGroupId(candidate.id); setCurrentIndex(0); }}>{candidate.memberCount} frames <small>{candidate.completed ? "✓ Set Complete" : `${candidate.reviewedCount} reviewed`}</small></button>) : <p className="muted">No stored similar sets yet. You can still review All Photos while local analysis finishes.</p>}</aside> : null}
-    {group ? <section className="set-summary"><div><p className="section-label">{group.kind.replaceAll("_", " ")} · {group.memberCount} · {group.reviewedCount} / {group.memberCount} reviewed</p><span>AI suggested starting point</span><strong>{group.aiRepresentativeFilename}</strong><span>Your representative</span><strong>{group.humanRepresentativeFilename ?? "Not chosen"}</strong><small>{group.completed ? "✓ Set Complete" : "Set remains open"}</small></div><button className="secondary" disabled={group.completed} onClick={() => void completeGroup()}>{group.completed ? "✓ Set Complete" : "Mark Set Complete"}</button></section> : null}
+    {group ? <section className="set-summary"><div><p className="section-label">{group.kind.replaceAll("_", " ")} · {group.memberCount} · {group.reviewedCount} / {group.memberCount} reviewed</p><span>AI suggested starting point</span><strong>{group.aiRepresentativeFilename}</strong>{group.studioStartingPointAssetId ? <><span>Studio Brain starting point</span><strong>{group.studioStartingPointReason ?? "Local comparable-set advice"}</strong></> : null}<span>Your representative</span><strong>{group.humanRepresentativeFilename ?? "Not chosen"}</strong><small>{group.completed ? "✓ Set Complete" : "Set remains open"}</small></div><button className="secondary" disabled={group.completed} onClick={() => void completeGroup()}>{group.completed ? "✓ Set Complete" : "Mark Set Complete"}</button></section> : null}
     {selectedForCompare.length ? <section className="culling-bulk" aria-label="Selected frames"><strong>{selectedForCompare.length} selected</strong><button onClick={() => void applyBulk({ decision: "keep" })}>Keep selected</button><button onClick={() => void applyBulk({ decision: "reject" })}>Reject selected</button><button onClick={() => void applyBulk({ decision: "review" })}>Review selected</button><button onClick={() => void applyBulk({ rating: 5 })}>Rate 5</button><button onClick={() => setCompareIds([])}>Clear selection</button></section> : null}
     <main className="culling-stage">
       <aside className="culling-sidebar"><p className="section-label">Queue</p>{workspace.items.slice(0, 80).map((item, index) => <button key={item.media.assetId} className={index === currentIndex ? "active" : ""} onClick={() => chooseIndex(index)}><span>{decisionGlyph(item.decision.decision)} {item.media.filename}</span><small>{item.decision.rating ? `${item.decision.rating}★` : item.decision.starred ? "★" : item.media.intelligence.recommendation?.replaceAll("_", " ") ?? "unreviewed"}</small></button>)}</aside>
@@ -1456,11 +1627,17 @@ function CullingWorkspace({ project, momentId, onReturn, onError }: { project: P
         {surface === "compare" ? <CullingCompare items={selectedForCompare} onOpen={(assetId) => chooseIndex(workspace.items.findIndex((item) => item.media.assetId === assetId))} onNext={() => chooseIndex(currentIndex + 1)} /> : null}
         {surface === "face" ? <CullingFaceView items={selectedForCompare.length ? selectedForCompare : workspace.items} /> : null}
       </section>
-      <aside className="culling-inspector">{active ? <><p className="section-label">Decision & Evidence</p><h3>{active.media.filename}</h3><div className="quick-decisions"><button className={active.decision.decision === "keep" ? "active keep" : ""} onClick={() => void apply(active, { decision: "keep" }, true, true)}>K Keep</button><button className={active.decision.decision === "reject" ? "active reject" : ""} onClick={() => void apply(active, { decision: "reject" }, true, true)}>X Reject</button><button className={active.decision.decision === "review" ? "active review" : ""} onClick={() => void apply(active, { decision: "review" }, true, true)}>R Review</button><button className={active.decision.starred ? "active" : ""} onClick={() => void apply(active, { starred: !active.decision.starred })}>S {active.decision.starred ? "Starred" : "Star"}</button></div><div className="rating-controls" aria-label="Rating">{[1, 2, 3, 4, 5].map((rating) => <button key={rating} className={active.decision.rating === rating ? "active" : ""} onClick={() => void apply(active, { rating })}>{rating}</button>)}<button onClick={() => void apply(active, { rating: 0 })}>0 clear</button></div><label className="culling-note">Note <textarea value={active.decision.note ?? ""} onChange={(event) => patchWorkspace(active.media.assetId, localPatch(active.decision, { note: event.target.value }))} onBlur={(event) => void apply(active, { note: event.target.value }, false)} placeholder="Client requested this one" /></label><dl className="culling-evidence"><Detail label="AI recommendation" value={recommendationLabel(active.media.intelligence.recommendation) ?? "No current recommendation"} /><Detail label="Technical score" value={active.media.intelligence.technicalQualityScore === null ? "Unavailable" : `${Math.round(active.media.intelligence.technicalQualityScore)} / 100`} /><Detail label="Sharpness" value={displayLabel(active.media.intelligence.sharpnessBand ?? "unavailable")} /><Detail label="Blur" value={displayLabel(active.media.intelligence.blurLevel ?? "unavailable")} /><Detail label="Faces" value={active.media.intelligence.faceCount} /><Detail label="Eye state" value={active.media.intelligence.openEyesCount ? "Open evidence available" : "NOT_ANALYZABLE / unavailable"} /></dl>{active.relativeEvidence.length ? <ul className="culling-reasons">{active.relativeEvidence.map((reason) => <li key={reason}>{reason}</li>)}</ul> : null}{active.similarityGroupId ? <button className="secondary" onClick={() => void setRepresentative(active)}>{active.isHumanRepresentative ? `Human representative: ${active.media.filename}` : "Choose as human representative"}</button> : null}{active.decision.decision && active.media.intelligence.recommendation ? <p className="human-override">AI recommendation: {recommendationLabel(active.media.intelligence.recommendation)}<br />Your decision: {humanDecisionLabel(active.decision.decision)}</p> : null}</> : <p className="muted">No media matches this culling view.</p>}<details><summary>Keyboard Shortcuts</summary><p>K Keep · X Reject · R Review · S Star · 1–5 rate · 0 clear rating · ←/→ navigate · Space focus/grid · C compare · F Face View · G Set Grid · U Undo</p></details></aside>
+      <aside className="culling-inspector">{active ? <><p className="section-label">Decision & Evidence</p><h3>{active.media.filename}</h3><div className="quick-decisions"><button className={active.decision.decision === "keep" ? "active keep" : ""} onClick={() => void apply(active, { decision: "keep" }, true, true)}>K Keep</button><button className={active.decision.decision === "reject" ? "active reject" : ""} onClick={() => void apply(active, { decision: "reject" }, true, true)}>X Reject</button><button className={active.decision.decision === "review" ? "active review" : ""} onClick={() => void apply(active, { decision: "review" }, true, true)}>R Review</button><button className={active.decision.starred ? "active" : ""} onClick={() => void apply(active, { starred: !active.decision.starred })}>S {active.decision.starred ? "Starred" : "Star"}</button></div><div className="rating-controls" aria-label="Rating">{[1, 2, 3, 4, 5].map((rating) => <button key={rating} className={active.decision.rating === rating ? "active" : ""} onClick={() => void apply(active, { rating })}>{rating}</button>)}<button onClick={() => void apply(active, { rating: 0 })}>0 clear</button></div><label className="culling-note">Note <textarea value={active.decision.note ?? ""} onChange={(event) => patchWorkspace(active.media.assetId, localPatch(active.decision, { note: event.target.value }))} onBlur={(event) => void apply(active, { note: event.target.value }, false)} placeholder="Client requested this one" /></label><dl className="culling-evidence"><Detail label="AI recommendation" value={recommendationLabel(active.media.intelligence.recommendation) ?? "No current recommendation"} /><Detail label="Technical score" value={active.media.intelligence.technicalQualityScore === null ? "Unavailable" : `${Math.round(active.media.intelligence.technicalQualityScore)} / 100`} /><Detail label="Sharpness" value={displayLabel(active.media.intelligence.sharpnessBand ?? "unavailable")} /><Detail label="Blur" value={displayLabel(active.media.intelligence.blurLevel ?? "unavailable")} /><Detail label="Faces" value={active.media.intelligence.faceCount} /><Detail label="Eye state" value={active.media.intelligence.openEyesCount ? "Open evidence available" : "NOT_ANALYZABLE / unavailable"} /></dl><StudioRecommendationPanel recommendation={active.studioBrain} />{active.relativeEvidence.length ? <ul className="culling-reasons">{active.relativeEvidence.map((reason) => <li key={reason}>{reason}</li>)}</ul> : null}{active.similarityGroupId ? <button className="secondary" onClick={() => void setRepresentative(active)}>{active.isHumanRepresentative ? `Human representative: ${active.media.filename}` : "Choose as human representative"}</button> : null}{active.decision.decision && active.media.intelligence.recommendation ? <p className="human-override">AI recommendation: {recommendationLabel(active.media.intelligence.recommendation)}<br />Your decision: {humanDecisionLabel(active.decision.decision)}</p> : null}</> : <p className="muted">No media matches this culling view.</p>}<details><summary>Keyboard Shortcuts</summary><p>K Keep · X Reject · R Review · S Star · 1–5 rate · 0 clear rating · ←/→ navigate · Space focus/grid · C compare · F Face View · G Set Grid · U Undo</p></details></aside>
     </main>
     <nav className="culling-filmstrip" aria-label="Culling filmstrip">{workspace.items.map((item, index) => { const compareOrder = compareIds.indexOf(item.media.assetId) + 1; return <button key={item.media.assetId} className={`${index === currentIndex ? "active" : ""} ${compareOrder ? "compare-selected" : ""}`} onClick={() => chooseIndex(index)} onDoubleClick={() => toggleCompare(item.media.assetId)} aria-label={`Open ${item.media.filename}; ${compareOrder ? `Compare selection ${compareOrder}` : "double click to select for compare"}`}><PreviewImage url={item.media.thumbnailPreviewUrl} alt="" fallback={<span>{mediaSymbol(item.media)}</span>} /><small className="decision-state" title={`Decision: ${item.decision.decision ? humanDecisionLabel(item.decision.decision) : "Unreviewed"}`}>{decisionGlyph(item.decision.decision)}</small>{compareOrder ? <b className="compare-order" aria-hidden="true">{["①", "②", "③", "④"][compareOrder - 1]}</b> : null}</button>; })}</nav>
     <footer className="culling-footer"><span>{saving ? "Saving local decision…" : "Decisions persist locally in the background."}</span><button className="secondary" onClick={() => void exportReport()}>Export Culling Report</button><button className="secondary" onClick={onReturn}>Return to Project</button></footer>
   </div>;
+}
+
+function StudioRecommendationPanel({ recommendation }: { recommendation: CullingMediaRow["studioBrain"] }) {
+  if (!recommendation) return <section className="studio-recommendation"><p className="section-label">Studio Brain</p><p className="muted">Personalized advice is unavailable until a valid local model is ready.</p></section>;
+  const label = studioRecommendationLabel(recommendation.recommendation);
+  return <section className="studio-recommendation"><p className="section-label">Studio Brain</p><strong>{label}</strong><p className="muted">{recommendation.confidenceBand === "unavailable" ? "Not enough local evidence for a confident personalized recommendation." : `${displayLabel(recommendation.confidenceBand)} confidence · ${recommendation.agreement === "differs" ? "Differs from generic technical advice" : recommendation.agreement === "agrees" ? "Agrees with generic technical advice" : "Generic comparison unavailable"}`}</p>{recommendation.explanationFactors.length ? <ul className="culling-reasons">{recommendation.explanationFactors.map((factor) => <li key={factor}>{factor}</li>)}</ul> : null}<small>Advisory only — it does not change your decision, rating, star, representative, Moment, or media.</small></section>;
 }
 
 function CullingFocus({ item, onPrevious, onNext }: { item: CullingMediaRow; onPrevious: () => void; onNext: () => void }) {
@@ -2051,6 +2228,8 @@ function displayLabel(value: string) { return value.split("_").filter(Boolean).m
 function intelligenceStateLabel(value: string) { if (value === "running") return "Analyzing locally"; if (value === "paused") return "Analysis paused"; if (value === "completed") return "Analysis complete"; if (value === "interrupted") return "Analysis interrupted"; if (value === "failed") return "Analysis needs review"; if (value === "queued") return "Analysis queued"; return displayLabel(value); }
 function analysisStatusLabel(value: string | null | undefined) { if (value === "needs_original") return "Needs original"; if (value === "unsupported") return "Analysis unsupported"; if (value === "corrupt") return "Corrupt media"; if (value === "not_applicable") return "Not applicable"; if (value === "stale") return "Analysis stale"; if (value === "failed") return "Analysis failed"; if (value === "pending") return "Analysis pending"; return value ? displayLabel(value) : "Analysis unavailable"; }
 function recommendationLabel(value: string | null | undefined) { if (value === "strong_candidate") return "Strong technical candidate"; if (value === "strong_alternative") return "Strong alternative"; if (value === "review") return "Needs review"; if (value === "probable_duplicate") return "Probable duplicate"; if (value === "technical_issue") return "Technical issue"; return null; }
+function studioRecommendationLabel(value: string | null | undefined) { if (value === "likely_keep") return "Likely Keep"; if (value === "likely_review") return "Likely Review"; if (value === "likely_reject") return "Likely Reject"; return "Not enough evidence"; }
+function studioStatusLabel(value: string | null | undefined) { if (value === "ready") return "Ready"; if (value === "stale") return "Update recommended"; if (value === "learning") return "Learning"; if (value === "error") return "Needs attention"; return "Not ready"; }
 function technicalQualityLabel(value: string | null | undefined) { if (value === "strong") return "Strong"; if (value === "good") return "Good"; if (value === "review") return "Review"; if (value === "technical_issue") return "Technical issue"; return null; }
 function humanDecisionLabel(value: string) { if (value === "keep") return "Keep"; if (value === "review") return "Review"; if (value === "reject") return "Reject"; return displayLabel(value); }
 function similarityGroupLabel(value: string) { if (value === "exact_duplicate_set") return "Exact duplicate set"; if (value === "near_duplicate_set") return "Near-duplicate set"; if (value === "burst") return "Burst sequence"; if (value === "similar_set") return "Similar set"; return displayLabel(value); }

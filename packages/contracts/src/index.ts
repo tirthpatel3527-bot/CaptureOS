@@ -208,6 +208,8 @@ export interface CullingMediaRow {
   similarityGroupId: string | null;
   isAiRepresentative: boolean;
   isHumanRepresentative: boolean;
+  /** Separate local preference advice. It never replaces or mutates `decision`. */
+  studioBrain: StudioRecommendationView | null;
 }
 
 export interface CullingProgress {
@@ -237,6 +239,57 @@ export interface CullingGroupSummary {
   reviewedCount: number;
   completed: boolean;
   completionKind: "auto_all_reviewed" | "explicit_user_completion" | null;
+  /** Advisory only; this does not change generic or human representatives. */
+  studioStartingPointAssetId: string | null;
+  studioStartingPointReason: string | null;
+}
+
+export type StudioTrainingStatus = "not_ready" | "learning" | "ready" | "stale" | "error" | string;
+
+/** Small, UI-safe local Studio Profile status. No source path, note text, raw feature vector,
+ * model coefficient, probability, or biometric/identity signal is exposed here. */
+export interface StudioBrainProjectStatus {
+  profileId: string;
+  profileName: string;
+  trainingStatus: StudioTrainingStatus;
+  personalizationEnabled: boolean;
+  projectIncluded: boolean;
+  eligibleDecisionCount: number;
+  keepCount: number;
+  reviewCount: number;
+  rejectCount: number;
+  ratingCount: number;
+  starredCount: number;
+  representativeCount: number;
+  contributingProjectCount: number;
+  activeModelVersion: string | null;
+  lastTrainedAt: string | null;
+  readiness: { state?: string; message?: string; conditions?: { key: string; met: boolean; message: string }[]; reasons?: string[] };
+  lastError: string | null;
+}
+
+export interface StudioBrainProgress {
+  profileId: string;
+  state: StudioTrainingStatus | "queued" | "training" | "evaluating" | string;
+  active: boolean;
+  stage: string;
+  completed: number;
+  total: number;
+  errorCount: number;
+  activeModelVersion: string | null;
+  message: string | null;
+  /** Developer Details only; normal UI must use the friendly message. */
+  lastError: string | null;
+}
+
+export interface StudioRecommendationView {
+  recommendation: "likely_keep" | "likely_review" | "likely_reject" | "not_enough_evidence" | string;
+  confidenceBand: "high" | "moderate" | "low" | "unavailable" | string;
+  modelVersion: string;
+  explanationFactors: string[];
+  genericRecommendation: string | null;
+  agreement: "agrees" | "differs" | "unavailable" | string;
+  generatedAt: string;
 }
 
 export interface ReviewSessionView {
@@ -684,6 +737,8 @@ export interface MomentRepresentativeView {
 export interface MomentSummaryView {
   id: string;
   ordinal: number;
+  /** False at an incremental-run boundary; use a full local rebuild before merging there. */
+  canMergeWithPrevious: boolean;
   label: MomentLabelView;
   capturedFrom: string | null;
   capturedTo: string | null;

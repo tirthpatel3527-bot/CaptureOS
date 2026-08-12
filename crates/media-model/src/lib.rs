@@ -93,6 +93,11 @@ id_type!(PreferenceExampleId, "preference example");
 id_type!(SemanticIndexVersionId, "semantic index version");
 id_type!(MagicSearchHistoryId, "magic search history");
 id_type!(SavedSearchId, "saved search");
+id_type!(StudioProfileId, "studio profile");
+id_type!(StudioTrainingExampleId, "studio training example");
+id_type!(StudioTrainingRunId, "studio training run");
+id_type!(StudioModelId, "studio model");
+id_type!(StudioRecommendationId, "studio recommendation");
 
 pub type Timestamp = DateTime<Utc>;
 
@@ -847,6 +852,11 @@ pub enum JobStage {
     /// Capture Intelligence analysis and Magic Search indexing; it never implies an event,
     /// identity, or culling decision.
     MomentAnalysis,
+    /// Explicit, local-only Studio Brain preference-model training. This never changes a
+    /// photographer's decisions or source media.
+    StudioTraining,
+    /// Validation and safe activation of a candidate Studio Brain artifact.
+    StudioEvaluation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

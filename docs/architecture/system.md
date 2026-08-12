@@ -1,11 +1,11 @@
 # System architecture
 
-CaptureOS uses a desktop-first, local-only architecture. React uses Tauri commands and events; the Rust core owns the domain model, migrations, repositories, read-only Index Mode, verified Ingest Mode, visual preparation, Capture Intelligence, Milestone 6 Magic Search, and Milestone 7 Moment Brain orchestration. SQLite stores catalog information locally; it never stores original media bytes. The persistent app shell separates global Project Library navigation from the selected project workspace.
+CaptureOS uses a desktop-first, local-only architecture. React uses Tauri commands and events; the Rust core owns the domain model, migrations, repositories, read-only Index Mode, verified Ingest Mode, visual preparation, Capture Intelligence, Milestone 6 Magic Search, Milestone 7 Moment Brain, and Milestone 8 Studio Brain orchestration. SQLite stores catalog information locally; it never stores original media bytes. The persistent app shell separates global Project Library navigation from the selected project workspace.
 
 ```mermaid
 flowchart LR
   Shell["Global shell: Home / Project Library\nNew Project"] --> Route["Stable ProjectId route"]
-  Route --> UI["React media grid + Index / Ingest / Culling / Magic Search / Moments"]
+  Route --> UI["React media grid + Index / Ingest / Culling / Magic Search / Moments / Studio Brain"]
   UI --> Bridge["Tauri command bridge"]
   Bridge --> Core["capture-core"]
   Core --> Ingest["ingest: pre-flight → copy → BLAKE3 verify"]
@@ -13,6 +13,7 @@ flowchart LR
   Core --> Intelligence["capture-intelligence: local fingerprint → technical evidence → group/recommendation"]
   Core --> Search["Magic Search: planner → local embeddings → hybrid rank"]
   Core --> Timeline["Moment Brain: bounded local timeline → structural Moments"]
+  Core --> Studio["Studio Brain: explicit human history → compact local candidate → advisory recommendation"]
   Core --> Graph["capture-graph"]
   Core --> Model["media-model"]
   Core --> Repo["persistence repository"]
@@ -33,6 +34,11 @@ flowchart LR
   UI --> Culling["Culling Workspace\nlocal review, compare, face crops, keyboard workflow"]
   Culling --> Review["ReviewSession + current decision\nimmutable history/events + preference examples"]
   Review --> Repo
+  Review --> Studio
+  Intelligence --> Studio
+  Timeline --> Studio
+  Studio --> Repo
+  Studio --> UI
   Picker["Native folder picker"] --> Bridge
   Fixture["Golden Shoot + index/ingest fixtures"] --> Core
   Adapters["Local adapters: SIPS, Quick Look, WAV, optional Apple Vision\nFuture: approved local model providers, RAW, FFmpeg, proxy, NLE"] -. boundaries .-> Core
@@ -55,13 +61,18 @@ flowchart LR
 | `capture-intelligence` | Provider contracts; deterministic visual descriptors, technical evidence, bounded candidate grouping, local face-provider boundary, recommendations | Cloud inference, identity recognition, artistic judgment, automatic culling |
 | Magic Search | Current-project query planning, local semantic provider/vector-index boundary, hybrid ranking, explanations, local history | Chatbot, cloud inference, cross-project search, identity recognition, Similar Set mutation |
 | Moment Brain | Current-project still-photo structural timeline, bounded evidence-based segments/Moments, conservative label candidates, human override projection, factual coverage and advisory clock diagnostics | Event/identity recognition, captioning, missing-shot claims, automatic culling, timestamp write-back, cloud processing, Similar Set mutation |
+| Studio Brain | Explicit local human-source materialization, compact versioned preference model, leakage-aware evaluation, calibration/abstention, atomic candidate activation, separate advisory recommendations | Passive/AI self-training, notes/raw embeddings/identity inference, automatic culling, human-decision mutation, cloud/telemetry |
 | desktop | Global Project Library routing, selected-project commands, folder selection, pre-flight, progress, status, history | Product dashboard or creative workspace |
 
 ## Culling and review boundary
 
 Milestone 5 is a human-controlled metadata workflow, not an automatic culling engine. `media_decisions` stores the project-scoped current state (`KEEP`, `REJECT`, `REVIEW`, independent rating/star/note/flags); `decision_history` and `review_events` retain immutable changes. `review_sessions` records resumable local position and context. `group_human_representatives` deliberately lives beside—not inside—rebuildable `SimilarityGroup` recommendations, so a later analysis rebuild cannot overwrite a photographer's choice.
 
-`preference_examples` are bounded to meaningful similarity-set alternatives and include relative IDs plus technical/recommendation snapshots. They contain no original bytes, preview paths, face crops, identity labels, or remote endpoint. They are a data foundation only; no personalized training runs in Milestone 5. Culling report export requires an explicit new user-selected file and cannot overwrite a destination.
+`preference_examples` are bounded to meaningful similarity-set alternatives and include relative IDs plus technical/recommendation snapshots. They contain no original bytes, preview paths, face crops, identity labels, or remote endpoint. M8 may materialize them as explicit pairwise source evidence only when the current project is opted in and the photographer explicitly trains. Culling report export requires an explicit new user-selected file and cannot overwrite a destination.
+
+## Studio Brain boundary
+
+Studio Brain I is a profile-scoped local layer, separate from generic Capture Intelligence. `studio_training_examples` retain explicit source/provenance and compact snapshots; project preferences and decision exclusions control training without deleting M5 history. A candidate is trained from a frozen source snapshot, evaluated with whole-project (or conservative structural/time) holdouts, stored as checksummed static JSON, and atomically activated only after validation and non-regression against a retained active model. Its advisory rows never become labels or alter M5/M7 records. See [Studio Brain architecture](studio-brain.md).
 
 ## Magic Search boundary
 
@@ -80,6 +91,8 @@ Capture Intelligence receives only a validated, CaptureOS-owned analysis-preview
 Magic Search follows the same containment rule: its provider receives only a managed analysis preview and produces local image/text embeddings. Embeddings, query history, and the vector index are potentially sensitive local derived data. They are not telemetry, remote requests, or automatic exports. Existing compatible embeddings remain searchable while a source volume is offline; if a new embedding needs a missing source/preview, the asset is marked `NEEDS_ORIGINAL` without blocking other work.
 
 Moment Brain consumes only project-scoped durable catalog/timeline evidence and compatible M6 embeddings; it does not add a second media decoder or require an original to open a project. Timeline runs, memberships, local centroids, boundary evidence, conservative label candidates, coverage/checklist records, camera-clock diagnostics, and append-only human override events are sensitive local derived data. They are rebuildable, never uploaded/exported automatically, and never the sole source of a project or human decision. Project Home queries compact Moment status only; it never starts or waits for a timeline job.
+
+Studio Brain retains local preference-source records, run snapshots, small structured model artifacts, metric summaries, exclusions, and advisory recommendations. It does not retain original bytes, source paths, notes, raw semantic vectors, identity data, or telemetry. Opening a project reads a compact Studio status only; training is a separate explicit background action and stale/corrupt/disabled state falls back to M0–M7 generic behavior.
 
 ## Capture Intelligence evidence flow
 
@@ -111,7 +124,7 @@ flowchart LR
 
 `AnalysisArtifact` records provider, provider/model/settings versions, input fingerprint, timestamp, confidence, status, and error. When an input or analyzer changes, older records become `STALE`; they remain provenance rather than being relabeled as current. Terminal outcomes are `READY`, `UNSUPPORTED`, `CORRUPT`, `NEEDS_ORIGINAL`, `FAILED`, and `NOT_APPLICABLE`, so one unusable asset cannot block the durable background queue. Group membership is modelled directly to avoid an unnecessary quadratic number of `SIMILAR_TO` graph edges; `CaptureGraph` reserves typed relationships for future consumers.
 
-The M4 deterministic baseline remains deliberately conservative. Milestone 6 adds optional current-project still-photo semantic retrieval through an admitted local model pack. Milestone 7 adds structural local Moment organization from bounded persisted evidence. Neither adds facial identity, demographic classification, artistic ranking, automatic deletion, video/audio semantics, cloud analysis, or automatic culling. Detailed strategy and operating limits are in [Capture Intelligence](capture-intelligence.md), [Magic Search](magic-search.md), and [Moment Brain](moment-brain.md).
+The M4 deterministic baseline remains deliberately conservative. Milestone 6 adds optional current-project still-photo semantic retrieval through an admitted local model pack. Milestone 7 adds structural local Moment organization from bounded persisted evidence. Milestone 8 adds explicit local preference modeling that remains advisory and separate from generic evidence. None adds facial identity, demographic classification, artistic ranking, automatic deletion, video/audio semantics, cloud analysis, or automatic culling. Detailed strategy and operating limits are in [Capture Intelligence](capture-intelligence.md), [Magic Search](magic-search.md), [Moment Brain](moment-brain.md), and [Studio Brain](studio-brain.md).
 
 ## Ingest evidence flow
 
@@ -134,7 +147,7 @@ flowchart LR
 
 Home is deliberately the startup route. The Project Library is a derived, read-only catalog projection sorted by meaningful project activity and keyed by stable `ProjectId`, so existing projects retain their media, preview cache records, ingest history, Capture Intelligence artifacts, and CaptureGuardian evidence without a data reset. Identical display names are valid.
 
-Project-specific routes load only that project’s media, roots, jobs, ingest history, Capture Intelligence state, Magic Search embedding/index metadata/local search history, and compact Moment timeline status. Tauri broadcasts carry the source `ProjectId`, and the renderer filters them before updating the visible workspace. Sensitive asset-level reads, semantic retrieval, timeline retrieval, and human decisions check ownership again in `capture-core`; a project cannot request an asset, embedding, or Moment belonging to another project.
+Project-specific routes load only that project’s media, roots, jobs, ingest history, Capture Intelligence state, Magic Search embedding/index metadata/local search history, compact Moment timeline status, and compact Studio status. Tauri broadcasts carry the source `ProjectId`, and the renderer filters them before updating the visible workspace. Sensitive asset-level reads, semantic retrieval, timeline retrieval, Studio recommendation projection, and human decisions check ownership again in `capture-core`; a project cannot request an asset, embedding, Moment, or Studio advisory row belonging to another project.
 
 ## Portability boundary
 

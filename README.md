@@ -2,7 +2,7 @@
 
 CaptureOS is a local-first foundation for an intelligent operating system for professional camera media. Its long-term purpose is simple: **your entire shoot, alive, understood, protected.**
 
-Milestone 6 adds **Magic Search**: current-project, local visual retrieval over eligible still photographs. It combines an optional user-installed image/text embedding model with existing deterministic face-count, technical, camera, rating, and decision evidence. Magic Search is not a chatbot, does not upload media or queries, and does not alter Capture Intelligence, Similar Sets, or human culling decisions.
+Milestone 8 adds **Studio Brain I**: explicit local preference learning for photographer-controlled culling recommendations. It is a compact, offline, explainable advisory layer built on intentional human decisions and representative choices—not passive behavior or AI output. It never replaces Capture Intelligence, Magic Search, Moment Brain, or the photographer's decisions.
 
 ## Guarantees
 
@@ -26,6 +26,7 @@ crates/media-visual/    Local metadata and thumbnail/poster adapter boundary
 crates/capture-intelligence/
                         Local deterministic fingerprints, grouping, technical evidence,
                         face-provider boundary, and conservative recommendations
+crates/studio-brain/   Pure-Rust compact preference model, calibration, abstention, and pairwise ranking
 crates/storage/         Storage-volume semantics
 crates/ingest/          Streaming copy, BLAKE3 verification, pre-flight, safe layout
 crates/integrity/       Future integrity extension boundary
@@ -37,6 +38,10 @@ research/capture-intelligence-bench/
                         Generated-fixture benchmark and versioned ground-truth scaffolding
 research/magic-search-bench/
                         Local retrieval benchmark foundation and versioned search ground truth
+research/moment-brain-bench/
+                        Generated structural-timeline benchmark foundation
+research/studio-brain-bench/
+                        Generated preference-recovery and scale benchmark foundation
 docs/                   Product, architecture, ADRs, and security notes
 ```
 
@@ -61,6 +66,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p capture-intelligence-bench -- --suite baseline
 cargo run -p magic-search-bench -- --suite baseline
+cargo run -p moment-brain-bench -- --suite baseline
+cargo run -p studio-brain-bench -- --suite baseline
 # Starts the browser shell for UI-only work:
 npm run dev
 # Starts the complete desktop app (requires the Rust prerequisite):
@@ -170,9 +177,27 @@ cargo run --release -p moment-brain-bench -- --suite baseline
 
 It compares time-only, synthetic-signature-only, and combined structural mechanics at 1k, 10k, 50k, and 100k generated records. It contains no AI Test/customer photograph, model weight, model download, cloud request, identity/event label, or real semantic-quality claim. See [Moment Brain architecture](docs/architecture/moment-brain.md) and [MomentBrainBench](research/moment-brain-bench/README.md).
 
-## Milestone 7 boundaries
+## Studio Brain I behavior
 
-This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, video/audio semantic search, automatic culling, source write-back, color-critical RAW development, full proxy transcoding, NLE integration, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or other Milestone 8 work. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
+**Studio Brain** is a local preference model that a photographer explicitly trains from intentional Keep/Review/Reject history and approved human representative choices. It starts honestly in **Not ready** or **Learning**; the current AI Test's handful of decisions must not create a ready personalized model. Ratings/stars remain separate auxiliary signals, and private notes are never parsed for training.
+
+The initial compact model is deterministic, regularized three-class linear softmax with calibration, abstention, and a separate pairwise Similar Set ranker when enough human representative choices exist. It uses only bounded local technical, anonymous face/eye, Similar Set, Moment, generic-recommendation, and semantic-availability features; it does not ingest raw embeddings, filenames, paths, notes, identities, demographics, emotion, or client information. Studio Brain works offline and never opens originals merely to train or infer.
+
+Training is an explicit background action. It snapshots eligible immutable human-source rows, holds out whole projects where possible (otherwise whole Similar Set/Moment/capture-day buckets), validates a checksummed static JSON candidate, then atomically activates it only after it satisfies readiness and does not materially regress against the retained active model on the same grouped holdout. If it is not ready, fails, is interrupted, corrupt, or loses that comparison, generic Capture Intelligence remains available and the prior valid model stays active. Reset removes only derived Studio artifacts; human decisions and all M0–M7 evidence remain untouched.
+
+Smart Cull shows **Capture Intelligence** and **Studio Brain** separately. A Similar Set may show a Studio advisory starting point alongside the technical starting point and the photographer's representative; none is auto-selected. See [Studio Brain architecture](docs/architecture/studio-brain.md) and [StudioBrainBench](research/studio-brain-bench/README.md).
+
+Run the generated, no-download preference benchmark with:
+
+```sh
+cargo run -p studio-brain-bench -- --suite baseline
+```
+
+It reports local generated-data mechanics at 100, 1k, 10k, 50k, and 100k records. It is not real-photographer or artistic-quality accuracy.
+
+## Milestone 8 boundaries
+
+This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, client preference modeling, editing/style training, automatic culling/deletion, source write-back, color-critical RAW development, full proxy transcoding, NLE integration, video/audio intelligence, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or Milestone 9 work. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
 
 ## Smart Culling Workspace behavior
 
@@ -180,7 +205,7 @@ Choose **Cull Photos** from a project to open the dedicated local review workspa
 
 Keyboard controls are visible in the workspace: `K` Keep, `X` Reject, `R` Review, `S` star, `1`–`5` rate, `0` clear rating, arrow keys navigate, Space switches focus/grid, `C` Compare, `F` Face View, `G` Set Grid, and `U` Undo. They are disabled while typing in a field.
 
-AI technical recommendations and human decisions are stored independently. A Similar Set retains its AI suggested starting point while a photographer may separately choose a human representative. That action creates local, privacy-safe preference structure for a future Studio Brain; it does not train a model. A Culling Report is an explicit user-selected new CSV file containing catalog decision data only—never media bytes, face crops, or filesystem paths.
+AI technical recommendations, Studio Brain recommendations, and human decisions are stored independently. A Similar Set retains its technical starting point while a photographer may separately choose a human representative; eligible explicit representative choices can become local pairwise Studio evidence only after an explicit training request. A Culling Report is an explicit user-selected new CSV file containing catalog decision data only—never media bytes, face crops, or filesystem paths.
 
 ## License
 
