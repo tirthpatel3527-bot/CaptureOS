@@ -1,11 +1,11 @@
 # System architecture
 
-CaptureOS uses a desktop-first, local-only architecture. React uses Tauri commands and events; the Rust core owns the domain model, migrations, repositories, read-only Index Mode, verified Ingest Mode, visual preparation, Capture Intelligence, Milestone 6 Magic Search, Milestone 7 Moment Brain, and Milestone 8 Studio Brain orchestration. SQLite stores catalog information locally; it never stores original media bytes. The persistent app shell separates global Project Library navigation from the selected project workspace.
+CaptureOS uses a desktop-first, local-only architecture. React uses Tauri commands and events; the Rust core owns the domain model, migrations, repositories, read-only Index Mode, verified Ingest Mode, visual preparation, Capture Intelligence, Milestone 6 Magic Search, Milestone 7 Moment Brain, Milestone 8 Studio Brain, and Milestone 9 Delivery Brain orchestration. SQLite stores catalog information locally; it never stores original media bytes. The persistent app shell separates global Project Library navigation from the selected project workspace.
 
 ```mermaid
 flowchart LR
   Shell["Global shell: Home / Project Library\nNew Project"] --> Route["Stable ProjectId route"]
-  Route --> UI["React media grid + Index / Ingest / Culling / Magic Search / Moments / Studio Brain"]
+  Route --> UI["React media grid + Index / Ingest / Culling / Magic Search / Moments / Studio Brain / Production"]
   UI --> Bridge["Tauri command bridge"]
   Bridge --> Core["capture-core"]
   Core --> Ingest["ingest: pre-flight → copy → BLAKE3 verify"]
@@ -14,6 +14,7 @@ flowchart LR
   Core --> Search["Magic Search: planner → local embeddings → hybrid rank"]
   Core --> Timeline["Moment Brain: bounded local timeline → structural Moments"]
   Core --> Studio["Studio Brain: explicit human history → compact local candidate → advisory recommendation"]
+  Core --> Delivery["Delivery Brain: human plan → dry run → immutable manifest → verified LocalFolder job"]
   Core --> Graph["capture-graph"]
   Core --> Model["media-model"]
   Core --> Repo["persistence repository"]
@@ -39,6 +40,8 @@ flowchart LR
   Timeline --> Studio
   Studio --> Repo
   Studio --> UI
+  Delivery --> Repo
+  Delivery --> Export["User-selected local folder\npartial → BLAKE3 verified final + private report"]
   Picker["Native folder picker"] --> Bridge
   Fixture["Golden Shoot + index/ingest fixtures"] --> Core
   Adapters["Local adapters: SIPS, Quick Look, WAV, optional Apple Vision\nFuture: approved local model providers, RAW, FFmpeg, proxy, NLE"] -. boundaries .-> Core
@@ -49,20 +52,21 @@ flowchart LR
 
 ## Core boundaries
 
-| Boundary        | Responsibility                                                | Explicitly not responsible for             |
-| --------------- | ------------------------------------------------------------- | ----------------------------------------- |
-| `media-model`   | Stable types, identifiers, provenance, safety classifications | Database or UI behavior                   |
-| `capture-graph` | Typed, extensible relationship semantics                      | Graph database / AI inference             |
-| `persistence`   | SQLite migrations and repository APIs                         | Direct UI access or media handling        |
-| `capture-core`  | Projects, Index jobs, durable Ingest jobs, visual/analysis orchestration, FileInstance integration | Direct filesystem copy mechanics, decoding, or model implementation |
-| `ingest`        | Pre-flight, source discovery, safe destination layout, streaming copy and BLAKE3 evidence | Project/database/UI decisions |
-| `media-index`   | Read-only discovery, classification, bounded fingerprints     | Media decoding or perceptual/technical analysis |
-| `media-visual`  | Local metadata adapters, cache-safe thumbnail/poster generation, WAV parsing | Original write-back, RAW development, proxies, AI |
-| `capture-intelligence` | Provider contracts; deterministic visual descriptors, technical evidence, bounded candidate grouping, local face-provider boundary, recommendations | Cloud inference, identity recognition, artistic judgment, automatic culling |
-| Magic Search | Current-project query planning, local semantic provider/vector-index boundary, hybrid ranking, explanations, local history | Chatbot, cloud inference, cross-project search, identity recognition, Similar Set mutation |
-| Moment Brain | Current-project still-photo structural timeline, bounded evidence-based segments/Moments, conservative label candidates, human override projection, factual coverage and advisory clock diagnostics | Event/identity recognition, captioning, missing-shot claims, automatic culling, timestamp write-back, cloud processing, Similar Set mutation |
-| Studio Brain | Explicit local human-source materialization, compact versioned preference model, leakage-aware evaluation, calibration/abstention, atomic candidate activation, separate advisory recommendations | Passive/AI self-training, notes/raw embeddings/identity inference, automatic culling, human-decision mutation, cloud/telemetry |
-| desktop | Global Project Library routing, selected-project commands, folder selection, pre-flight, progress, status, history | Product dashboard or creative workspace |
+| Boundary               | Responsibility                                                                                                                                                                                      | Explicitly not responsible for                                                                                                               |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `media-model`          | Stable types, identifiers, provenance, safety classifications                                                                                                                                       | Database or UI behavior                                                                                                                      |
+| `capture-graph`        | Typed, extensible relationship semantics                                                                                                                                                            | Graph database / AI inference                                                                                                                |
+| `persistence`          | SQLite migrations and repository APIs                                                                                                                                                               | Direct UI access or media handling                                                                                                           |
+| `capture-core`         | Projects, Index jobs, durable Ingest jobs, visual/analysis orchestration, FileInstance integration                                                                                                  | Direct filesystem copy mechanics, decoding, or model implementation                                                                          |
+| `ingest`               | Pre-flight, source discovery, safe destination layout, streaming copy and BLAKE3 evidence                                                                                                           | Project/database/UI decisions                                                                                                                |
+| `media-index`          | Read-only discovery, classification, bounded fingerprints                                                                                                                                           | Media decoding or perceptual/technical analysis                                                                                              |
+| `media-visual`         | Local metadata adapters, cache-safe thumbnail/poster generation, WAV parsing                                                                                                                        | Original write-back, RAW development, proxies, AI                                                                                            |
+| `capture-intelligence` | Provider contracts; deterministic visual descriptors, technical evidence, bounded candidate grouping, local face-provider boundary, recommendations                                                 | Cloud inference, identity recognition, artistic judgment, automatic culling                                                                  |
+| Magic Search           | Current-project query planning, local semantic provider/vector-index boundary, hybrid ranking, explanations, local history                                                                          | Chatbot, cloud inference, cross-project search, identity recognition, Similar Set mutation                                                   |
+| Moment Brain           | Current-project still-photo structural timeline, bounded evidence-based segments/Moments, conservative label candidates, human override projection, factual coverage and advisory clock diagnostics | Event/identity recognition, captioning, missing-shot claims, automatic culling, timestamp write-back, cloud processing, Similar Set mutation |
+| Studio Brain           | Explicit local human-source materialization, compact versioned preference model, leakage-aware evaluation, calibration/abstention, atomic candidate activation, separate advisory recommendations   | Passive/AI self-training, notes/raw embeddings/identity inference, automatic culling, human-decision mutation, cloud/telemetry               |
+| Delivery Brain         | Human-rule Production Plans, Virtual Collections, safe naming, compact dry-run/preflight, immutable manifests, background LocalFolder verified-copy jobs, local reports                             | Studio-as-selection authority, source mutation, cloud/editor adapters, rendering, overwrite, automatic delivery                              |
+| desktop                | Global Project Library routing, selected-project commands, folder selection, pre-flight, progress, status, history                                                                                  | Product dashboard or creative workspace                                                                                                      |
 
 ## Culling and review boundary
 
@@ -73,6 +77,23 @@ Milestone 5 is a human-controlled metadata workflow, not an automatic culling en
 ## Studio Brain boundary
 
 Studio Brain I is a profile-scoped local layer, separate from generic Capture Intelligence. `studio_training_examples` retain explicit source/provenance and compact snapshots; project preferences and decision exclusions control training without deleting M5 history. A candidate is trained from a frozen source snapshot, evaluated with whole-project (or conservative structural/time) holdouts, stored as checksummed static JSON, and atomically activated only after validation and non-regression against a retained active model. Its advisory rows never become labels or alter M5/M7 records. See [Studio Brain architecture](studio-brain.md).
+
+## Delivery Brain boundary
+
+M9 is a project-scoped local production pipeline. `production_plans` represent editable intent,
+`virtual_collections` are logical references/rules, `export_manifests` are complete immutable
+selection/naming/source snapshots, and `export_jobs` are individual execution records with
+per-entry outcomes. A human decision-history or Moment event advances a project revision; the
+manifest write transaction rejects a candidate built against an older revision. Plan-local
+overrides never update culling records, and Studio recommendations do not appear in a selection
+rule.
+
+The only M9 adapter is LocalFolder. Core resolves only a selected available `FileInstance`, then
+uses ingest's bounded streaming BLAKE3 copy/re-read/no-overwrite finalization. The desktop process
+guard and durable active-job constraint prevent duplicate starts; restart recovery labels an
+unfinished job interrupted while retaining verified destination files. Normal UI projections are
+compact (summary/history/naming examples); manifest entries stay in core/SQLite rather than being
+loaded wholesale into React. See [Delivery Brain architecture](delivery-brain.md).
 
 ## Magic Search boundary
 
@@ -93,6 +114,13 @@ Magic Search follows the same containment rule: its provider receives only a man
 Moment Brain consumes only project-scoped durable catalog/timeline evidence and compatible M6 embeddings; it does not add a second media decoder or require an original to open a project. Timeline runs, memberships, local centroids, boundary evidence, conservative label candidates, coverage/checklist records, camera-clock diagnostics, and append-only human override events are sensitive local derived data. They are rebuildable, never uploaded/exported automatically, and never the sole source of a project or human decision. Project Home queries compact Moment status only; it never starts or waits for a timeline job.
 
 Studio Brain retains local preference-source records, run snapshots, small structured model artifacts, metric summaries, exclusions, and advisory recommendations. It does not retain original bytes, source paths, notes, raw semantic vectors, identity data, or telemetry. Opening a project reads a compact Studio status only; training is a separate explicit background action and stale/corrupt/disabled state falls back to M0–M7 generic behavior.
+
+Delivery Brain retains plan configuration, source-free manifest entry metadata, job state, and
+private local report summaries in SQLite. A selected local destination path is catalog-private;
+client-facing report files exclude it along with source paths, internal IDs, notes, AI scores,
+Studio advice, embeddings, and model data. No M9 request is sent to a network service. Planning
+and export do not open a project automatically; the photographer explicitly requests the dry run
+or job.
 
 ## Capture Intelligence evidence flow
 
@@ -124,7 +152,7 @@ flowchart LR
 
 `AnalysisArtifact` records provider, provider/model/settings versions, input fingerprint, timestamp, confidence, status, and error. When an input or analyzer changes, older records become `STALE`; they remain provenance rather than being relabeled as current. Terminal outcomes are `READY`, `UNSUPPORTED`, `CORRUPT`, `NEEDS_ORIGINAL`, `FAILED`, and `NOT_APPLICABLE`, so one unusable asset cannot block the durable background queue. Group membership is modelled directly to avoid an unnecessary quadratic number of `SIMILAR_TO` graph edges; `CaptureGraph` reserves typed relationships for future consumers.
 
-The M4 deterministic baseline remains deliberately conservative. Milestone 6 adds optional current-project still-photo semantic retrieval through an admitted local model pack. Milestone 7 adds structural local Moment organization from bounded persisted evidence. Milestone 8 adds explicit local preference modeling that remains advisory and separate from generic evidence. None adds facial identity, demographic classification, artistic ranking, automatic deletion, video/audio semantics, cloud analysis, or automatic culling. Detailed strategy and operating limits are in [Capture Intelligence](capture-intelligence.md), [Magic Search](magic-search.md), [Moment Brain](moment-brain.md), and [Studio Brain](studio-brain.md).
+The M4 deterministic baseline remains deliberately conservative. Milestone 6 adds optional current-project still-photo semantic retrieval through an admitted local model pack. Milestone 7 adds structural local Moment organization from bounded persisted evidence. Milestone 8 adds explicit local preference modeling that remains advisory and separate from generic evidence. Milestone 9 adds human-controlled local verified delivery organization. None adds facial identity, demographic classification, artistic ranking, automatic deletion, video/audio semantics, cloud analysis, automatic culling, or editing/rendering. Detailed strategy and operating limits are in [Capture Intelligence](capture-intelligence.md), [Magic Search](magic-search.md), [Moment Brain](moment-brain.md), [Studio Brain](studio-brain.md), and [Delivery Brain](delivery-brain.md).
 
 ## Ingest evidence flow
 

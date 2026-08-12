@@ -2,6 +2,11 @@
 
 use capture_graph::{EntityRef, Relationship, RelationshipKind};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use delivery_brain::{
+    DeliveryAssetCandidate, DeliverySourceCandidate, FilenameStrategy, ManifestEntryDraft,
+    OrganizationStrategy, PlanOverride, PlanOverrideKind, ProductionPlanStatus, ProductionPlanType,
+    SelectionRules, VirtualCollectionKind,
+};
 use media_model::*;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::{
@@ -12,7 +17,7 @@ use studio_brain::{decode_verified_model_artifact, VerifiedModelArtifact};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 20;
 // This is a query-page size, never a catalog/result limit. Moment semantic search continues
 // until its cursor is exhausted so it cannot silently omit a large project's later Moments.
 const MOMENT_SEARCH_ROW_PAGE_SIZE: u32 = 256;
@@ -1325,6 +1330,204 @@ pub struct MediaPreparationCandidate {
     pub is_available: bool,
 }
 
+/// The human-configured intention. It deliberately has no export execution state: an immutable
+/// Manifest captures a point-in-time plan, and an Export Job records one actual local execution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionPlanRecord {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub plan_type: ProductionPlanType,
+    pub status: ProductionPlanStatus,
+    pub selection_rules: SelectionRules,
+    pub organization: OrganizationStrategy,
+    pub filename_strategy: FilenameStrategy,
+    pub destination_path: Option<String>,
+    pub destination_reserve_bytes: u64,
+    pub estimated_file_count: u64,
+    pub estimated_bytes: u64,
+    pub current_manifest_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionPlanInput {
+    pub name: String,
+    pub plan_type: ProductionPlanType,
+    pub selection_rules: SelectionRules,
+    pub organization: OrganizationStrategy,
+    pub filename_strategy: FilenameStrategy,
+}
+
+/// Explicit planning inputs read atomically from the local catalog for one dry-run/manifest
+/// attempt. The source revision is the transactionally rechecked anti-race token.
+pub type ProductionManifestBuildInput = (
+    ProductionPlanRecord,
+    Vec<PlanOverride>,
+    Vec<DeliveryAssetCandidate>,
+    BTreeMap<String, String>,
+    u64,
+    Option<Vec<String>>,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualCollectionRecord {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub kind: VirtualCollectionKind,
+    pub rules: SelectionRules,
+    pub created_at: String,
+    pub updated_at: String,
+    pub asset_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualCollectionInput {
+    pub name: String,
+    pub kind: VirtualCollectionKind,
+    pub rules: SelectionRules,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionWorkspaceView {
+    pub plans: Vec<ProductionPlanRecord>,
+    pub collections: Vec<VirtualCollectionRecord>,
+    /// Bounded presentation history only; complete durable job history remains queryable in the
+    /// catalog and is never deleted by this workspace projection.
+    pub recent_exports: Vec<ExportJobRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportManifestRecord {
+    pub id: String,
+    pub plan_id: String,
+    pub project_id: String,
+    pub manifest_version: u64,
+    pub source_revision: u64,
+    pub status: String,
+    pub selection_snapshot: serde_json::Value,
+    pub organization_snapshot: serde_json::Value,
+    pub filename_strategy_snapshot: serde_json::Value,
+    pub destination_path: String,
+    pub selected_file_count: u64,
+    pub estimated_bytes: u64,
+    pub checksum: String,
+    pub validation: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportManifestEntryRecord {
+    pub id: String,
+    pub manifest_id: String,
+    pub ordinal: u64,
+    pub media_asset_id: String,
+    pub selected_file_instance_id: Option<String>,
+    pub original_filename: String,
+    pub destination_relative_path: String,
+    pub destination_filename: String,
+    pub expected_byte_size: u64,
+    pub source_checksum: Option<String>,
+    pub human_decision: Option<String>,
+    pub rating: u8,
+    pub starred: bool,
+    pub moment_id: Option<String>,
+    pub moment_label: Option<String>,
+    pub status: String,
+    pub issue: Option<String>,
+}
+
+/// Private execution projection. This remains inside the backend because it includes local root
+/// resolution metadata; normal plan/manifest views never expose source filesystem paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportManifestExecutionEntry {
+    pub entry: ExportManifestEntryRecord,
+    pub source_root_path: Option<String>,
+    pub source_relative_path: Option<String>,
+    pub source_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportJobRecord {
+    pub id: String,
+    pub plan_id: String,
+    pub manifest_id: String,
+    pub background_job_id: String,
+    pub state: String,
+    pub destination_path: String,
+    pub items_total: u64,
+    pub items_completed: u64,
+    pub verified_count: u64,
+    pub skipped_identical_count: u64,
+    pub failed_count: u64,
+    pub verified_bytes: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportJobEntryUpdate {
+    pub manifest_entry_id: String,
+    pub state: String,
+    pub copied_bytes: u64,
+    pub source_checksum: Option<String>,
+    pub destination_checksum: Option<String>,
+    pub error_message: Option<String>,
+}
+
+/// Immutable, local handoff summary for one completed or partially completed export. The
+/// serialized content intentionally excludes source locations, internal asset identities,
+/// notes, and any AI or Studio Brain evidence.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryReportRecord {
+    pub id: String,
+    pub export_job_id: String,
+    pub manifest_checksum: String,
+    pub report_json: serde_json::Value,
+    pub report_text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionPreflight {
+    pub manifest: ExportManifestRecord,
+    /// Execution-only entry details stay inside the backend. Serializing every entry here would
+    /// make a 100k-file preflight load a full manifest into the desktop webview.
+    #[serde(skip_serializing)]
+    pub entries: Vec<ExportManifestEntryRecord>,
+    pub destination_writable: bool,
+    pub available_bytes: Option<u64>,
+    pub required_bytes: u64,
+    pub reserve_bytes: u64,
+    pub headroom_bytes: Option<u64>,
+    pub available_source_count: u64,
+    pub offline_source_count: u64,
+    pub existing_identical_count: u64,
+    pub collision_count: u64,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl ProductionPreflight {
+    pub fn can_start(&self) -> bool {
+        self.blockers.is_empty()
+    }
+}
+
 pub trait CatalogRepository {
     fn create_project(&self, name: &str) -> Result<Project>;
     fn projects(&self) -> Result<Vec<Project>>;
@@ -1620,6 +1823,124 @@ pub trait CatalogRepository {
     ) -> Result<()>;
     fn reset_studio_personalization(&self, profile_id: &str) -> Result<()>;
     fn recover_interrupted_studio_training(&self) -> Result<u64>;
+    /// Production reads are cheap project-opening projections. They never build a manifest,
+    /// inspect a destination, or start a copy job.
+    fn production_workspace(&self, project_id: &ProjectId) -> Result<ProductionWorkspaceView>;
+    fn create_production_plan(
+        &self,
+        project_id: &ProjectId,
+        input: &ProductionPlanInput,
+    ) -> Result<ProductionPlanRecord>;
+    fn update_production_plan_destination(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+        destination_path: Option<&str>,
+    ) -> Result<ProductionPlanRecord>;
+    fn update_production_plan_destination_reserve(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+        reserve_bytes: u64,
+    ) -> Result<ProductionPlanRecord>;
+    fn update_production_plan_configuration(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+        input: &ProductionPlanInput,
+    ) -> Result<ProductionPlanRecord>;
+    fn production_plan(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+    ) -> Result<Option<ProductionPlanRecord>>;
+    fn set_production_plan_override(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+        media_asset_id: &MediaAssetId,
+        kind: Option<PlanOverrideKind>,
+    ) -> Result<()>;
+    fn create_virtual_collection(
+        &self,
+        project_id: &ProjectId,
+        input: &VirtualCollectionInput,
+    ) -> Result<VirtualCollectionRecord>;
+    fn set_static_virtual_collection_members(
+        &self,
+        project_id: &ProjectId,
+        collection_id: &str,
+        media_asset_ids: &[MediaAssetId],
+    ) -> Result<()>;
+    /// Adds or removes one explicit static member without loading the collection into a desktop
+    /// webview. This preserves the 100k-project memory boundary.
+    fn set_static_virtual_collection_member(
+        &self,
+        project_id: &ProjectId,
+        collection_id: &str,
+        media_asset_id: &MediaAssetId,
+        included: bool,
+    ) -> Result<()>;
+    fn virtual_collection_assets(
+        &self,
+        project_id: &ProjectId,
+        collection_id: &str,
+    ) -> Result<Vec<String>>;
+    /// Bounded only by actual project selection; it returns storage-safe source summaries and no
+    /// absolute paths. Core invokes it only for an explicit Preview/Manifest action.
+    fn production_manifest_build_input(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+    ) -> Result<ProductionManifestBuildInput>;
+    /// Persists a full manifest and every entry in one transaction. Failed creation leaves a
+    /// previous valid manifest active and never creates a partial exportable snapshot.
+    fn create_export_manifest(
+        &self,
+        plan: &ProductionPlanRecord,
+        source_revision: u64,
+        destination_path: &str,
+        validation: &serde_json::Value,
+        entries: &[ManifestEntryDraft],
+        checksum: &str,
+    ) -> Result<ExportManifestRecord>;
+    fn export_manifest(
+        &self,
+        project_id: &ProjectId,
+        manifest_id: &str,
+    ) -> Result<Option<ExportManifestRecord>>;
+    fn export_manifest_entries(
+        &self,
+        project_id: &ProjectId,
+        manifest_id: &str,
+    ) -> Result<Vec<ExportManifestEntryRecord>>;
+    fn export_manifest_execution_entries(
+        &self,
+        project_id: &ProjectId,
+        manifest_id: &str,
+    ) -> Result<Vec<ExportManifestExecutionEntry>>;
+    fn create_export_job(&self, record: &ExportJobRecord, job: &BackgroundJob) -> Result<()>;
+    fn export_job(&self, project_id: &ProjectId, job_id: &str) -> Result<Option<ExportJobRecord>>;
+    fn latest_export_job(
+        &self,
+        project_id: &ProjectId,
+        manifest_id: &str,
+    ) -> Result<Option<ExportJobRecord>>;
+    fn update_export_job_entry(
+        &self,
+        export_job_id: &str,
+        update: &ExportJobEntryUpdate,
+    ) -> Result<()>;
+    fn cancel_pending_export_job_entries(&self, export_job_id: &str, message: &str) -> Result<()>;
+    fn update_export_job(
+        &self,
+        record: &ExportJobRecord,
+        background_job: &BackgroundJob,
+    ) -> Result<()>;
+    /// Persists the same privacy-preserving report emitted to the selected local destination.
+    /// One immutable report is allowed per execution; retries must create a new Export Job.
+    fn store_delivery_report(&self, report: &DeliveryReportRecord) -> Result<()>;
+    fn recover_interrupted_production_exports(&self) -> Result<u64>;
     fn latest_capture_intelligence_job(
         &self,
         project_id: &ProjectId,
@@ -1966,6 +2287,16 @@ impl SqliteRepository {
             self.connection.execute_batch(MIGRATION_018)?;
             self.connection
                 .pragma_update(None, "user_version", 18_i64)?;
+        }
+        if version < 19 {
+            self.connection.execute_batch(MIGRATION_019)?;
+            self.connection
+                .pragma_update(None, "user_version", 19_i64)?;
+        }
+        if version < 20 {
+            self.connection.execute_batch(MIGRATION_020)?;
+            self.connection
+                .pragma_update(None, "user_version", 20_i64)?;
         }
         Ok(())
     }
@@ -6118,6 +6449,994 @@ impl CatalogRepository for SqliteRepository {
         let now = timestamp(&Utc::now());
         let changed = transaction.execute("UPDATE studio_training_runs SET state = 'interrupted', error_message = COALESCE(error_message, 'Studio Brain training was interrupted before activation; any previous personalized model remains active.'), updated_at = ?1, finished_at = ?1 WHERE state IN ('queued', 'training', 'evaluating', 'persisting')", params![now])?;
         transaction.execute("UPDATE background_jobs SET state_json = '\"interrupted\"', stage_json = '\"studio_training\"', error_message = COALESCE(error_message, 'Studio Brain training was interrupted before activation; any previous personalized model remains active.'), updated_at = ?1, finished_at = ?1 WHERE state_json = '\"running\"' AND resume_metadata_json LIKE '%\"pipeline\":\"studio-training\"%'", params![now])?;
+        transaction.commit()?;
+        Ok(changed as u64)
+    }
+
+    fn production_workspace(&self, project_id: &ProjectId) -> Result<ProductionWorkspaceView> {
+        let mut plans_statement = self.connection.prepare(
+            "SELECT id, project_id, name, plan_type, status, selection_rules_json, organization_json, filename_strategy_json, destination_path, destination_reserve_bytes, estimated_file_count, estimated_bytes, current_manifest_id, created_at, updated_at FROM production_plans WHERE project_id = ?1 ORDER BY updated_at DESC, id ASC",
+        )?;
+        let plans = plans_statement
+            .query_map(params![project_id.to_string()], production_plan_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut collections_statement = self.connection.prepare(
+            "SELECT collection.id, collection.project_id, collection.name, collection.kind, collection.rules_json, collection.created_at, collection.updated_at, COUNT(member.media_asset_id) FROM virtual_collections collection LEFT JOIN virtual_collection_members member ON member.virtual_collection_id = collection.id WHERE collection.project_id = ?1 GROUP BY collection.id ORDER BY collection.updated_at DESC, collection.id ASC",
+        )?;
+        let collections = collections_statement
+            .query_map(params![project_id.to_string()], virtual_collection_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut jobs_statement = self.connection.prepare(
+            "SELECT job.id, job.production_plan_id, job.export_manifest_id, job.background_job_id, job.state, job.destination_path, job.items_total, job.items_completed, job.verified_count, job.skipped_identical_count, job.failed_count, job.verified_bytes, job.created_at, job.updated_at, job.finished_at, job.error_message
+             FROM export_jobs job
+             JOIN export_manifests manifest ON manifest.id = job.export_manifest_id
+             WHERE manifest.project_id = ?1
+             ORDER BY job.updated_at DESC, job.id DESC
+             LIMIT 40",
+        )?;
+        let recent_exports = jobs_statement
+            .query_map(params![project_id.to_string()], export_job_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ProductionWorkspaceView {
+            plans,
+            collections,
+            recent_exports,
+        })
+    }
+
+    fn create_production_plan(
+        &self,
+        project_id: &ProjectId,
+        input: &ProductionPlanInput,
+    ) -> Result<ProductionPlanRecord> {
+        let name = valid_production_name(&input.name)?;
+        if self.get_project(project_id)?.is_none() {
+            return Err(PersistenceError::InvalidData(
+                "project does not exist".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let now = timestamp(&Utc::now());
+        let id = Uuid::new_v4().to_string();
+        let reserve = delivery_brain::DEFAULT_DESTINATION_RESERVE_BYTES;
+        transaction.execute(
+            "INSERT INTO production_plans (id, project_id, name, plan_type, status, selection_rules_json, organization_json, filename_strategy_json, destination_path, destination_reserve_bytes, estimated_file_count, estimated_bytes, current_manifest_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'draft', ?5, ?6, ?7, NULL, ?8, 0, 0, NULL, ?9, ?9)",
+            params![id, project_id.to_string(), name, production_plan_type_name(input.plan_type), json(&input.selection_rules)?, json(&input.organization)?, json(&input.filename_strategy)?, reserve as i64, now],
+        )?;
+        let configuration = serde_json::json!({
+            "name": name,
+            "planType": input.plan_type,
+            "selectionRules": input.selection_rules,
+            "organization": input.organization,
+            "filenameStrategy": input.filename_strategy,
+            "destinationReserveBytes": reserve,
+        });
+        transaction.execute(
+            "INSERT INTO production_plan_versions (id, production_plan_id, version, configuration_json, created_at) VALUES (?1, ?2, 1, ?3, ?4)",
+            params![Uuid::new_v4().to_string(), id, json(&configuration)?, now],
+        )?;
+        insert_production_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(&id),
+            None,
+            None,
+            "PRODUCTION_PLAN_CREATED",
+            &serde_json::json!({"planType": input.plan_type}),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.production_plan(project_id, &id)?.ok_or_else(|| {
+            PersistenceError::InvalidData("created Production Plan could not be read".into())
+        })
+    }
+
+    fn update_production_plan_destination(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+        destination_path: Option<&str>,
+    ) -> Result<ProductionPlanRecord> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_production_plan_exists(&transaction, project_id, plan_id)?;
+        let exporting: bool = transaction.query_row(
+            "SELECT status = 'exporting' FROM production_plans WHERE id = ?1 AND project_id = ?2",
+            params![plan_id, project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if exporting {
+            return Err(PersistenceError::InvalidData(
+                "A Production Plan cannot change destination while its frozen manifest is exporting".into(),
+            ));
+        }
+        stale_current_manifest_for_plan(&transaction, project_id, plan_id)?;
+        let now = timestamp(&Utc::now());
+        let changed = transaction.execute(
+            "UPDATE production_plans SET destination_path = ?3, status = 'draft', current_manifest_id = NULL, updated_at = ?4 WHERE id = ?1 AND project_id = ?2",
+            params![plan_id, project_id.to_string(), destination_path.map(str::trim).filter(|value| !value.is_empty()), now],
+        )?;
+        if changed != 1 {
+            return Err(PersistenceError::InvalidData(
+                "Production Plan destination could not be updated".into(),
+            ));
+        }
+        insert_production_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(plan_id),
+            None,
+            None,
+            "PRODUCTION_PLAN_UPDATED",
+            &serde_json::json!({"destinationChanged": true}),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.production_plan(project_id, plan_id)?.ok_or_else(|| {
+            PersistenceError::InvalidData("updated Production Plan could not be read".into())
+        })
+    }
+
+    fn update_production_plan_destination_reserve(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+        reserve_bytes: u64,
+    ) -> Result<ProductionPlanRecord> {
+        if reserve_bytes < delivery_brain::MIN_DESTINATION_RESERVE_BYTES {
+            return Err(PersistenceError::InvalidData(format!(
+                "Production safety reserve must be at least {} MiB",
+                delivery_brain::MIN_DESTINATION_RESERVE_BYTES / (1024 * 1024)
+            )));
+        }
+        if reserve_bytes > i64::MAX as u64 {
+            return Err(PersistenceError::InvalidData(
+                "Production safety reserve exceeds supported local storage accounting".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_production_plan_exists(&transaction, project_id, plan_id)?;
+        let current_plan = transaction.query_row(
+            "SELECT id, project_id, name, plan_type, status, selection_rules_json, organization_json, filename_strategy_json, destination_path, destination_reserve_bytes, estimated_file_count, estimated_bytes, current_manifest_id, created_at, updated_at FROM production_plans WHERE id = ?1 AND project_id = ?2",
+            params![plan_id, project_id.to_string()],
+            production_plan_from_row,
+        )?;
+        if current_plan.status == ProductionPlanStatus::Exporting {
+            return Err(PersistenceError::InvalidData(
+                "A Production Plan cannot change safety reserve while its frozen manifest is exporting".into(),
+            ));
+        }
+        if current_plan.destination_reserve_bytes == reserve_bytes {
+            return Ok(current_plan);
+        }
+        stale_current_manifest_for_plan(&transaction, project_id, plan_id)?;
+        let now = timestamp(&Utc::now());
+        let next_version: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM production_plan_versions WHERE production_plan_id = ?1",
+            params![plan_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE production_plans SET destination_reserve_bytes = ?3, status = 'draft', current_manifest_id = NULL, updated_at = ?4 WHERE id = ?1 AND project_id = ?2",
+            params![plan_id, project_id.to_string(), reserve_bytes as i64, now],
+        )?;
+        let configuration = serde_json::json!({
+            "name": current_plan.name,
+            "planType": current_plan.plan_type,
+            "selectionRules": current_plan.selection_rules,
+            "organization": current_plan.organization,
+            "filenameStrategy": current_plan.filename_strategy,
+            "destinationReserveBytes": reserve_bytes,
+        });
+        transaction.execute(
+            "INSERT INTO production_plan_versions (id, production_plan_id, version, configuration_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![Uuid::new_v4().to_string(), plan_id, next_version, json(&configuration)?, now],
+        )?;
+        insert_production_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(plan_id),
+            None,
+            None,
+            "PRODUCTION_PLAN_UPDATED",
+            &serde_json::json!({"destinationReserveBytes": reserve_bytes}),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.production_plan(project_id, plan_id)?.ok_or_else(|| {
+            PersistenceError::InvalidData("updated Production Plan could not be read".into())
+        })
+    }
+
+    fn update_production_plan_configuration(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+        input: &ProductionPlanInput,
+    ) -> Result<ProductionPlanRecord> {
+        let name = valid_production_name(&input.name)?;
+        let transaction = moment_write_transaction(&self.connection)?;
+        ensure_production_plan_exists(&transaction, project_id, plan_id)?;
+        let exporting: bool = transaction.query_row(
+            "SELECT status = 'exporting' FROM production_plans WHERE id = ?1 AND project_id = ?2",
+            params![plan_id, project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if exporting {
+            return Err(PersistenceError::InvalidData(
+                "A Production Plan cannot change configuration while its frozen manifest is exporting".into(),
+            ));
+        }
+        stale_current_manifest_for_plan(&transaction, project_id, plan_id)?;
+        let now = timestamp(&Utc::now());
+        let next_version: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM production_plan_versions WHERE production_plan_id = ?1",
+            params![plan_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE production_plans SET name = ?3, plan_type = ?4, selection_rules_json = ?5, organization_json = ?6, filename_strategy_json = ?7, status = 'draft', current_manifest_id = NULL, updated_at = ?8 WHERE id = ?1 AND project_id = ?2",
+            params![plan_id, project_id.to_string(), name, production_plan_type_name(input.plan_type), json(&input.selection_rules)?, json(&input.organization)?, json(&input.filename_strategy)?, now],
+        )?;
+        let configuration = serde_json::json!({
+            "name": input.name.trim(),
+            "planType": input.plan_type,
+            "selectionRules": input.selection_rules,
+            "organization": input.organization,
+            "filenameStrategy": input.filename_strategy,
+        });
+        transaction.execute(
+            "INSERT INTO production_plan_versions (id, production_plan_id, version, configuration_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![Uuid::new_v4().to_string(), plan_id, next_version, json(&configuration)?, now],
+        )?;
+        insert_production_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(plan_id),
+            None,
+            None,
+            "PLAN_CONFIGURATION_UPDATED",
+            &serde_json::json!({"version": next_version}),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.production_plan(project_id, plan_id)?.ok_or_else(|| {
+            PersistenceError::InvalidData("updated Production Plan could not be read".into())
+        })
+    }
+
+    fn production_plan(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+    ) -> Result<Option<ProductionPlanRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, project_id, name, plan_type, status, selection_rules_json, organization_json, filename_strategy_json, destination_path, destination_reserve_bytes, estimated_file_count, estimated_bytes, current_manifest_id, created_at, updated_at FROM production_plans WHERE id = ?1 AND project_id = ?2",
+                params![plan_id, project_id.to_string()],
+                production_plan_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn set_production_plan_override(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+        media_asset_id: &MediaAssetId,
+        kind: Option<PlanOverrideKind>,
+    ) -> Result<()> {
+        if !self.media_asset_belongs_to_project(media_asset_id, project_id)? {
+            return Err(PersistenceError::InvalidData(
+                "media asset does not belong to this project".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let now = timestamp(&Utc::now());
+        ensure_production_plan_exists(&transaction, project_id, plan_id)?;
+        let exporting: bool = transaction.query_row(
+            "SELECT status = 'exporting' FROM production_plans WHERE id = ?1 AND project_id = ?2",
+            params![plan_id, project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if exporting {
+            return Err(PersistenceError::InvalidData(
+                "A Production Plan cannot change selection overrides while its frozen manifest is exporting".into(),
+            ));
+        }
+        stale_current_manifest_for_plan(&transaction, project_id, plan_id)?;
+        match kind {
+            Some(kind) => {
+                transaction.execute(
+                    "INSERT INTO production_plan_overrides (production_plan_id, media_asset_id, override_kind, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4) ON CONFLICT(production_plan_id, media_asset_id) DO UPDATE SET override_kind = excluded.override_kind, updated_at = excluded.updated_at",
+                    params![plan_id, media_asset_id.to_string(), plan_override_kind_name(kind), now],
+                )?;
+            }
+            None => {
+                transaction.execute(
+                    "DELETE FROM production_plan_overrides WHERE production_plan_id = ?1 AND media_asset_id = ?2",
+                    params![plan_id, media_asset_id.to_string()],
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE production_plans SET status = 'draft', current_manifest_id = NULL, updated_at = ?3 WHERE id = ?1 AND project_id = ?2",
+            params![plan_id, project_id.to_string(), now],
+        )?;
+        insert_production_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(plan_id),
+            None,
+            None,
+            "PRODUCTION_PLAN_UPDATED",
+            &serde_json::json!({"planOverride": kind}),
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn create_virtual_collection(
+        &self,
+        project_id: &ProjectId,
+        input: &VirtualCollectionInput,
+    ) -> Result<VirtualCollectionRecord> {
+        let name = valid_production_name(&input.name)?;
+        if input.rules.virtual_collection_id.is_some() {
+            return Err(PersistenceError::InvalidData(
+                "a Virtual Collection cannot recursively reference another collection".into(),
+            ));
+        }
+        if self.get_project(project_id)?.is_none() {
+            return Err(PersistenceError::InvalidData(
+                "project does not exist".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let id = Uuid::new_v4().to_string();
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "INSERT INTO virtual_collections (id, project_id, name, kind, rules_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![id, project_id.to_string(), name, virtual_collection_kind_name(input.kind), json(&input.rules)?, now],
+        )?;
+        insert_production_event(
+            &transaction,
+            &project_id.to_string(),
+            None,
+            None,
+            None,
+            "VIRTUAL_COLLECTION_CREATED",
+            &serde_json::json!({"kind": input.kind}),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.connection.query_row(
+            "SELECT collection.id, collection.project_id, collection.name, collection.kind, collection.rules_json, collection.created_at, collection.updated_at, COUNT(member.media_asset_id) FROM virtual_collections collection LEFT JOIN virtual_collection_members member ON member.virtual_collection_id = collection.id WHERE collection.id = ?1 GROUP BY collection.id",
+            params![id], virtual_collection_from_row,
+        ).map_err(Into::into)
+    }
+
+    fn set_static_virtual_collection_members(
+        &self,
+        project_id: &ProjectId,
+        collection_id: &str,
+        media_asset_ids: &[MediaAssetId],
+    ) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let kind: String = transaction
+            .query_row(
+                "SELECT kind FROM virtual_collections WHERE id = ?1 AND project_id = ?2",
+                params![collection_id, project_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                PersistenceError::InvalidData(
+                    "Virtual Collection does not belong to this project".into(),
+                )
+            })?;
+        if kind != "static" {
+            return Err(PersistenceError::InvalidData(
+                "only a static Virtual Collection accepts explicit members".into(),
+            ));
+        }
+        let requested_members = media_asset_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        for asset_id in &requested_members {
+            let belongs: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM media_assets WHERE id = ?1 AND project_id = ?2)",
+                params![asset_id, project_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !belongs {
+                return Err(PersistenceError::InvalidData(
+                    "Virtual Collection member does not belong to this project".into(),
+                ));
+            }
+        }
+        let existing_members = transaction
+            .prepare(
+                "SELECT media_asset_id FROM virtual_collection_members WHERE virtual_collection_id = ?1 ORDER BY media_asset_id ASC",
+            )?
+            .query_map(params![collection_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        if existing_members == requested_members {
+            return Ok(());
+        }
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "DELETE FROM virtual_collection_members WHERE virtual_collection_id = ?1",
+            params![collection_id],
+        )?;
+        for asset_id in &requested_members {
+            transaction.execute(
+                "INSERT INTO virtual_collection_members (virtual_collection_id, media_asset_id, created_at) VALUES (?1, ?2, ?3)",
+                params![collection_id, asset_id, now],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE virtual_collections SET updated_at = ?2 WHERE id = ?1",
+            params![collection_id, now],
+        )?;
+        stale_plans_referencing_collection(&transaction, project_id, collection_id, &now)?;
+        advance_production_selection_revision(&transaction, project_id, &now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn set_static_virtual_collection_member(
+        &self,
+        project_id: &ProjectId,
+        collection_id: &str,
+        media_asset_id: &MediaAssetId,
+        included: bool,
+    ) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let kind: String = transaction
+            .query_row(
+                "SELECT kind FROM virtual_collections WHERE id = ?1 AND project_id = ?2",
+                params![collection_id, project_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                PersistenceError::InvalidData(
+                    "Virtual Collection does not belong to this project".into(),
+                )
+            })?;
+        if kind != "static" {
+            return Err(PersistenceError::InvalidData(
+                "only a static Virtual Collection accepts explicit members".into(),
+            ));
+        }
+        let belongs: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM media_assets WHERE id = ?1 AND project_id = ?2)",
+            params![media_asset_id.to_string(), project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !belongs {
+            return Err(PersistenceError::InvalidData(
+                "Virtual Collection member does not belong to this project".into(),
+            ));
+        }
+        let now = timestamp(&Utc::now());
+        let membership_changed = if included {
+            transaction.execute(
+                "INSERT OR IGNORE INTO virtual_collection_members (virtual_collection_id, media_asset_id, created_at) VALUES (?1, ?2, ?3)",
+                params![collection_id, media_asset_id.to_string(), now],
+            )? > 0
+        } else {
+            transaction.execute(
+                "DELETE FROM virtual_collection_members WHERE virtual_collection_id = ?1 AND media_asset_id = ?2",
+                params![collection_id, media_asset_id.to_string()],
+            )? > 0
+        };
+        if !membership_changed {
+            return Ok(());
+        }
+        transaction.execute(
+            "UPDATE virtual_collections SET updated_at = ?2 WHERE id = ?1",
+            params![collection_id, now],
+        )?;
+        stale_plans_referencing_collection(&transaction, project_id, collection_id, &now)?;
+        advance_production_selection_revision(&transaction, project_id, &now)?;
+        insert_production_event(
+            &transaction,
+            &project_id.to_string(),
+            None,
+            None,
+            None,
+            "VIRTUAL_COLLECTION_MEMBER_UPDATED",
+            &serde_json::json!({"collectionId": collection_id, "included": included}),
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn virtual_collection_assets(
+        &self,
+        project_id: &ProjectId,
+        collection_id: &str,
+    ) -> Result<Vec<String>> {
+        let (kind, rules): (String, String) = self.connection.query_row(
+            "SELECT kind, rules_json FROM virtual_collections WHERE id = ?1 AND project_id = ?2",
+            params![collection_id, project_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if kind == "static" {
+            let mut statement = self.connection.prepare(
+                "SELECT member.media_asset_id FROM virtual_collection_members member JOIN media_assets asset ON asset.id = member.media_asset_id WHERE member.virtual_collection_id = ?1 AND asset.project_id = ?2 ORDER BY member.media_asset_id ASC",
+            )?;
+            return statement
+                .query_map(params![collection_id, project_id.to_string()], |row| {
+                    row.get(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into);
+        }
+        let rules: SelectionRules = from_json(&rules)?;
+        Ok(
+            production_delivery_asset_candidates(&self.connection, project_id)?
+                .into_iter()
+                .filter(|asset| rules.matches(asset))
+                .map(|asset| asset.asset_id)
+                .collect(),
+        )
+    }
+
+    fn production_manifest_build_input(
+        &self,
+        project_id: &ProjectId,
+        plan_id: &str,
+    ) -> Result<ProductionManifestBuildInput> {
+        let plan = self.production_plan(project_id, plan_id)?.ok_or_else(|| {
+            PersistenceError::InvalidData("Production Plan does not belong to this project".into())
+        })?;
+        let mut overrides_statement = self.connection.prepare(
+            "SELECT media_asset_id, override_kind FROM production_plan_overrides WHERE production_plan_id = ?1 ORDER BY media_asset_id ASC",
+        )?;
+        let overrides = overrides_statement
+            .query_map(params![plan_id], |row| {
+                let kind: String = row.get(1)?;
+                let kind = serde_json::from_str(&format!("\"{kind}\"")).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(PlanOverride {
+                    media_asset_id: row.get(0)?,
+                    kind,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut roots_statement = self.connection.prepare(
+            "SELECT instance.id, root.selected_path FROM file_instances instance JOIN media_assets asset ON asset.id = instance.media_asset_id JOIN index_roots root ON root.id = instance.index_root_id WHERE asset.project_id = ?1",
+        )?;
+        let source_roots = roots_statement
+            .query_map(params![project_id.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<std::result::Result<BTreeMap<String, String>, _>>()?;
+        let source_revision = production_source_revision(&self.connection, project_id)?;
+        let virtual_collection_asset_ids = plan
+            .selection_rules
+            .virtual_collection_id
+            .as_deref()
+            .map(|collection_id| self.virtual_collection_assets(project_id, collection_id))
+            .transpose()?;
+        Ok((
+            plan,
+            overrides,
+            production_delivery_asset_candidates(&self.connection, project_id)?,
+            source_roots,
+            source_revision,
+            virtual_collection_asset_ids,
+        ))
+    }
+
+    fn create_export_manifest(
+        &self,
+        plan: &ProductionPlanRecord,
+        source_revision: u64,
+        destination_path: &str,
+        validation: &serde_json::Value,
+        entries: &[ManifestEntryDraft],
+        checksum: &str,
+    ) -> Result<ExportManifestRecord> {
+        if destination_path.trim().is_empty() {
+            return Err(PersistenceError::InvalidData(
+                "a local destination is required before creating an export manifest".into(),
+            ));
+        }
+        if entries.iter().any(|entry| {
+            entry.status != delivery_brain::ManifestEntryStatus::Planned
+                || !delivery_brain::safe_destination_relative_path(&entry.destination_relative_path)
+        }) {
+            return Err(PersistenceError::InvalidData(
+                "a blocked or unsafe dry-run cannot become an export manifest".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let current_revision =
+            production_source_revision_transaction(&transaction, &plan.project_id)?;
+        if current_revision != source_revision {
+            return Err(PersistenceError::InvalidData(
+                "Production selection sources changed while this manifest was being prepared; refresh the plan".into(),
+            ));
+        }
+        ensure_production_plan_exists_by_string(&transaction, &plan.project_id, &plan.id)?;
+        let current_plan = transaction.query_row(
+            "SELECT id, project_id, name, plan_type, status, selection_rules_json, organization_json, filename_strategy_json, destination_path, destination_reserve_bytes, estimated_file_count, estimated_bytes, current_manifest_id, created_at, updated_at FROM production_plans WHERE id = ?1 AND project_id = ?2",
+            params![plan.id, plan.project_id],
+            production_plan_from_row,
+        )?;
+        if current_plan.name != plan.name
+            || current_plan.plan_type != plan.plan_type
+            || current_plan.selection_rules != plan.selection_rules
+            || current_plan.organization != plan.organization
+            || current_plan.filename_strategy != plan.filename_strategy
+            || current_plan.destination_path != plan.destination_path
+            || current_plan.destination_reserve_bytes != plan.destination_reserve_bytes
+        {
+            return Err(PersistenceError::InvalidData(
+                "Production Plan configuration changed while this manifest was being prepared; refresh the plan".into(),
+            ));
+        }
+        let exporting: bool = transaction.query_row(
+            "SELECT status = 'exporting' FROM production_plans WHERE id = ?1 AND project_id = ?2",
+            params![plan.id, plan.project_id],
+            |row| row.get(0),
+        )?;
+        if exporting {
+            return Err(PersistenceError::InvalidData(
+                "A new Export Manifest cannot replace a Production Plan while its prior manifest is exporting".into(),
+            ));
+        }
+        let version: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(manifest_version), 0) + 1 FROM export_manifests WHERE production_plan_id = ?1",
+            params![plan.id],
+            |row| row.get(0),
+        )?;
+        let id = Uuid::new_v4().to_string();
+        let now = timestamp(&Utc::now());
+        let selected_file_count = entries.len() as u64;
+        let estimated_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+            total.checked_add(entry.expected_byte_size).ok_or_else(|| {
+                PersistenceError::InvalidData("manifest estimated bytes overflow".into())
+            })
+        })?;
+        transaction.execute(
+            "UPDATE export_manifests SET status = 'superseded' WHERE production_plan_id = ?1 AND status = 'ready'",
+            params![plan.id],
+        )?;
+        transaction.execute(
+            "INSERT INTO export_manifests (id, production_plan_id, project_id, manifest_version, source_revision, status, selection_snapshot_json, organization_snapshot_json, filename_strategy_snapshot_json, destination_path, selected_file_count, estimated_bytes, checksum, validation_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![id, plan.id, plan.project_id, version, source_revision as i64, json(&plan.selection_rules)?, json(&plan.organization)?, json(&plan.filename_strategy)?, destination_path.trim(), selected_file_count as i64, estimated_bytes as i64, checksum, json(validation)?, now],
+        )?;
+        for (ordinal, entry) in entries.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO export_manifest_entries (id, export_manifest_id, ordinal, media_asset_id, selected_file_instance_id, source_relative_path, original_filename, destination_relative_path, destination_filename, expected_byte_size, source_checksum, human_decision, rating, starred, moment_id, moment_label, status, issue) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                params![Uuid::new_v4().to_string(), id, ordinal as i64, entry.media_asset_id, entry.selected_file_instance_id, entry.source_relative_path, entry.original_filename, entry.destination_relative_path, entry.destination_filename, entry.expected_byte_size as i64, entry.source_checksum, entry.human_decision, entry.rating as i64, entry.starred, entry.moment_id, entry.moment_label, manifest_entry_status_name(entry.status), entry.issue],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE production_plans SET status = 'ready', destination_path = ?3, estimated_file_count = ?4, estimated_bytes = ?5, current_manifest_id = ?6, updated_at = ?7 WHERE id = ?1 AND project_id = ?2",
+            params![plan.id, plan.project_id, destination_path.trim(), selected_file_count as i64, estimated_bytes as i64, id, now],
+        )?;
+        insert_production_event(
+            &transaction,
+            &plan.project_id,
+            Some(&plan.id),
+            Some(&id),
+            None,
+            "MANIFEST_CREATED",
+            &serde_json::json!({"manifestVersion": version, "selectedFileCount": selected_file_count, "estimatedBytes": estimated_bytes}),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.export_manifest(
+            &ProjectId::try_from(plan.project_id.as_str())
+                .map_err(|error| PersistenceError::InvalidData(error.to_string()))?,
+            &id,
+        )?
+        .ok_or_else(|| {
+            PersistenceError::InvalidData("created export manifest could not be read".into())
+        })
+    }
+
+    fn export_manifest(
+        &self,
+        project_id: &ProjectId,
+        manifest_id: &str,
+    ) -> Result<Option<ExportManifestRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, production_plan_id, project_id, manifest_version, source_revision, status, selection_snapshot_json, organization_snapshot_json, filename_strategy_snapshot_json, destination_path, selected_file_count, estimated_bytes, checksum, validation_json, created_at FROM export_manifests WHERE id = ?1 AND project_id = ?2",
+                params![manifest_id, project_id.to_string()],
+                export_manifest_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn export_manifest_entries(
+        &self,
+        project_id: &ProjectId,
+        manifest_id: &str,
+    ) -> Result<Vec<ExportManifestEntryRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT entry.id, entry.export_manifest_id, entry.ordinal, entry.media_asset_id, entry.selected_file_instance_id, entry.original_filename, entry.destination_relative_path, entry.destination_filename, entry.expected_byte_size, entry.source_checksum, entry.human_decision, entry.rating, entry.starred, entry.moment_id, entry.moment_label, entry.status, entry.issue FROM export_manifest_entries entry JOIN export_manifests manifest ON manifest.id = entry.export_manifest_id WHERE entry.export_manifest_id = ?1 AND manifest.project_id = ?2 ORDER BY entry.ordinal ASC",
+        )?;
+        let entries = statement
+            .query_map(
+                params![manifest_id, project_id.to_string()],
+                export_manifest_entry_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(PersistenceError::from)?;
+        Ok(entries)
+    }
+
+    fn export_manifest_execution_entries(
+        &self,
+        project_id: &ProjectId,
+        manifest_id: &str,
+    ) -> Result<Vec<ExportManifestExecutionEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT entry.id, entry.export_manifest_id, entry.ordinal, entry.media_asset_id, entry.selected_file_instance_id, entry.original_filename, entry.destination_relative_path, entry.destination_filename, entry.expected_byte_size, entry.source_checksum, entry.human_decision, entry.rating, entry.starred, entry.moment_id, entry.moment_label, entry.status, entry.issue, root.selected_path, entry.source_relative_path, COALESCE(instance.is_available, 0) FROM export_manifest_entries entry JOIN export_manifests manifest ON manifest.id = entry.export_manifest_id LEFT JOIN file_instances instance ON instance.id = entry.selected_file_instance_id LEFT JOIN index_roots root ON root.id = instance.index_root_id WHERE entry.export_manifest_id = ?1 AND manifest.project_id = ?2 ORDER BY entry.ordinal ASC",
+        )?;
+        let entries = statement
+            .query_map(params![manifest_id, project_id.to_string()], |row| {
+                Ok(ExportManifestExecutionEntry {
+                    entry: export_manifest_entry_from_row(row)?,
+                    source_root_path: row.get(17)?,
+                    source_relative_path: row.get(18)?,
+                    source_available: row.get(19)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(PersistenceError::from)?;
+        Ok(entries)
+    }
+
+    fn create_export_job(&self, record: &ExportJobRecord, job: &BackgroundJob) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM export_jobs WHERE export_manifest_id = ?1 AND state IN ('queued','running','paused'))",
+            params![record.manifest_id],
+            |row| row.get(0),
+        )?;
+        if active {
+            return Err(PersistenceError::InvalidData(
+                "this export manifest already has an active local export".into(),
+            ));
+        }
+        let (manifest_project, manifest_ready, is_current): (String, bool, bool) = transaction.query_row(
+            "SELECT manifest.project_id, manifest.status = 'ready', plan.current_manifest_id = manifest.id
+             FROM export_manifests manifest
+             JOIN production_plans plan ON plan.id = manifest.production_plan_id
+             WHERE manifest.id = ?1 AND manifest.production_plan_id = ?2",
+            params![record.manifest_id, record.plan_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if !manifest_ready || !is_current {
+            return Err(PersistenceError::InvalidData(
+                "This Export Manifest is stale or has been replaced; refresh the Production Plan before exporting".into(),
+            ));
+        }
+        if job.project_id.as_ref().map(ToString::to_string).as_deref()
+            != Some(manifest_project.as_str())
+        {
+            return Err(PersistenceError::InvalidData(
+                "export background job must retain the manifest project identity".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO background_jobs (id, state_json, stage_json, items_completed, items_total, files_discovered, files_processed, error_count, project_id, index_root_id, error_message, resume_metadata_json, created_at, updated_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![job.id.to_string(), json(&job.state)?, json(&job.stage)?, job.items_completed as i64, job.items_total.map(|value| value as i64), job.files_discovered as i64, job.files_processed as i64, job.error_count as i64, job.project_id.as_ref().map(ToString::to_string), job.index_root_id.as_ref().map(ToString::to_string), job.error_message, job.resume_metadata.as_ref().map(serde_json::to_string).transpose()?, timestamp(&job.created_at), timestamp(&job.updated_at), optional_timestamp(&job.finished_at)],
+        )?;
+        transaction.execute(
+            "INSERT INTO export_jobs (id, production_plan_id, export_manifest_id, background_job_id, state, destination_path, items_total, items_completed, verified_count, skipped_identical_count, failed_count, verified_bytes, error_message, created_at, updated_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![record.id, record.plan_id, record.manifest_id, record.background_job_id, record.state, record.destination_path, record.items_total as i64, record.items_completed as i64, record.verified_count as i64, record.skipped_identical_count as i64, record.failed_count as i64, record.verified_bytes as i64, record.error_message, record.created_at, record.updated_at, record.finished_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO export_job_entries (export_job_id, export_manifest_entry_id, state, copied_bytes, updated_at) SELECT ?1, id, CASE WHEN status = 'planned' THEN 'pending' ELSE 'blocked' END, 0, ?2 FROM export_manifest_entries WHERE export_manifest_id = ?3",
+            params![record.id, record.created_at, record.manifest_id],
+        )?;
+        transaction.execute(
+            "UPDATE production_plans SET status = 'exporting', updated_at = ?2 WHERE id = ?1",
+            params![record.plan_id, record.updated_at],
+        )?;
+        insert_production_event(
+            &transaction,
+            &manifest_project,
+            Some(&record.plan_id),
+            Some(&record.manifest_id),
+            Some(&record.id),
+            "EXPORT_STARTED",
+            &serde_json::json!({"itemsTotal": record.items_total}),
+            &record.created_at,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn export_job(&self, project_id: &ProjectId, job_id: &str) -> Result<Option<ExportJobRecord>> {
+        self.connection
+            .query_row(
+                "SELECT job.id, job.production_plan_id, job.export_manifest_id, job.background_job_id, job.state, job.destination_path, job.items_total, job.items_completed, job.verified_count, job.skipped_identical_count, job.failed_count, job.verified_bytes, job.created_at, job.updated_at, job.finished_at, job.error_message FROM export_jobs job JOIN export_manifests manifest ON manifest.id = job.export_manifest_id WHERE job.id = ?1 AND manifest.project_id = ?2",
+                params![job_id, project_id.to_string()],
+                export_job_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn latest_export_job(
+        &self,
+        project_id: &ProjectId,
+        manifest_id: &str,
+    ) -> Result<Option<ExportJobRecord>> {
+        self.connection
+            .query_row(
+                "SELECT job.id, job.production_plan_id, job.export_manifest_id, job.background_job_id, job.state, job.destination_path, job.items_total, job.items_completed, job.verified_count, job.skipped_identical_count, job.failed_count, job.verified_bytes, job.created_at, job.updated_at, job.finished_at, job.error_message FROM export_jobs job JOIN export_manifests manifest ON manifest.id = job.export_manifest_id WHERE job.export_manifest_id = ?1 AND manifest.project_id = ?2 ORDER BY job.updated_at DESC, job.id DESC LIMIT 1",
+                params![manifest_id, project_id.to_string()],
+                export_job_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn update_export_job_entry(
+        &self,
+        export_job_id: &str,
+        update: &ExportJobEntryUpdate,
+    ) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let now = timestamp(&Utc::now());
+        let changed = transaction.execute(
+            "UPDATE export_job_entries SET state = ?3, copied_bytes = ?4, source_checksum = ?5, destination_checksum = ?6, error_message = ?7, updated_at = ?8 WHERE export_job_id = ?1 AND export_manifest_entry_id = ?2",
+            params![export_job_id, update.manifest_entry_id, update.state, update.copied_bytes as i64, update.source_checksum, update.destination_checksum, update.error_message, now],
+        )?;
+        if changed != 1 {
+            return Err(PersistenceError::InvalidData(
+                "export entry does not belong to this Export Job".into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn cancel_pending_export_job_entries(&self, export_job_id: &str, message: &str) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let changed = transaction.execute(
+            "UPDATE export_job_entries SET state = 'cancelled', error_message = ?2, updated_at = ?3 WHERE export_job_id = ?1 AND state IN ('pending', 'copying')",
+            params![export_job_id, message, timestamp(&Utc::now())],
+        )?;
+        if changed == 0 {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM export_jobs WHERE id = ?1)",
+                params![export_job_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(PersistenceError::InvalidData(
+                    "Export Job does not exist".into(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn update_export_job(
+        &self,
+        record: &ExportJobRecord,
+        background_job: &BackgroundJob,
+    ) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let project_id: String = transaction.query_row(
+            "SELECT manifest.project_id FROM export_jobs job JOIN export_manifests manifest ON manifest.id = job.export_manifest_id WHERE job.id = ?1 AND job.production_plan_id = ?2 AND job.export_manifest_id = ?3",
+            params![record.id, record.plan_id, record.manifest_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE export_jobs SET state = ?2, items_total = ?3, items_completed = ?4, verified_count = ?5, skipped_identical_count = ?6, failed_count = ?7, verified_bytes = ?8, error_message = ?9, updated_at = ?10, finished_at = ?11 WHERE id = ?1",
+            params![record.id, record.state, record.items_total as i64, record.items_completed as i64, record.verified_count as i64, record.skipped_identical_count as i64, record.failed_count as i64, record.verified_bytes as i64, record.error_message, record.updated_at, record.finished_at],
+        )?;
+        transaction.execute(
+            "UPDATE background_jobs SET state_json = ?2, stage_json = ?3, items_completed = ?4, items_total = ?5, files_discovered = ?6, files_processed = ?7, error_count = ?8, error_message = ?9, resume_metadata_json = ?10, updated_at = ?11, finished_at = ?12 WHERE id = ?1",
+            params![background_job.id.to_string(), json(&background_job.state)?, json(&background_job.stage)?, background_job.items_completed as i64, background_job.items_total.map(|value| value as i64), background_job.files_discovered as i64, background_job.files_processed as i64, background_job.error_count as i64, background_job.error_message, background_job.resume_metadata.as_ref().map(serde_json::to_string).transpose()?, timestamp(&background_job.updated_at), optional_timestamp(&background_job.finished_at)],
+        )?;
+        let plan_status = match record.state.as_str() {
+            "completed" => "completed",
+            "partially_completed" => "partially_completed",
+            "failed" => "failed",
+            "cancelled" | "interrupted" | "paused" => "ready",
+            _ => "exporting",
+        };
+        transaction.execute(
+            "UPDATE production_plans SET status = ?2, updated_at = ?3 WHERE id = ?1 AND current_manifest_id = ?4",
+            params![record.plan_id, plan_status, record.updated_at, record.manifest_id],
+        )?;
+        if matches!(
+            record.state.as_str(),
+            "completed" | "partially_completed" | "failed" | "cancelled" | "interrupted"
+        ) {
+            let event_type = match record.state.as_str() {
+                "completed" => "EXPORT_COMPLETED",
+                "partially_completed" => "EXPORT_PARTIAL",
+                "cancelled" => "EXPORT_CANCELLED",
+                "interrupted" => "EXPORT_PAUSED",
+                _ => "EXPORT_FAILED",
+            };
+            insert_production_event(
+                &transaction,
+                &project_id,
+                Some(&record.plan_id),
+                Some(&record.manifest_id),
+                Some(&record.id),
+                event_type,
+                &serde_json::json!({"verifiedCount": record.verified_count, "failedCount": record.failed_count}),
+                &record.updated_at,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn store_delivery_report(&self, report: &DeliveryReportRecord) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let manifest_checksum: String = transaction.query_row(
+            "SELECT manifest.checksum
+             FROM export_jobs job
+             JOIN export_manifests manifest ON manifest.id = job.export_manifest_id
+             WHERE job.id = ?1",
+            params![report.export_job_id],
+            |row| row.get(0),
+        )?;
+        if manifest_checksum != report.manifest_checksum {
+            return Err(PersistenceError::InvalidData(
+                "Delivery Report checksum must match the Export Manifest".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO delivery_reports (id, export_job_id, manifest_checksum, report_json, report_text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                report.id,
+                report.export_job_id,
+                report.manifest_checksum,
+                json(&report.report_json)?,
+                report.report_text,
+                report.created_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn recover_interrupted_production_exports(&self) -> Result<u64> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let now = timestamp(&Utc::now());
+        let changed = transaction.execute(
+            "UPDATE export_jobs SET state = 'interrupted', error_message = COALESCE(error_message, 'Local export was interrupted. Previously verified files remain valid; resume to continue.'), updated_at = ?1, finished_at = ?1 WHERE state IN ('queued','running')",
+            params![now],
+        )?;
+        transaction.execute(
+            "UPDATE background_jobs SET state_json = '\"interrupted\"', stage_json = '\"production_export\"', error_message = COALESCE(error_message, 'Local export was interrupted. Previously verified files remain valid; resume to continue.'), updated_at = ?1, finished_at = ?1 WHERE state_json = '\"running\"' AND resume_metadata_json LIKE '%\"pipeline\":\"production-export\"%'",
+            params![now],
+        )?;
+        transaction.execute(
+            "UPDATE production_plans SET status = 'ready', updated_at = ?1 WHERE id IN (SELECT production_plan_id FROM export_jobs WHERE state = 'interrupted') AND status = 'exporting'",
+            params![now],
+        )?;
         transaction.commit()?;
         Ok(changed as u64)
     }
@@ -10907,6 +12226,443 @@ fn face_artifact_payload_string(payload: &str, key: &str) -> Option<String> {
 fn from_json<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
     serde_json::from_str(value).map_err(Into::into)
 }
+
+fn enum_from_text<T: serde::de::DeserializeOwned>(value: &str) -> rusqlite::Result<T> {
+    serde_json::from_value(serde_json::Value::String(value.into())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
+}
+
+fn json_from_row<T: serde::de::DeserializeOwned>(value: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(value).map_err(|error| to_sql_error(error.into()))
+}
+
+fn production_plan_type_name(value: ProductionPlanType) -> &'static str {
+    match value {
+        ProductionPlanType::ClientDelivery => "client_delivery",
+        ProductionPlanType::EditorWorkset => "editor_workset",
+        ProductionPlanType::PortfolioSelects => "portfolio_selects",
+        ProductionPlanType::ProofGallery => "proof_gallery",
+        ProductionPlanType::BackupArchive => "backup_archive",
+        ProductionPlanType::Custom => "custom",
+    }
+}
+
+fn virtual_collection_kind_name(value: VirtualCollectionKind) -> &'static str {
+    match value {
+        VirtualCollectionKind::Static => "static",
+        VirtualCollectionKind::Dynamic => "dynamic",
+    }
+}
+
+fn plan_override_kind_name(value: PlanOverrideKind) -> &'static str {
+    match value {
+        PlanOverrideKind::ForceInclude => "force_include",
+        PlanOverrideKind::ForceExclude => "force_exclude",
+    }
+}
+
+fn manifest_entry_status_name(value: delivery_brain::ManifestEntryStatus) -> &'static str {
+    match value {
+        delivery_brain::ManifestEntryStatus::Planned => "planned",
+        delivery_brain::ManifestEntryStatus::BlockedSourceUnavailable => {
+            "blocked_source_unavailable"
+        }
+        delivery_brain::ManifestEntryStatus::BlockedInternalCollision => {
+            "blocked_internal_collision"
+        }
+    }
+}
+
+fn production_plan_from_row(row: &Row<'_>) -> rusqlite::Result<ProductionPlanRecord> {
+    let plan_type: String = row.get(3)?;
+    let status: String = row.get(4)?;
+    let rules: String = row.get(5)?;
+    let organization: String = row.get(6)?;
+    let filename_strategy: String = row.get(7)?;
+    Ok(ProductionPlanRecord {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        plan_type: enum_from_text(&plan_type)?,
+        status: enum_from_text(&status)?,
+        selection_rules: json_from_row(&rules)?,
+        organization: json_from_row(&organization)?,
+        filename_strategy: json_from_row(&filename_strategy)?,
+        destination_path: row.get(8)?,
+        destination_reserve_bytes: row.get::<_, i64>(9)? as u64,
+        estimated_file_count: row.get::<_, i64>(10)? as u64,
+        estimated_bytes: row.get::<_, i64>(11)? as u64,
+        current_manifest_id: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    })
+}
+
+fn virtual_collection_from_row(row: &Row<'_>) -> rusqlite::Result<VirtualCollectionRecord> {
+    let kind: String = row.get(3)?;
+    let rules: String = row.get(4)?;
+    Ok(VirtualCollectionRecord {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        kind: enum_from_text(&kind)?,
+        rules: json_from_row(&rules)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        asset_count: row.get::<_, i64>(7)? as u64,
+    })
+}
+
+fn export_manifest_from_row(row: &Row<'_>) -> rusqlite::Result<ExportManifestRecord> {
+    let selection_snapshot: String = row.get(6)?;
+    let organization_snapshot: String = row.get(7)?;
+    let filename_strategy_snapshot: String = row.get(8)?;
+    let validation: String = row.get(13)?;
+    Ok(ExportManifestRecord {
+        id: row.get(0)?,
+        plan_id: row.get(1)?,
+        project_id: row.get(2)?,
+        manifest_version: row.get::<_, i64>(3)? as u64,
+        source_revision: row.get::<_, i64>(4)? as u64,
+        status: row.get(5)?,
+        selection_snapshot: json_from_row(&selection_snapshot)?,
+        organization_snapshot: json_from_row(&organization_snapshot)?,
+        filename_strategy_snapshot: json_from_row(&filename_strategy_snapshot)?,
+        destination_path: row.get(9)?,
+        selected_file_count: row.get::<_, i64>(10)? as u64,
+        estimated_bytes: row.get::<_, i64>(11)? as u64,
+        checksum: row.get(12)?,
+        validation: json_from_row(&validation)?,
+        created_at: row.get(14)?,
+    })
+}
+
+fn export_manifest_entry_from_row(row: &Row<'_>) -> rusqlite::Result<ExportManifestEntryRecord> {
+    Ok(ExportManifestEntryRecord {
+        id: row.get(0)?,
+        manifest_id: row.get(1)?,
+        ordinal: row.get::<_, i64>(2)? as u64,
+        media_asset_id: row.get(3)?,
+        selected_file_instance_id: row.get(4)?,
+        original_filename: row.get(5)?,
+        destination_relative_path: row.get(6)?,
+        destination_filename: row.get(7)?,
+        expected_byte_size: row.get::<_, i64>(8)? as u64,
+        source_checksum: row.get(9)?,
+        human_decision: row.get(10)?,
+        rating: row.get::<_, i64>(11)? as u8,
+        starred: row.get(12)?,
+        moment_id: row.get(13)?,
+        moment_label: row.get(14)?,
+        status: row.get(15)?,
+        issue: row.get(16)?,
+    })
+}
+
+fn export_job_from_row(row: &Row<'_>) -> rusqlite::Result<ExportJobRecord> {
+    Ok(ExportJobRecord {
+        id: row.get(0)?,
+        plan_id: row.get(1)?,
+        manifest_id: row.get(2)?,
+        background_job_id: row.get(3)?,
+        state: row.get(4)?,
+        destination_path: row.get(5)?,
+        items_total: row.get::<_, i64>(6)? as u64,
+        items_completed: row.get::<_, i64>(7)? as u64,
+        verified_count: row.get::<_, i64>(8)? as u64,
+        skipped_identical_count: row.get::<_, i64>(9)? as u64,
+        failed_count: row.get::<_, i64>(10)? as u64,
+        verified_bytes: row.get::<_, i64>(11)? as u64,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        finished_at: row.get(14)?,
+        error_message: row.get(15)?,
+    })
+}
+
+fn valid_production_name(value: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err(PersistenceError::InvalidData(
+            "Production Plan and Virtual Collection names cannot be empty".into(),
+        ));
+    }
+    if name.chars().count() > 240 {
+        return Err(PersistenceError::InvalidData(
+            "Production Plan and Virtual Collection names must be 240 characters or fewer".into(),
+        ));
+    }
+    Ok(name.into())
+}
+
+fn ensure_production_plan_exists(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    plan_id: &str,
+) -> Result<()> {
+    ensure_production_plan_exists_by_string(transaction, &project_id.to_string(), plan_id)
+}
+
+fn ensure_production_plan_exists_by_string(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    plan_id: &str,
+) -> Result<()> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM production_plans WHERE id = ?1 AND project_id = ?2)",
+        params![plan_id, project_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(PersistenceError::InvalidData(
+            "Production Plan does not belong to this project".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A frozen manifest records a resolved collection membership snapshot. Changing that collection
+/// must therefore stale—not silently rewrite—any currently referenced plan/manifest.
+fn stale_plans_referencing_collection(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    collection_id: &str,
+    updated_at: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE export_manifests
+         SET status = 'stale'
+         WHERE status = 'ready'
+           AND production_plan_id IN (
+             SELECT id FROM production_plans
+             WHERE project_id = ?1
+               AND json_extract(selection_rules_json, '$.virtualCollectionId') = ?2
+           )",
+        params![project_id.to_string(), collection_id],
+    )?;
+    transaction.execute(
+        "UPDATE production_plans
+         SET status = 'stale', updated_at = ?3
+         WHERE project_id = ?1
+           AND current_manifest_id IS NOT NULL
+           AND json_extract(selection_rules_json, '$.virtualCollectionId') = ?2
+           AND status <> 'exporting'",
+        params![project_id.to_string(), collection_id, updated_at],
+    )?;
+    Ok(())
+}
+
+/// Plan edits replace intent. The prior current manifest remains durable audit history, but it
+/// must be visibly stale and cannot be mistaken for a fresh export candidate.
+fn stale_current_manifest_for_plan(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    plan_id: &str,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE export_manifests
+         SET status = 'stale'
+         WHERE id = (
+           SELECT current_manifest_id FROM production_plans
+           WHERE id = ?1 AND project_id = ?2
+         ) AND status = 'ready'",
+        params![plan_id, project_id.to_string()],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // explicit optional foreign-key provenance mirrors one SQL event row
+fn insert_production_event(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    plan_id: Option<&str>,
+    manifest_id: Option<&str>,
+    export_job_id: Option<&str>,
+    event_type: &str,
+    details: &serde_json::Value,
+    created_at: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO production_events (id, project_id, production_plan_id, export_manifest_id, export_job_id, event_type, details_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![Uuid::new_v4().to_string(), project_id, plan_id, manifest_id, export_job_id, event_type, json(details)?, created_at],
+    )?;
+    Ok(())
+}
+
+fn production_source_revision(connection: &Connection, project_id: &ProjectId) -> Result<u64> {
+    connection
+        .query_row(
+            "SELECT source_revision FROM production_project_revisions WHERE project_id = ?1",
+            params![project_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|value| value as u64)
+        .map_or(Ok(0), Ok)
+}
+
+fn production_source_revision_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+) -> Result<u64> {
+    transaction
+        .query_row(
+            "SELECT source_revision FROM production_project_revisions WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|value| value as u64)
+        .map_or(Ok(0), Ok)
+}
+
+/// Static collection membership is explicit, plan-relevant selection evidence. Advance the
+/// project revision in the same transaction so a dry-run built just before that human action
+/// cannot freeze an obsolete collection snapshot. The existing M9 trigger marks any affected
+/// ready manifests stale before a later export can use them.
+fn advance_production_selection_revision(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    updated_at: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO production_project_revisions (project_id, source_revision, updated_at)
+         VALUES (?1, 1, ?2)
+         ON CONFLICT(project_id) DO UPDATE
+         SET source_revision = source_revision + 1, updated_at = excluded.updated_at",
+        params![project_id.to_string(), updated_at],
+    )?;
+    Ok(())
+}
+
+fn production_delivery_asset_candidates(
+    connection: &Connection,
+    project_id: &ProjectId,
+) -> Result<Vec<DeliveryAssetCandidate>> {
+    #[derive(Default)]
+    struct AssetRow {
+        candidate: Option<DeliveryAssetCandidate>,
+    }
+    let mut statement = connection.prepare(
+        "WITH active_moments AS (
+             SELECT membership.media_asset_id, record.id AS moment_id, record.ordinal, label.label AS human_label, record.suggested_label,
+                    ROW_NUMBER() OVER (PARTITION BY membership.media_asset_id ORDER BY record.ordinal ASC, record.id ASC) AS position
+             FROM moment_memberships membership
+             JOIN moment_records record ON record.id = membership.moment_id AND record.stale = 0
+             LEFT JOIN moment_human_labels label ON label.project_id = record.project_id AND label.anchor_asset_id = record.anchor_asset_id
+             WHERE membership.project_id = ?1 AND membership.active = 1 AND membership.membership_state = 'member'
+           )
+         SELECT asset.id, asset.display_name, NULLIF(asset.extension, ''), COALESCE(asset.byte_size, metadata.byte_size, 0),
+                COALESCE(metadata.captured_at_local, asset.captured_at), metadata.camera_model,
+                decision.decision, COALESCE(decision.rating, 0), COALESCE(decision.starred, 0),
+                moment.moment_id, moment.ordinal, moment.human_label, moment.suggested_label,
+                instance.id, root.id, instance.relative_path,
+                CASE WHEN instance.is_available = 1 AND root.selected_path IS NOT NULL THEN 1 ELSE 0 END,
+                EXISTS(SELECT 1 FROM backup_copies backup WHERE backup.verified_at IS NOT NULL AND (backup.source_file_instance_id = instance.id OR backup.backup_file_instance_id = instance.id)),
+                instance.observed_at, asset.content_hash
+         FROM media_assets asset
+         LEFT JOIN media_metadata metadata ON metadata.media_asset_id = asset.id
+         LEFT JOIN media_decisions decision ON decision.project_id = asset.project_id AND decision.media_asset_id = asset.id
+         LEFT JOIN active_moments moment ON moment.media_asset_id = asset.id AND moment.position = 1
+         LEFT JOIN file_instances instance ON instance.media_asset_id = asset.id
+         LEFT JOIN index_roots root ON root.id = instance.index_root_id
+         WHERE asset.project_id = ?1
+         ORDER BY COALESCE(metadata.captured_at_local, asset.captured_at, asset.observed_modified_at, asset.created_at) ASC, asset.id ASC, instance.id ASC",
+    )?;
+    let mut assets = BTreeMap::<String, AssetRow>::new();
+    for row in statement.query_map(params![project_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, bool>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<String>>(12)?,
+            row.get::<_, Option<String>>(13)?,
+            row.get::<_, Option<String>>(14)?,
+            row.get::<_, Option<String>>(15)?,
+            row.get::<_, bool>(16)?,
+            row.get::<_, bool>(17)?,
+            row.get::<_, Option<String>>(18)?,
+            row.get::<_, Option<String>>(19)?,
+        ))
+    })? {
+        let (
+            asset_id,
+            original_filename,
+            extension,
+            byte_size,
+            captured_at,
+            camera,
+            human_decision,
+            rating,
+            starred,
+            moment_id,
+            moment_ordinal,
+            human_label,
+            suggested_label,
+            instance_id,
+            root_id,
+            relative_path,
+            available,
+            verified,
+            observed_at,
+            content_checksum,
+        ) = row?;
+        let entry = assets.entry(asset_id.clone()).or_default();
+        if entry.candidate.is_none() {
+            entry.candidate = Some(DeliveryAssetCandidate {
+                asset_id,
+                original_filename,
+                extension,
+                byte_size: byte_size as u64,
+                captured_at,
+                camera,
+                human_decision,
+                rating: rating as u8,
+                starred,
+                moment: moment_id.map(|id| delivery_brain::MomentDestination {
+                    id,
+                    ordinal: moment_ordinal.unwrap_or(0) as u64,
+                    human_label,
+                    suggested_label,
+                }),
+                sources: Vec::new(),
+            });
+        }
+        if let (Some(file_instance_id), Some(relative_path), Some(observed_at)) =
+            (instance_id, relative_path, observed_at)
+        {
+            entry
+                .candidate
+                .as_mut()
+                .expect("candidate initialized")
+                .sources
+                .push(DeliverySourceCandidate {
+                    file_instance_id,
+                    source_root_id: root_id,
+                    relative_path,
+                    available,
+                    verified,
+                    observed_at,
+                    byte_size: byte_size as u64,
+                    content_checksum: content_checksum.clone(),
+                });
+        }
+    }
+    Ok(assets
+        .into_values()
+        .filter_map(|row| row.candidate)
+        .collect())
+}
 fn parse_timestamp(value: &str) -> Result<Timestamp> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -12680,6 +14436,239 @@ UPDATE studio_profiles SET source_materialization_pending = 0;
 COMMIT;
 "#;
 
+// M9 keeps the intended plan, its immutable dry-run manifest, and an actual export execution
+// deliberately separate. The local destination path is catalog-private; manifest entries persist
+// only FileInstance identity and a safe relative target, never a source absolute path.
+const MIGRATION_019: &str = r#"
+BEGIN;
+CREATE TABLE production_project_revisions (
+  project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  source_revision INTEGER NOT NULL DEFAULT 0 CHECK (source_revision >= 0),
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE production_plans (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  plan_type TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('draft','ready','exporting','completed','partially_completed','blocked','failed','stale')),
+  selection_rules_json TEXT NOT NULL,
+  organization_json TEXT NOT NULL,
+  filename_strategy_json TEXT NOT NULL,
+  destination_path TEXT,
+  destination_reserve_bytes INTEGER NOT NULL CHECK (destination_reserve_bytes >= 0),
+  estimated_file_count INTEGER NOT NULL DEFAULT 0 CHECK (estimated_file_count >= 0),
+  estimated_bytes INTEGER NOT NULL DEFAULT 0 CHECK (estimated_bytes >= 0),
+  current_manifest_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE production_plan_versions (
+  id TEXT PRIMARY KEY,
+  production_plan_id TEXT NOT NULL REFERENCES production_plans(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL CHECK (version > 0),
+  configuration_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(production_plan_id, version)
+);
+CREATE TABLE virtual_collections (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('static','dynamic')),
+  rules_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(project_id, name)
+);
+CREATE TABLE virtual_collection_members (
+  virtual_collection_id TEXT NOT NULL REFERENCES virtual_collections(id) ON DELETE CASCADE,
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(virtual_collection_id, media_asset_id)
+);
+CREATE TABLE production_plan_overrides (
+  production_plan_id TEXT NOT NULL REFERENCES production_plans(id) ON DELETE CASCADE,
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+  override_kind TEXT NOT NULL CHECK (override_kind IN ('force_include','force_exclude')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(production_plan_id, media_asset_id)
+);
+CREATE TABLE export_manifests (
+  id TEXT PRIMARY KEY,
+  production_plan_id TEXT NOT NULL REFERENCES production_plans(id) ON DELETE RESTRICT,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+  manifest_version INTEGER NOT NULL CHECK (manifest_version > 0),
+  source_revision INTEGER NOT NULL CHECK (source_revision >= 0),
+  status TEXT NOT NULL CHECK (status IN ('ready','stale','blocked','superseded')),
+  selection_snapshot_json TEXT NOT NULL,
+  organization_snapshot_json TEXT NOT NULL,
+  filename_strategy_snapshot_json TEXT NOT NULL,
+  destination_path TEXT NOT NULL,
+  selected_file_count INTEGER NOT NULL CHECK (selected_file_count >= 0),
+  estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
+  checksum TEXT NOT NULL,
+  validation_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(production_plan_id, manifest_version)
+);
+CREATE TABLE export_manifest_entries (
+  id TEXT PRIMARY KEY,
+  export_manifest_id TEXT NOT NULL REFERENCES export_manifests(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE RESTRICT,
+  selected_file_instance_id TEXT REFERENCES file_instances(id) ON DELETE RESTRICT,
+  source_relative_path TEXT,
+  original_filename TEXT NOT NULL,
+  destination_relative_path TEXT NOT NULL,
+  destination_filename TEXT NOT NULL,
+  expected_byte_size INTEGER NOT NULL CHECK (expected_byte_size >= 0),
+  source_checksum TEXT,
+  human_decision TEXT,
+  rating INTEGER NOT NULL CHECK (rating >= 0 AND rating <= 5),
+  starred INTEGER NOT NULL CHECK (starred IN (0, 1)),
+  moment_id TEXT,
+  moment_label TEXT,
+  status TEXT NOT NULL CHECK (status IN ('planned','blocked_source_unavailable','blocked_internal_collision')),
+  issue TEXT,
+  UNIQUE(export_manifest_id, ordinal),
+  UNIQUE(export_manifest_id, destination_relative_path)
+);
+CREATE TABLE export_jobs (
+  id TEXT PRIMARY KEY,
+  production_plan_id TEXT NOT NULL REFERENCES production_plans(id) ON DELETE RESTRICT,
+  export_manifest_id TEXT NOT NULL REFERENCES export_manifests(id) ON DELETE RESTRICT,
+  background_job_id TEXT NOT NULL REFERENCES background_jobs(id) ON DELETE RESTRICT,
+  state TEXT NOT NULL CHECK (state IN ('queued','running','paused','interrupted','completed','partially_completed','failed','cancelled')),
+  destination_path TEXT NOT NULL,
+  items_total INTEGER NOT NULL CHECK (items_total >= 0),
+  items_completed INTEGER NOT NULL DEFAULT 0 CHECK (items_completed >= 0),
+  verified_count INTEGER NOT NULL DEFAULT 0 CHECK (verified_count >= 0),
+  skipped_identical_count INTEGER NOT NULL DEFAULT 0 CHECK (skipped_identical_count >= 0),
+  failed_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+  verified_bytes INTEGER NOT NULL DEFAULT 0 CHECK (verified_bytes >= 0),
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  finished_at TEXT,
+  UNIQUE(background_job_id)
+);
+CREATE UNIQUE INDEX idx_export_jobs_active_manifest
+  ON export_jobs(export_manifest_id)
+  WHERE state IN ('queued','running','paused');
+CREATE TABLE export_job_entries (
+  export_job_id TEXT NOT NULL REFERENCES export_jobs(id) ON DELETE CASCADE,
+  export_manifest_entry_id TEXT NOT NULL REFERENCES export_manifest_entries(id) ON DELETE RESTRICT,
+  state TEXT NOT NULL CHECK (state IN ('pending','copying','copied','verifying','verified','skipped_identical','blocked','failed','cancelled')),
+  copied_bytes INTEGER NOT NULL DEFAULT 0 CHECK (copied_bytes >= 0),
+  source_checksum TEXT,
+  destination_checksum TEXT,
+  error_message TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(export_job_id, export_manifest_entry_id)
+);
+CREATE TABLE delivery_reports (
+  id TEXT PRIMARY KEY,
+  export_job_id TEXT NOT NULL REFERENCES export_jobs(id) ON DELETE CASCADE,
+  manifest_checksum TEXT NOT NULL,
+  report_json TEXT NOT NULL,
+  report_text TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(export_job_id)
+);
+CREATE TABLE production_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  production_plan_id TEXT REFERENCES production_plans(id) ON DELETE SET NULL,
+  export_manifest_id TEXT REFERENCES export_manifests(id) ON DELETE SET NULL,
+  export_job_id TEXT REFERENCES export_jobs(id) ON DELETE SET NULL,
+  event_type TEXT NOT NULL,
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_production_plans_project ON production_plans(project_id, updated_at DESC);
+CREATE INDEX idx_collection_project ON virtual_collections(project_id, updated_at DESC);
+CREATE INDEX idx_manifest_project_plan ON export_manifests(project_id, production_plan_id, created_at DESC);
+CREATE INDEX idx_manifest_entries_manifest ON export_manifest_entries(export_manifest_id, ordinal);
+CREATE INDEX idx_export_jobs_project ON export_jobs(production_plan_id, updated_at DESC);
+CREATE INDEX idx_export_job_entries_state ON export_job_entries(export_job_id, state);
+CREATE INDEX idx_production_events_project ON production_events(project_id, created_at DESC);
+CREATE TRIGGER production_project_revision_from_decision
+AFTER INSERT ON decision_history
+BEGIN
+  INSERT INTO production_project_revisions (project_id, source_revision, updated_at)
+  VALUES (NEW.project_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  ON CONFLICT(project_id) DO UPDATE SET source_revision = source_revision + 1, updated_at = excluded.updated_at;
+END;
+CREATE TRIGGER production_project_revision_from_moment
+AFTER INSERT ON moment_events
+BEGIN
+  INSERT INTO production_project_revisions (project_id, source_revision, updated_at)
+  VALUES (NEW.project_id, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  ON CONFLICT(project_id) DO UPDATE SET source_revision = source_revision + 1, updated_at = excluded.updated_at;
+END;
+CREATE TRIGGER production_stale_plans_after_source_change
+AFTER UPDATE OF source_revision ON production_project_revisions
+BEGIN
+  UPDATE production_plans
+  SET status = 'stale', updated_at = NEW.updated_at
+  WHERE project_id = NEW.project_id
+    AND current_manifest_id IS NOT NULL
+    AND status <> 'exporting';
+  UPDATE export_manifests
+  SET status = 'stale'
+  WHERE project_id = NEW.project_id
+    AND source_revision < NEW.source_revision
+    AND status = 'ready';
+END;
+COMMIT;
+"#;
+
+/// M9 follow-up: a first human authority event creates, rather than updates, the project
+/// revision row. Preserve migration 019 for already-created M9 catalogs and make that path
+/// stale historical revision-zero manifests safely.
+const MIGRATION_020: &str = r#"
+BEGIN;
+UPDATE production_plans
+SET status = 'stale', updated_at = COALESCE(
+  (SELECT revision.updated_at FROM production_project_revisions revision WHERE revision.project_id = production_plans.project_id),
+  updated_at
+)
+WHERE current_manifest_id IN (
+  SELECT manifest.id
+  FROM export_manifests manifest
+  JOIN production_project_revisions revision ON revision.project_id = manifest.project_id
+  WHERE manifest.production_plan_id = production_plans.id
+    AND manifest.source_revision < revision.source_revision
+)
+  AND status <> 'exporting';
+UPDATE export_manifests
+SET status = 'stale'
+WHERE status = 'ready'
+  AND EXISTS (
+    SELECT 1 FROM production_project_revisions revision
+    WHERE revision.project_id = export_manifests.project_id
+      AND export_manifests.source_revision < revision.source_revision
+  );
+CREATE TRIGGER production_stale_plans_after_initial_source_change
+AFTER INSERT ON production_project_revisions
+WHEN NEW.source_revision > 0
+BEGIN
+  UPDATE production_plans
+  SET status = 'stale', updated_at = NEW.updated_at
+  WHERE project_id = NEW.project_id
+    AND current_manifest_id IS NOT NULL
+    AND status <> 'exporting';
+  UPDATE export_manifests
+  SET status = 'stale'
+  WHERE project_id = NEW.project_id
+    AND source_revision < NEW.source_revision
+    AND status = 'ready';
+END;
+COMMIT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12901,6 +14890,464 @@ mod tests {
         let repository = SqliteRepository::open_in_memory().unwrap();
         repository.migrate().unwrap();
         assert_eq!(repository.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn production_manifest_refuses_a_snapshot_when_a_human_decision_arrives_concurrently() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        let volume = volume();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume).unwrap();
+        let asset = culling_asset(&repository, &project.id, 8_001);
+        repository
+            .update_culling_decision(
+                &project.id,
+                &asset.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        let plan = repository
+            .create_production_plan(
+                &project.id,
+                &ProductionPlanInput {
+                    name: "Concurrent client delivery".into(),
+                    plan_type: ProductionPlanType::ClientDelivery,
+                    selection_rules: SelectionRules::client_delivery(),
+                    organization: OrganizationStrategy::SingleFolder,
+                    filename_strategy: FilenameStrategy::PreserveOriginal,
+                },
+            )
+            .unwrap();
+        let (_, _, _, _, revision_before_human_change, _) = repository
+            .production_manifest_build_input(&project.id, &plan.id)
+            .unwrap();
+        repository
+            .update_culling_decision(
+                &project.id,
+                &asset.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Review),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        let error = repository
+            .create_export_manifest(
+                &plan,
+                revision_before_human_change,
+                "/fixture/destination",
+                &serde_json::json!({}),
+                &[],
+                "fixture-checksum",
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed while this manifest was being prepared"));
+        assert_eq!(
+            repository.production_workspace(&project.id).unwrap().plans[0].status,
+            ProductionPlanStatus::Draft
+        );
+        let decision = repository.culling_progress(&project.id).unwrap();
+        assert_eq!(
+            decision.review, 1,
+            "the newer explicit human decision remains authoritative"
+        );
+    }
+
+    #[test]
+    fn production_manifest_refuses_a_snapshot_when_plan_configuration_changes_concurrently() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        let plan = repository
+            .create_production_plan(
+                &project.id,
+                &ProductionPlanInput {
+                    name: "Configuration race".into(),
+                    plan_type: ProductionPlanType::ClientDelivery,
+                    selection_rules: SelectionRules::client_delivery(),
+                    organization: OrganizationStrategy::SingleFolder,
+                    filename_strategy: FilenameStrategy::PreserveOriginal,
+                },
+            )
+            .unwrap();
+        let (_, _, _, _, revision, _) = repository
+            .production_manifest_build_input(&project.id, &plan.id)
+            .unwrap();
+        repository
+            .update_production_plan_configuration(
+                &project.id,
+                &plan.id,
+                &ProductionPlanInput {
+                    name: "Configuration race".into(),
+                    plan_type: ProductionPlanType::EditorWorkset,
+                    selection_rules: SelectionRules::editor_workset(),
+                    organization: OrganizationStrategy::SingleFolder,
+                    filename_strategy: FilenameStrategy::PreserveOriginal,
+                },
+            )
+            .unwrap();
+
+        let error = repository
+            .create_export_manifest(
+                &plan,
+                revision,
+                "/fixture/destination",
+                &serde_json::json!({}),
+                &[],
+                "fixture-checksum",
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("configuration changed while this manifest was being prepared"));
+        let current = repository
+            .production_plan(&project.id, &plan.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.plan_type, ProductionPlanType::EditorWorkset);
+        assert_eq!(current.selection_rules, SelectionRules::editor_workset());
+        assert!(current.current_manifest_id.is_none());
+    }
+
+    #[test]
+    fn first_human_source_event_after_a_revision_zero_manifest_marks_it_stale() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let asset = culling_asset(&repository, &project.id, 8_050);
+        let plan = repository
+            .create_production_plan(
+                &project.id,
+                &ProductionPlanInput {
+                    name: "Revision zero client delivery".into(),
+                    plan_type: ProductionPlanType::ClientDelivery,
+                    selection_rules: SelectionRules::client_delivery(),
+                    organization: OrganizationStrategy::SingleFolder,
+                    filename_strategy: FilenameStrategy::PreserveOriginal,
+                },
+            )
+            .unwrap();
+        let manifest = repository
+            .create_export_manifest(
+                &plan,
+                0,
+                "/fixture/destination",
+                &serde_json::json!({}),
+                &[],
+                "revision-zero-checksum",
+            )
+            .unwrap();
+        repository
+            .update_culling_decision(
+                &project.id,
+                &asset.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            repository.production_workspace(&project.id).unwrap().plans[0].status,
+            ProductionPlanStatus::Stale
+        );
+        assert_eq!(
+            repository
+                .export_manifest(&project.id, &manifest.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "stale"
+        );
+    }
+
+    #[test]
+    fn plan_edit_marks_its_prior_current_manifest_stale_before_replacing_intent() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        let plan = repository
+            .create_production_plan(
+                &project.id,
+                &ProductionPlanInput {
+                    name: "Mutable delivery plan".into(),
+                    plan_type: ProductionPlanType::ClientDelivery,
+                    selection_rules: SelectionRules::client_delivery(),
+                    organization: OrganizationStrategy::SingleFolder,
+                    filename_strategy: FilenameStrategy::PreserveOriginal,
+                },
+            )
+            .unwrap();
+        let manifest = repository
+            .create_export_manifest(
+                &plan,
+                0,
+                "/fixture/destination",
+                &serde_json::json!({}),
+                &[],
+                "prior-manifest-checksum",
+            )
+            .unwrap();
+        let updated = repository
+            .update_production_plan_destination(
+                &project.id,
+                &plan.id,
+                Some("/fixture/new-destination"),
+            )
+            .unwrap();
+        assert_eq!(updated.status, ProductionPlanStatus::Draft);
+        assert_eq!(updated.current_manifest_id, None);
+        assert_eq!(
+            repository
+                .export_manifest(&project.id, &manifest.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "stale"
+        );
+    }
+
+    #[test]
+    fn plan_safety_reserve_is_configurable_and_stales_the_prior_manifest() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        let plan = repository
+            .create_production_plan(
+                &project.id,
+                &ProductionPlanInput {
+                    name: "Reserve-aware delivery".into(),
+                    plan_type: ProductionPlanType::ClientDelivery,
+                    selection_rules: SelectionRules::client_delivery(),
+                    organization: OrganizationStrategy::SingleFolder,
+                    filename_strategy: FilenameStrategy::PreserveOriginal,
+                },
+            )
+            .unwrap();
+        let manifest = repository
+            .create_export_manifest(
+                &plan,
+                0,
+                "/fixture/destination",
+                &serde_json::json!({}),
+                &[],
+                "reserve-checksum",
+            )
+            .unwrap();
+        let reserve = delivery_brain::MIN_DESTINATION_RESERVE_BYTES * 2;
+        let updated = repository
+            .update_production_plan_destination_reserve(&project.id, &plan.id, reserve)
+            .unwrap();
+        assert_eq!(updated.destination_reserve_bytes, reserve);
+        assert_eq!(updated.status, ProductionPlanStatus::Draft);
+        assert!(updated.current_manifest_id.is_none());
+        assert_eq!(
+            repository
+                .export_manifest(&project.id, &manifest.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "stale"
+        );
+        assert!(repository
+            .update_production_plan_destination_reserve(
+                &project.id,
+                &plan.id,
+                delivery_brain::MIN_DESTINATION_RESERVE_BYTES - 1,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn virtual_collections_and_plan_overrides_are_scoped_references_not_culling_mutations() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let first = culling_asset(&repository, &project.id, 8_101);
+        let second = culling_asset(&repository, &project.id, 8_102);
+        repository
+            .update_culling_decision(
+                &project.id,
+                &first.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: Some(5),
+                    starred: Some(true),
+                    note: Some("Must remain private".into()),
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        let static_collection = repository
+            .create_virtual_collection(
+                &project.id,
+                &VirtualCollectionInput {
+                    name: "Manual client choices".into(),
+                    kind: VirtualCollectionKind::Static,
+                    rules: SelectionRules::default(),
+                },
+            )
+            .unwrap();
+        repository
+            .set_static_virtual_collection_members(
+                &project.id,
+                &static_collection.id,
+                std::slice::from_ref(&second.id),
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .virtual_collection_assets(&project.id, &static_collection.id)
+                .unwrap(),
+            vec![second.id.to_string()]
+        );
+        repository
+            .set_static_virtual_collection_member(
+                &project.id,
+                &static_collection.id,
+                &first.id,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .virtual_collection_assets(&project.id, &static_collection.id)
+                .unwrap(),
+            vec![first.id.to_string(), second.id.to_string()]
+        );
+        repository
+            .set_static_virtual_collection_member(
+                &project.id,
+                &static_collection.id,
+                &first.id,
+                false,
+            )
+            .unwrap();
+        let dynamic_collection = repository
+            .create_virtual_collection(
+                &project.id,
+                &VirtualCollectionInput {
+                    name: "Human keeps".into(),
+                    kind: VirtualCollectionKind::Dynamic,
+                    rules: SelectionRules::client_delivery(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .virtual_collection_assets(&project.id, &dynamic_collection.id)
+                .unwrap(),
+            vec![first.id.to_string()]
+        );
+        let plan = repository
+            .create_production_plan(
+                &project.id,
+                &ProductionPlanInput {
+                    name: "Client plan".into(),
+                    plan_type: ProductionPlanType::ClientDelivery,
+                    selection_rules: SelectionRules {
+                        virtual_collection_id: Some(static_collection.id.clone()),
+                        ..SelectionRules::client_delivery()
+                    },
+                    organization: OrganizationStrategy::SingleFolder,
+                    filename_strategy: FilenameStrategy::PreserveOriginal,
+                },
+            )
+            .unwrap();
+        repository
+            .set_production_plan_override(
+                &project.id,
+                &plan.id,
+                &first.id,
+                Some(PlanOverrideKind::ForceExclude),
+            )
+            .unwrap();
+        let (_, overrides, _, _, _, collection_asset_ids) = repository
+            .production_manifest_build_input(&project.id, &plan.id)
+            .unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].kind, PlanOverrideKind::ForceExclude);
+        assert_eq!(collection_asset_ids, Some(vec![second.id.to_string()]));
+        let (_, _, _, _, source_revision, _) = repository
+            .production_manifest_build_input(&project.id, &plan.id)
+            .unwrap();
+        let manifest = repository
+            .create_export_manifest(
+                &plan,
+                source_revision,
+                "/fixture/destination",
+                &serde_json::json!({}),
+                &[],
+                "collection-staleness-checksum",
+            )
+            .unwrap();
+        repository
+            .set_static_virtual_collection_member(
+                &project.id,
+                &static_collection.id,
+                &second.id,
+                false,
+            )
+            .unwrap();
+        let error = repository
+            .create_export_manifest(
+                &plan,
+                source_revision,
+                "/fixture/destination",
+                &serde_json::json!({}),
+                &[],
+                "stale-collection-snapshot",
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(
+            "Production selection sources changed while this manifest was being prepared"
+        ));
+        assert_eq!(
+            repository.production_workspace(&project.id).unwrap().plans[0].status,
+            ProductionPlanStatus::Stale
+        );
+        assert_eq!(
+            repository
+                .export_manifest(&project.id, &manifest.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "stale"
+        );
+        let current = repository.culling_progress(&project.id).unwrap();
+        assert_eq!(current.keep, 1);
+        assert_eq!(current.review, 0);
+        let current_decision: String = repository.connection.query_row(
+            "SELECT decision FROM media_decisions WHERE project_id = ?1 AND media_asset_id = ?2",
+            params![project.id.to_string(), first.id.to_string()],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(current_decision, "keep");
     }
 
     #[test]

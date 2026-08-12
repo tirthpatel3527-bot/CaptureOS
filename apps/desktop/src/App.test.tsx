@@ -1008,6 +1008,81 @@ describe("CaptureOS application shell and local media engine", () => {
     expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "start_studio_brain_training_command")).toHaveLength(0);
   });
 
+  it("keeps Production dry-run and verified export explicit, human-rule based, and non-blocking", async () => {
+    const plan = {
+      id: "plan-1", projectId: "project-1", name: "Client Delivery", planType: "client_delivery", status: "draft",
+      selectionRules: { decisions: ["keep"], minimumRating: null, starredOnly: false, momentIds: [], staticAssetIds: [], virtualCollectionId: null },
+      organization: "by_moment", filenameStrategy: { kind: "preserve_original" }, destinationPath: "/Volumes/Delivery",
+      destinationReserveBytes: 1024, estimatedFileCount: 0, estimatedBytes: 0, currentManifestId: null,
+      createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
+    };
+    const preview = {
+      plan, destinationPath: "/Volumes/Delivery", destinationWritable: true, availableBytes: 1_000_000,
+      requiredBytes: 2_048, reserveBytes: 1_024, headroomBytes: 999_000, availableSourceCount: 2,
+      offlineSourceCount: 0, existingIdenticalCount: 0, collisionCount: 0, blockers: [], warnings: [],
+      namingExamples: [{ originalFilename: "IMG_0001.JPG", destinationRelativePath: "01_Portraits/IMG_0001.JPG" }],
+      inspection: { includedCount: 2, excludedCount: 1, blockedCount: 0, remainingCount: 0, items: [{ assetId: "asset-1", originalFilename: "IMG_0001.JPG", humanDecision: "keep", state: "included", destinationRelativePath: "01_Portraits/IMG_0001.JPG", reason: null, planOverride: null }] },
+      manifestSummary: { selectedFileCount: 2, estimatedBytes: 2_048, checksum: "a".repeat(64), blockingIssueCount: 0, warningIssueCount: 0 },
+    };
+    const manifest = {
+      id: "manifest-1", planId: "plan-1", projectId: "project-1", manifestVersion: 1, sourceRevision: 4,
+      status: "ready", destinationPath: "/Volumes/Delivery", selectedFileCount: 2, estimatedBytes: 2_048,
+      checksum: "a".repeat(64), createdAt: "2026-01-01T00:00:00Z",
+    };
+    setCommandOverrides({
+      production_workspace_command: { plans: [plan], collections: [], recentExports: [] },
+      moment_timeline: momentTimeline,
+      update_production_plan_configuration_command: { id: "plan-1" },
+      set_production_plan_destination_reserve_command: { id: "plan-1" },
+      production_plan_preview_command: preview,
+      create_production_manifest_command: manifest,
+      production_manifest_preflight_command: {
+        manifest, destinationWritable: true, availableBytes: 1_000_000, requiredBytes: 2_048,
+        reserveBytes: 1_024, headroomBytes: 999_000, availableSourceCount: 2, offlineSourceCount: 0,
+        existingIdenticalCount: 0, collisionCount: 0, blockers: [], warnings: [],
+      },
+      start_production_export_command: {
+        exportJobId: "", manifestId: "manifest-1", state: "queued", stage: "queued", itemsCompleted: 0,
+        itemsTotal: 2, verifiedCount: 0, skippedIdenticalCount: 0, failedCount: 0, verifiedBytes: 0,
+        currentFilename: null, message: "Verified local export is queued and will not block project browsing.",
+      },
+    });
+    await renderProject();
+    fireEvent.click(screen.getByRole("button", { name: "Production" }));
+    expect(await screen.findByRole("heading", { name: "Production plans" })).toBeTruthy();
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "start_production_export_command")).toHaveLength(0);
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "production_plan_preview_command")).toHaveLength(0);
+    expect(screen.getByText(/Studio Brain remains advisory/)).toBeTruthy();
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "moment_timeline")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Choose Moments" }));
+    fireEvent.click(await screen.findByRole("checkbox", { name: /01 · Outdoor portraits \(2 files\)/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Save plan settings" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("update_production_plan_configuration_command", expect.objectContaining({
+      projectId: "project-1",
+      planId: "plan-1",
+      input: expect.objectContaining({
+        selectionRules: expect.objectContaining({ momentIds: ["moment-1"] }),
+      }),
+    })));
+    fireEvent.change(screen.getByLabelText("Production safety reserve in GiB"), {
+      target: { value: "2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save reserve" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("set_production_plan_destination_reserve_command", {
+      projectId: "project-1",
+      planId: "plan-1",
+      reserveBytes: 2 * 1024 * 1024 * 1024,
+    }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview dry run" }));
+    await screen.findByText(/Dry run is ready/);
+    fireEvent.click(screen.getByRole("button", { name: "Freeze manifest" }));
+    await screen.findByText(/Immutable manifest saved/);
+    fireEvent.click(screen.getByRole("button", { name: "Start verified export" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("start_production_export_command", {
+      projectId: "project-1", manifestId: "manifest-1",
+    }));
+  });
+
   it("queues one explicit Studio Brain train action and never turns it into a culling decision", async () => {
     setCommandOverrides({
       start_studio_brain_training_command: {

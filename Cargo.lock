@@ -303,6 +303,7 @@ dependencies = [
  "capture-graph",
  "capture-intelligence",
  "chrono",
+ "delivery-brain",
  "ingest",
  "magic-search",
  "media-index",
@@ -363,6 +364,7 @@ name = "captureos-desktop"
 version = "0.1.0"
 dependencies = [
  "capture-core",
+ "delivery-brain",
  "ingest",
  "media-model",
  "media-visual",
@@ -727,6 +729,27 @@ dependencies = [
  "libc",
  "libdbus-sys",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "delivery-brain"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "delivery-brain-bench"
+version = "0.1.0"
+dependencies = [
+ "delivery-brain",
+ "ingest",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2835,6 +2858,7 @@ dependencies = [
  "blake3",
  "capture-graph",
  "chrono",
+ "delivery-brain",
  "media-model",
  "rusqlite",
  "serde",

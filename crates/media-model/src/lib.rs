@@ -98,6 +98,11 @@ id_type!(StudioTrainingExampleId, "studio training example");
 id_type!(StudioTrainingRunId, "studio training run");
 id_type!(StudioModelId, "studio model");
 id_type!(StudioRecommendationId, "studio recommendation");
+id_type!(ProductionPlanId, "production plan");
+id_type!(VirtualCollectionId, "virtual collection");
+id_type!(ExportManifestId, "export manifest");
+id_type!(ExportJobId, "export job");
+id_type!(DeliveryReportId, "delivery report");
 
 pub type Timestamp = DateTime<Utc>;
 
@@ -857,6 +862,10 @@ pub enum JobStage {
     StudioTraining,
     /// Validation and safe activation of a candidate Studio Brain artifact.
     StudioEvaluation,
+    /// Deterministic local Production Plan dry-run and immutable manifest construction.
+    ProductionPlanning,
+    /// Streaming local-folder copy and strong destination verification for an Export Job.
+    ProductionExport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

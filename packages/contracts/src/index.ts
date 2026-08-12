@@ -1,10 +1,5 @@
 export type MediaFilter =
-  | "all"
-  | "photos"
-  | "video"
-  | "audio"
-  | "sidecars"
-  | "unknown";
+  "all" | "photos" | "video" | "audio" | "sidecars" | "unknown";
 
 export interface ProjectView {
   id: string;
@@ -19,7 +14,11 @@ export interface ProjectLibraryItem {
   lastActivityAt: string;
   mediaAssetCount: number;
   storageVolumeCount: number;
-  protectionState: "verified_copy_history" | "ingest_history_recorded" | "not_recorded" | string;
+  protectionState:
+    | "verified_copy_history"
+    | "ingest_history_recorded"
+    | "not_recorded"
+    | string;
 }
 
 export interface IndexRootView {
@@ -98,11 +97,7 @@ export type VisualMediaFilter =
   | "blurReview";
 
 export type VisualMediaSort =
-  | "captureTime"
-  | "filename"
-  | "fileSize"
-  | "dateIndexed"
-  | "mediaType";
+  "captureTime" | "filename" | "fileSize" | "dateIndexed" | "mediaType";
 
 export interface VisualMediaQuery {
   filter: VisualMediaFilter;
@@ -137,7 +132,17 @@ export interface VisualMediaRow {
   thumbnailPreviewUrl: string | null;
   mediumPreviewUrl: string | null;
   previewPreviewUrl: string | null;
-  previewStatus: "pending" | "ready" | "unsupported" | "offline" | "corrupt" | "failed" | "timeout" | "cancelled" | "stale" | string;
+  previewStatus:
+    | "pending"
+    | "ready"
+    | "unsupported"
+    | "offline"
+    | "corrupt"
+    | "failed"
+    | "timeout"
+    | "cancelled"
+    | "stale"
+    | string;
   previewFailureReason: string | null;
   width: number | null;
   height: number | null;
@@ -149,18 +154,56 @@ export interface VisualMediaRow {
 }
 
 export interface IntelligenceSummary {
-  status: "pending" | "ready" | "unsupported" | "corrupt" | "needs_original" | "failed" | "not_applicable" | "stale" | string | null;
-  technicalQualityBand: "strong" | "good" | "review" | "technical_issue" | "not_applicable" | string | null;
+  status:
+    | "pending"
+    | "ready"
+    | "unsupported"
+    | "corrupt"
+    | "needs_original"
+    | "failed"
+    | "not_applicable"
+    | "stale"
+    | string
+    | null;
+  technicalQualityBand:
+    | "strong"
+    | "good"
+    | "review"
+    | "technical_issue"
+    | "not_applicable"
+    | string
+    | null;
   technicalQualityScore: number | null;
-  recommendation: "strong_candidate" | "strong_alternative" | "review" | "probable_duplicate" | "technical_issue" | "not_applicable" | string | null;
+  recommendation:
+    | "strong_candidate"
+    | "strong_alternative"
+    | "review"
+    | "probable_duplicate"
+    | "technical_issue"
+    | "not_applicable"
+    | string
+    | null;
   recommendationConfidence: number | null;
   similarityGroupId: string | null;
-  similarityGroupKind: "exact_duplicate_set" | "near_duplicate_set" | "similar_set" | "burst" | string | null;
+  similarityGroupKind:
+    | "exact_duplicate_set"
+    | "near_duplicate_set"
+    | "similar_set"
+    | "burst"
+    | string
+    | null;
   similarCount: number;
   faceCount: number;
   openEyesCount: number;
   possibleClosedEyesCount: number;
-  blurLevel: "low" | "moderate" | "high" | "uncertain" | "not_applicable" | string | null;
+  blurLevel:
+    | "low"
+    | "moderate"
+    | "high"
+    | "uncertain"
+    | "not_applicable"
+    | string
+    | null;
   sharpnessBand: string | null;
   confidence: number | null;
   unavailableReason: string | null;
@@ -173,7 +216,21 @@ export interface VisualMediaPage {
 }
 
 export type CullingMode = "all_photos" | "similar_sets" | "ai_review_queue";
-export type CullingFilter = "all" | "unreviewed" | "keep" | "reject" | "review" | "starred" | "five_star" | "four_plus" | "strong_candidates" | "technical_issues" | "possible_duplicates" | "similar_groups" | "faces" | "blur_review";
+export type CullingFilter =
+  | "all"
+  | "unreviewed"
+  | "keep"
+  | "reject"
+  | "review"
+  | "starred"
+  | "five_star"
+  | "four_plus"
+  | "strong_candidates"
+  | "technical_issues"
+  | "possible_duplicates"
+  | "similar_groups"
+  | "faces"
+  | "blur_review";
 export type CullingDecision = "keep" | "review" | "reject";
 
 /**
@@ -244,7 +301,8 @@ export interface CullingGroupSummary {
   studioStartingPointReason: string | null;
 }
 
-export type StudioTrainingStatus = "not_ready" | "learning" | "ready" | "stale" | "error" | string;
+export type StudioTrainingStatus =
+  "not_ready" | "learning" | "ready" | "stale" | "error" | string;
 
 /** Small, UI-safe local Studio Profile status. No source path, note text, raw feature vector,
  * model coefficient, probability, or biometric/identity signal is exposed here. */
@@ -264,7 +322,12 @@ export interface StudioBrainProjectStatus {
   contributingProjectCount: number;
   activeModelVersion: string | null;
   lastTrainedAt: string | null;
-  readiness: { state?: string; message?: string; conditions?: { key: string; met: boolean; message: string }[]; reasons?: string[] };
+  readiness: {
+    state?: string;
+    message?: string;
+    conditions?: { key: string; met: boolean; message: string }[];
+    reasons?: string[];
+  };
   lastError: string | null;
 }
 
@@ -283,13 +346,215 @@ export interface StudioBrainProgress {
 }
 
 export interface StudioRecommendationView {
-  recommendation: "likely_keep" | "likely_review" | "likely_reject" | "not_enough_evidence" | string;
+  recommendation:
+    | "likely_keep"
+    | "likely_review"
+    | "likely_reject"
+    | "not_enough_evidence"
+    | string;
   confidenceBand: "high" | "moderate" | "low" | "unavailable" | string;
   modelVersion: string;
   explanationFactors: string[];
   genericRecommendation: string | null;
   agreement: "agrees" | "differs" | "unavailable" | string;
   generatedAt: string;
+}
+
+export type ProductionPlanType =
+  | "client_delivery"
+  | "editor_workset"
+  | "portfolio_selects"
+  | "proof_gallery"
+  | "backup_archive"
+  | "custom";
+export type ProductionPlanStatus =
+  | "draft"
+  | "ready"
+  | "exporting"
+  | "completed"
+  | "partially_completed"
+  | "blocked"
+  | "failed"
+  | "stale"
+  | string;
+export type VirtualCollectionKind = "static" | "dynamic";
+export type OrganizationStrategy = "single_folder" | "by_moment";
+export type FilenameStrategy =
+  | { kind: "preserve_original" }
+  | { kind: "sequential" }
+  | { kind: "project_sequence" }
+  | { kind: "moment_sequence" }
+  | { kind: "custom_template"; template: string };
+
+/** Explicit photographer culling state is the only decision input. Studio recommendations are
+ * intentionally absent: they are advisory and cannot become delivery truth. */
+export interface ProductionSelectionRules {
+  decisions: string[];
+  minimumRating: number | null;
+  starredOnly: boolean;
+  momentIds: string[];
+  staticAssetIds: string[];
+  virtualCollectionId: string | null;
+}
+
+export interface ProductionPlanInput {
+  name: string;
+  planType: ProductionPlanType;
+  selectionRules: ProductionSelectionRules;
+  organization: OrganizationStrategy;
+  filenameStrategy: FilenameStrategy;
+}
+
+export interface ProductionPlanView extends ProductionPlanInput {
+  id: string;
+  projectId: string;
+  status: ProductionPlanStatus;
+  destinationPath: string | null;
+  destinationReserveBytes: number;
+  estimatedFileCount: number;
+  estimatedBytes: number;
+  currentManifestId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface VirtualCollectionView {
+  id: string;
+  projectId: string;
+  name: string;
+  kind: VirtualCollectionKind;
+  rules: ProductionSelectionRules;
+  createdAt: string;
+  updatedAt: string;
+  assetCount: number;
+}
+
+export interface VirtualCollectionInput {
+  name: string;
+  kind: VirtualCollectionKind;
+  rules: ProductionSelectionRules;
+}
+
+export interface ProductionWorkspaceView {
+  plans: ProductionPlanView[];
+  collections: VirtualCollectionView[];
+  recentExports: ProductionExportJobView[];
+}
+
+export interface ProductionExportJobView {
+  id: string;
+  planId: string;
+  manifestId: string;
+  state: string;
+  itemsTotal: number;
+  itemsCompleted: number;
+  verifiedCount: number;
+  skippedIdenticalCount: number;
+  failedCount: number;
+  verifiedBytes: number;
+  createdAt: string;
+  finishedAt: string | null;
+  errorMessage: string | null;
+}
+
+export interface DeliveryManifestEntry {
+  originalFilename: string;
+  destinationRelativePath: string;
+}
+
+/** A bounded local review of the proposed plan; never a culling-state mutation. */
+export interface ProductionPlanInspectionItem {
+  assetId: string;
+  originalFilename: string;
+  humanDecision: string | null;
+  state: "included" | "excluded" | "blocked" | string;
+  destinationRelativePath: string | null;
+  reason: string | null;
+  planOverride: "force_include" | "force_exclude" | null;
+}
+
+export interface ProductionPlanInspection {
+  includedCount: number;
+  excludedCount: number;
+  blockedCount: number;
+  remainingCount: number;
+  items: ProductionPlanInspectionItem[];
+}
+
+export interface ProductionPlanPreview {
+  plan: ProductionPlanView;
+  destinationPath: string | null;
+  destinationWritable: boolean;
+  availableBytes: number | null;
+  requiredBytes: number;
+  reserveBytes: number;
+  headroomBytes: number | null;
+  availableSourceCount: number;
+  offlineSourceCount: number;
+  existingIdenticalCount: number;
+  collisionCount: number;
+  blockers: string[];
+  warnings: string[];
+  namingExamples: DeliveryManifestEntry[];
+  inspection: ProductionPlanInspection;
+  manifestSummary: {
+    selectedFileCount: number;
+    estimatedBytes: number;
+    checksum: string;
+    blockingIssueCount: number;
+    warningIssueCount: number;
+  };
+}
+
+export interface ExportManifestView {
+  id: string;
+  planId: string;
+  projectId: string;
+  manifestVersion: number;
+  sourceRevision: number;
+  status: string;
+  destinationPath: string;
+  selectedFileCount: number;
+  estimatedBytes: number;
+  checksum: string;
+  createdAt: string;
+}
+
+export interface ProductionPreflight {
+  manifest: ExportManifestView;
+  destinationWritable: boolean;
+  availableBytes: number | null;
+  requiredBytes: number;
+  reserveBytes: number;
+  headroomBytes: number | null;
+  availableSourceCount: number;
+  offlineSourceCount: number;
+  existingIdenticalCount: number;
+  collisionCount: number;
+  blockers: string[];
+  warnings: string[];
+}
+
+export interface ProductionExportProgress {
+  exportJobId: string;
+  manifestId: string;
+  state:
+    | "queued"
+    | "running"
+    | "completed"
+    | "partially_completed"
+    | "cancelled"
+    | "failed"
+    | string;
+  stage: string;
+  itemsCompleted: number;
+  itemsTotal: number;
+  verifiedCount: number;
+  skippedIdenticalCount: number;
+  failedCount: number;
+  verifiedBytes: number;
+  currentFilename: string | null;
+  message: string | null;
 }
 
 export interface ReviewSessionView {
@@ -420,11 +685,13 @@ export interface CaptureIntelligenceDetail {
   faceProviderVersion: string;
   faceResolvedProvider: string;
   faceResolvedProviderVersion: string;
-  faceAnalysisStatus: "ready" | "not_applicable" | "failed" | "unsupported" | string;
+  faceAnalysisStatus:
+    "ready" | "not_applicable" | "failed" | "unsupported" | string;
   faceAnalysisError: string | null;
   /** Diagnostic only: an earlier local provider attempt may fail before a fallback succeeds. */
   faceProviderAttemptError: string | null;
-  faceLandmarkStatus: "ready" | "not_applicable" | "failed" | "unsupported" | string;
+  faceLandmarkStatus:
+    "ready" | "not_applicable" | "failed" | "unsupported" | string;
   faceLandmarkError: string | null;
   faces: FaceAnalysisEvidence[];
   recommendationReasons: string[];
@@ -456,7 +723,15 @@ export interface SimilarityGroupView {
 }
 
 export interface CaptureIntelligenceProgress {
-  state: "queued" | "running" | "paused" | "completed" | "failed" | "cancelled" | "interrupted" | string;
+  state:
+    | "queued"
+    | "running"
+    | "paused"
+    | "completed"
+    | "failed"
+    | "cancelled"
+    | "interrupted"
+    | string;
   stage: string;
   resourceMode: "eco" | "balanced" | "fast" | string;
   itemsCompleted: number;
@@ -662,7 +937,15 @@ export interface SemanticIndexCounts {
 }
 
 export interface SemanticIndexProgress {
-  state: "idle" | "queued" | "running" | "paused" | "completed" | "failed" | "interrupted" | string;
+  state:
+    | "idle"
+    | "queued"
+    | "running"
+    | "paused"
+    | "completed"
+    | "failed"
+    | "interrupted"
+    | string;
   model: SemanticModelStatus;
   counts: SemanticIndexCounts;
   active: boolean;
@@ -681,11 +964,23 @@ export interface SemanticIndexProgress {
  * These projections deliberately contain display evidence instead of source
  * paths, embedding vectors, numeric semantic scores, or identity claims.
  */
-export type MomentAnalysisState = "idle" | "queued" | "running" | "paused" | "completed" | "failed" | "interrupted" | string;
-export type MomentBoundaryStrength = "continuous" | "moderate" | "strong" | "unavailable" | string;
-export type MomentLabelSource = "human" | "generic_visual_vocabulary" | "project_checklist" | "none" | string;
-export type MomentLabelStrength = "strong" | "moderate" | "weak" | "unavailable" | string;
-export type CoverageConfirmationState = "unreviewed" | "confirmed_covered" | "needs_review" | "not_covered" | string;
+export type MomentAnalysisState =
+  | "idle"
+  | "queued"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "interrupted"
+  | string;
+export type MomentBoundaryStrength =
+  "continuous" | "moderate" | "strong" | "unavailable" | string;
+export type MomentLabelSource =
+  "human" | "generic_visual_vocabulary" | "project_checklist" | "none" | string;
+export type MomentLabelStrength =
+  "strong" | "moderate" | "weak" | "unavailable" | string;
+export type CoverageConfirmationState =
+  "unreviewed" | "confirmed_covered" | "needs_review" | "not_covered" | string;
 
 export interface MomentAnalysisProgress {
   state: MomentAnalysisState;
@@ -847,7 +1142,8 @@ export interface UpdateCoverageConfirmationInput {
   assetId?: string;
 }
 
-export type MagicSearchSort = "relevance" | "captureTime" | "technicalQuality" | "rating";
+export type MagicSearchSort =
+  "relevance" | "captureTime" | "technicalQuality" | "rating";
 
 export interface MagicSearchRequest {
   query: string;

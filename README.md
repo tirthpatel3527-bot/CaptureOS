@@ -2,7 +2,11 @@
 
 CaptureOS is a local-first foundation for an intelligent operating system for professional camera media. Its long-term purpose is simple: **your entire shoot, alive, understood, protected.**
 
-Milestone 8 adds **Studio Brain I**: explicit local preference learning for photographer-controlled culling recommendations. It is a compact, offline, explainable advisory layer built on intentional human decisions and representative choices—not passive behavior or AI output. It never replaces Capture Intelligence, Magic Search, Moment Brain, or the photographer's decisions.
+Milestone 9 adds **Delivery Brain + Production Pipeline I**: editable local Production Plans,
+Virtual Collections, compact dry-run naming/preflight, immutable Export Manifests, and explicit
+background LocalFolder exports that reuse streaming BLAKE3 verification. It organizes explicit
+human decisions into worksets; it never replaces Smart Cull authority, Studio Brain's advisory
+boundary, source-media immutability, or local/offline operation.
 
 ## Guarantees
 
@@ -27,6 +31,7 @@ crates/capture-intelligence/
                         Local deterministic fingerprints, grouping, technical evidence,
                         face-provider boundary, and conservative recommendations
 crates/studio-brain/   Pure-Rust compact preference model, calibration, abstention, and pairwise ranking
+crates/delivery-brain/ Pure deterministic plan selection, safe naming, collision, manifest mechanics
 crates/storage/         Storage-volume semantics
 crates/ingest/          Streaming copy, BLAKE3 verification, pre-flight, safe layout
 crates/integrity/       Future integrity extension boundary
@@ -42,6 +47,8 @@ research/moment-brain-bench/
                         Generated structural-timeline benchmark foundation
 research/studio-brain-bench/
                         Generated preference-recovery and scale benchmark foundation
+research/delivery-brain-bench/
+                        Generated manifest-scale and verified-copy mechanics benchmark foundation
 docs/                   Product, architecture, ADRs, and security notes
 ```
 
@@ -68,6 +75,7 @@ cargo run -p capture-intelligence-bench -- --suite baseline
 cargo run -p magic-search-bench -- --suite baseline
 cargo run -p moment-brain-bench -- --suite baseline
 cargo run -p studio-brain-bench -- --suite baseline
+cargo run --release -p delivery-brain-bench -- --suite baseline
 # Starts the browser shell for UI-only work:
 npm run dev
 # Starts the complete desktop app (requires the Rust prerequisite):
@@ -195,9 +203,49 @@ cargo run -p studio-brain-bench -- --suite baseline
 
 It reports local generated-data mechanics at 100, 1k, 10k, 50k, and 100k records. It is not real-photographer or artistic-quality accuracy.
 
-## Milestone 8 boundaries
+## Delivery Brain and Production Pipeline I behavior
 
-This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, client preference modeling, editing/style training, automatic culling/deletion, source write-back, color-critical RAW development, full proxy transcoding, NLE integration, video/audio intelligence, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or Milestone 9 work. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
+Open **Production** in a project to create an editable Client Delivery, Editor Workset, or Custom
+plan. Client Delivery starts from explicit `KEEP`; Editor Workset starts from `KEEP` and `REVIEW`.
+Ratings, stars, Moment filters, static/dynamic local Virtual Collections, and plan-only
+include/exclude overrides are separate organization controls. They never change underlying Smart
+Cull decisions. Studio Brain recommendations are deliberately not a delivery selection rule.
+
+Before a file write, CaptureOS runs a local dry run with source availability, destination
+writability/capacity, safe naming examples, case-insensitive internal collision detection,
+existing-destination equivalence, and source/destination containment checks. A complete candidate
+becomes a checksummed immutable Export Manifest only after a transaction rechecks its current
+plan configuration and the human-decision, Moment, and static-collection selection revision.
+Production Plan (intent), Export Manifest (snapshot), and
+Export Job (one execution) are distinct durable records.
+
+M9 ships only a user-selected existing **local folder** destination. It picks an available
+catalogued `FileInstance`, preferring verified-copy evidence, and reuses the Ingest streaming
+BLAKE3 copier: incomplete output remains a CaptureOS partial; only re-read BLAKE3-equivalent
+content atomically finalizes without overwriting a different existing file. Identical files are
+reported as already present/verified. A disconnect, cancellation, verification failure, collision,
+or partial job preserves already verified files and remains honest/resumable after restart.
+
+Each terminal job writes JSON and text Delivery Reports under the selected destination and stores a
+local immutable report summary. Client reports include plan/job status, count, verified bytes,
+manifest checksum, local destination type, and verification policy—but exclude source paths,
+internal IDs, notes, AI technical scores, Studio advice, embeddings, and model data. M9 does not
+render or convert media, write XMP/sidecars, integrate Adobe/NLE/cloud services, delete files, or
+automatically deliver anything. See [Delivery Brain architecture](docs/architecture/delivery-brain.md).
+
+Run the generated, no-download Delivery Brain benchmark with:
+
+```sh
+cargo run --release -p delivery-brain-bench -- --suite baseline
+```
+
+It reports generated planning/collision/resume mechanics at 100, 1k, 10k, 50k, and 100k records,
+plus a 2 MiB generated streaming-copy/reuse check. It contains no customer catalog or media and is
+not a filesystem-throughput or creative-quality claim.
+
+## Milestone 9 boundaries
+
+This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, client preference modeling, editing/style training, automatic culling/deletion, source write-back, color-critical RAW development, full proxy transcoding, NLE integration, video/audio intelligence, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or Milestone 10 work. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
 
 ## Smart Culling Workspace behavior
 

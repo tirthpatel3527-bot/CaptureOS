@@ -10,8 +10,11 @@ use capture_intelligence::{
     DETERMINISTIC_VERSION, FACE_ANALYSIS_SETTINGS_VERSION,
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use delivery_brain::{
+    build_manifest, ManifestBuildInput, ManifestDraft, PlanOverride, PlanOverrideKind,
+};
 use ingest::{
-    copy_and_verify, preflight, CopyVerificationOutcome, DefaultDestinationLayout,
+    copy_and_verify, hash_file, preflight, CopyVerificationOutcome, DefaultDestinationLayout,
     DestinationLayout, IngestRequest, LocalAvailableSpace, PreflightIssue, PreflightReport,
     PreflightSeverity,
 };
@@ -41,24 +44,27 @@ use persistence::{
     CaptureTimeObservationRecord, CatalogCounts, CatalogRepository, CoverageChecklistItemRecord,
     CoverageChecklistItemView as PersistedCoverageChecklistItemView, CullingDecisionUpdate,
     CullingDecisionView, CullingProgress, CullingQuery, CullingReportRow, CullingWorkspaceView,
+    DeliveryReportRecord, ExportJobEntryUpdate, ExportJobRecord, ExportManifestRecord,
     FaceAnalysisProviderConfig, IndexedMediaRow, IngestAuditEvent, IngestItemRecord, IngestReport,
     MagicSearchHistoryEntry as PersistedMagicSearchHistoryEntry, MediaAssetDetail,
     MediaBrowserFilter, MediaMetadataRecord, MomentAnalysisInput, MomentAnalysisRunRecord,
     MomentBoundaryEvidenceRecord, MomentIncrementalAnalysisWindow, MomentMembershipRecord,
     MomentOverrideOperation, MomentRecord, MomentTimelineStatusRecord, PersistenceError,
-    PreviewArtifactRecord, ProjectIndexSummary, ProjectLibraryItem as PersistedProjectLibraryItem,
-    Result as PersistenceResult, ReviewSessionView, SemanticEmbeddingRecord, SemanticIndexVersion,
-    SemanticInputCandidate, SemanticMetadataQuery, SemanticMetadataSort, SemanticModelConfig,
-    SemanticSearchCandidate, SimilarityGroupView, StudioBrainProjectStatus,
-    StudioModelActivationOutcome, StudioModelRecord, StudioPairwisePreferenceRecord,
-    StudioRecommendationRecord, StudioTrainingExampleRecord, StudioTrainingRunRecord,
-    TimelineSegmentRecord, VisualMediaPage, VisualMediaQuery, VisualMediaRow,
+    PreviewArtifactRecord, ProductionPlanInput, ProductionPlanRecord, ProductionPreflight,
+    ProductionWorkspaceView, ProjectIndexSummary,
+    ProjectLibraryItem as PersistedProjectLibraryItem, Result as PersistenceResult,
+    ReviewSessionView, SemanticEmbeddingRecord, SemanticIndexVersion, SemanticInputCandidate,
+    SemanticMetadataQuery, SemanticMetadataSort, SemanticModelConfig, SemanticSearchCandidate,
+    SimilarityGroupView, StudioBrainProjectStatus, StudioModelActivationOutcome, StudioModelRecord,
+    StudioPairwisePreferenceRecord, StudioRecommendationRecord, StudioTrainingExampleRecord,
+    StudioTrainingRunRecord, TimelineSegmentRecord, VirtualCollectionInput,
+    VirtualCollectionRecord, VisualMediaPage, VisualMediaQuery, VisualMediaRow,
     VisualPreparationTerminalCounts,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
+    fs::{self, OpenOptions},
     io::Write,
     panic::AssertUnwindSafe,
     path::{Component, Path, PathBuf},
@@ -4751,6 +4757,1437 @@ pub fn reset_studio_brain_personalization(
     let profile_id = repository.ensure_default_studio_profile()?;
     repository.reset_studio_personalization(&profile_id)?;
     repository.studio_brain_project_status(project_id)
+}
+
+/// One explicit production-plan dry run. It is derived from local catalog state and performs no
+/// destination writes. A frozen manifest is created only after this preview is free of blockers.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionPlanPreview {
+    pub plan: ProductionPlanRecord,
+    /// Kept in core for the immediate manifest transaction. It is deliberately never serialized
+    /// across the desktop boundary, which prevents a large project preview from loading an
+    /// entire 100k-entry candidate manifest into React memory.
+    #[serde(skip_serializing)]
+    pub manifest_draft: ManifestDraft,
+    pub manifest_summary: ProductionManifestPreviewSummary,
+    /// At most 120 local catalog records. This makes the human selection review useful without
+    /// turning a large production plan into a 100k-item frontend payload.
+    pub inspection: ProductionPlanInspection,
+    pub destination_path: Option<String>,
+    pub destination_writable: bool,
+    pub available_bytes: Option<u64>,
+    pub required_bytes: u64,
+    pub reserve_bytes: u64,
+    pub headroom_bytes: Option<u64>,
+    pub available_source_count: u64,
+    pub offline_source_count: u64,
+    pub existing_identical_count: u64,
+    pub collision_count: u64,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+    pub naming_examples: Vec<ProductionNamingExample>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionManifestPreviewSummary {
+    pub selected_file_count: u64,
+    pub estimated_bytes: u64,
+    pub checksum: String,
+    pub blocking_issue_count: u64,
+    pub warning_issue_count: u64,
+}
+
+/// Bounded, read-only production selection review. Its asset identifiers are desktop-local
+/// control references only; they are never written to client-facing delivery artifacts.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionPlanInspection {
+    pub included_count: u64,
+    pub excluded_count: u64,
+    pub blocked_count: u64,
+    pub remaining_count: u64,
+    pub items: Vec<ProductionPlanInspectionItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionPlanInspectionItem {
+    pub asset_id: String,
+    pub original_filename: String,
+    pub human_decision: Option<String>,
+    /// `included`, `excluded`, or `blocked`; this is a plan preview fact, never a culling state.
+    pub state: String,
+    pub destination_relative_path: Option<String>,
+    pub reason: Option<String>,
+    pub plan_override: Option<PlanOverrideKind>,
+}
+
+impl ProductionPlanPreview {
+    pub fn can_create_manifest(&self) -> bool {
+        self.blockers.is_empty() && self.manifest_draft.is_ready()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionNamingExample {
+    pub original_filename: String,
+    pub destination_relative_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionExportProgress {
+    pub export_job_id: String,
+    pub manifest_id: String,
+    pub state: String,
+    pub stage: String,
+    pub items_completed: u64,
+    pub items_total: u64,
+    pub verified_count: u64,
+    pub skipped_identical_count: u64,
+    pub failed_count: u64,
+    pub verified_bytes: u64,
+    pub current_filename: Option<String>,
+    pub message: Option<String>,
+}
+
+pub fn load_production_workspace(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+) -> PersistenceResult<ProductionWorkspaceView> {
+    repository.production_workspace(project_id)
+}
+
+pub fn create_production_plan(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    input: &ProductionPlanInput,
+) -> PersistenceResult<ProductionPlanRecord> {
+    repository.create_production_plan(project_id, input)
+}
+
+pub fn update_production_plan_destination(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    plan_id: &str,
+    destination_path: Option<&str>,
+) -> PersistenceResult<ProductionPlanRecord> {
+    repository.update_production_plan_destination(project_id, plan_id, destination_path)
+}
+
+/// Changes only a plan's local preflight headroom. It never creates an artificial catalog or
+/// export-size limit, and any previous manifest becomes stale for an explicit fresh preview.
+pub fn update_production_plan_destination_reserve(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    plan_id: &str,
+    reserve_bytes: u64,
+) -> PersistenceResult<ProductionPlanRecord> {
+    repository.update_production_plan_destination_reserve(project_id, plan_id, reserve_bytes)
+}
+
+pub fn update_production_plan_configuration(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    plan_id: &str,
+    input: &ProductionPlanInput,
+) -> PersistenceResult<ProductionPlanRecord> {
+    repository.update_production_plan_configuration(project_id, plan_id, input)
+}
+
+pub fn set_production_plan_override(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    plan_id: &str,
+    asset_id: &MediaAssetId,
+    kind: Option<PlanOverrideKind>,
+) -> PersistenceResult<()> {
+    // This writes an organizational override only. The repository never receives a culling
+    // mutation here, so Keep/Reject/Review, rating, star, note, and source media remain intact.
+    repository.set_production_plan_override(project_id, plan_id, asset_id, kind)
+}
+
+pub fn create_virtual_collection(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    input: &VirtualCollectionInput,
+) -> PersistenceResult<VirtualCollectionRecord> {
+    repository.create_virtual_collection(project_id, input)
+}
+
+pub fn set_static_virtual_collection_members(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    collection_id: &str,
+    media_asset_ids: &[MediaAssetId],
+) -> PersistenceResult<()> {
+    repository.set_static_virtual_collection_members(project_id, collection_id, media_asset_ids)
+}
+
+/// One static-collection membership is a local asset reference only. It neither copies media
+/// nor changes Smart Cull; collection-backed manifests become stale for an explicit refresh.
+pub fn set_static_virtual_collection_member(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    collection_id: &str,
+    media_asset_id: &MediaAssetId,
+    included: bool,
+) -> PersistenceResult<()> {
+    repository.set_static_virtual_collection_member(
+        project_id,
+        collection_id,
+        media_asset_id,
+        included,
+    )
+}
+
+pub fn virtual_collection_assets(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    collection_id: &str,
+) -> PersistenceResult<Vec<String>> {
+    repository.virtual_collection_assets(project_id, collection_id)
+}
+
+pub fn preview_production_plan(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    plan_id: &str,
+) -> PersistenceResult<ProductionPlanPreview> {
+    let (plan, overrides, assets, source_roots, source_revision, virtual_collection_asset_ids) =
+        repository.production_manifest_build_input(project_id, plan_id)?;
+    let project = repository
+        .get_project(project_id)?
+        .ok_or_else(|| PersistenceError::InvalidData("project does not exist".into()))?;
+    let inspection_seed = production_plan_inspection_seed(
+        &plan,
+        &overrides,
+        &assets,
+        virtual_collection_asset_ids.as_deref(),
+    );
+    let manifest_draft = build_manifest(&ManifestBuildInput {
+        plan_id: plan.id.clone(),
+        project_id: plan.project_id.clone(),
+        project_name: project.name,
+        plan_type: plan.plan_type,
+        selection_rules: plan.selection_rules.clone(),
+        organization: plan.organization,
+        filename_strategy: plan.filename_strategy.clone(),
+        overrides,
+        virtual_collection_asset_ids,
+        assets,
+    })
+    .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    let inspection = production_plan_inspection_from_seed(inspection_seed, &manifest_draft);
+    let mut preview =
+        production_preview_from_draft(&plan, manifest_draft, &source_roots, inspection)?;
+    // The source revision is not an advisory display field—it is rechecked inside the manifest
+    // creation transaction. Recording it in the diagnostic lets advanced users understand why a
+    // concurrent human decision asks them to refresh rather than silently changing a snapshot.
+    preview.warnings.push(format!(
+        "Local selection revision {source_revision}; manifest creation rechecks it transactionally."
+    ));
+    Ok(preview)
+}
+
+pub fn create_production_export_manifest(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    plan_id: &str,
+) -> PersistenceResult<ExportManifestRecord> {
+    let (plan, overrides, assets, source_roots, source_revision, virtual_collection_asset_ids) =
+        repository.production_manifest_build_input(project_id, plan_id)?;
+    let project = repository
+        .get_project(project_id)?
+        .ok_or_else(|| PersistenceError::InvalidData("project does not exist".into()))?;
+    let draft = build_manifest(&ManifestBuildInput {
+        plan_id: plan.id.clone(),
+        project_id: plan.project_id.clone(),
+        project_name: project.name,
+        plan_type: plan.plan_type,
+        selection_rules: plan.selection_rules.clone(),
+        organization: plan.organization,
+        filename_strategy: plan.filename_strategy.clone(),
+        overrides,
+        virtual_collection_asset_ids,
+        assets,
+    })
+    .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    let preview = production_preview_from_draft(
+        &plan,
+        draft.clone(),
+        &source_roots,
+        ProductionPlanInspection::default(),
+    )?;
+    if !preview.can_create_manifest() {
+        return Err(PersistenceError::InvalidData(format!(
+            "Production Plan cannot create a manifest: {}",
+            preview.blockers.join(" ")
+        )));
+    }
+    let destination = preview
+        .destination_path
+        .as_deref()
+        .ok_or_else(|| PersistenceError::InvalidData("a local destination is required".into()))?;
+    repository.create_export_manifest(
+        &plan,
+        source_revision,
+        destination,
+        &serde_json::json!({
+            "destinationWritable": preview.destination_writable,
+            "availableBytes": preview.available_bytes,
+            "requiredBytes": preview.required_bytes,
+            "reserveBytes": preview.reserve_bytes,
+            "headroomBytes": preview.headroom_bytes,
+            "availableSourceCount": preview.available_source_count,
+            "offlineSourceCount": preview.offline_source_count,
+            "existingIdenticalCount": preview.existing_identical_count,
+            "collisionCount": preview.collision_count,
+            "blockers": preview.blockers,
+            "warnings": preview.warnings,
+        }),
+        &draft.entries,
+        &draft.checksum,
+    )
+}
+
+pub fn preflight_production_export(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    manifest_id: &str,
+) -> PersistenceResult<ProductionPreflight> {
+    let manifest = repository
+        .export_manifest(project_id, manifest_id)?
+        .ok_or_else(|| {
+            PersistenceError::InvalidData("export manifest does not belong to this project".into())
+        })?;
+    let entries = repository.export_manifest_entries(project_id, manifest_id)?;
+    let execution_entries =
+        repository.export_manifest_execution_entries(project_id, manifest_id)?;
+    let preflight = production_preflight_from_entries(
+        &manifest.destination_path,
+        manifest.estimated_bytes,
+        delivery_brain::DEFAULT_DESTINATION_RESERVE_BYTES,
+        &entries,
+        &execution_entries,
+    )?;
+    Ok(ProductionPreflight {
+        manifest,
+        entries,
+        destination_writable: preflight.destination_writable,
+        available_bytes: preflight.available_bytes,
+        required_bytes: preflight.required_bytes,
+        reserve_bytes: preflight.reserve_bytes,
+        headroom_bytes: preflight.headroom_bytes,
+        available_source_count: preflight.available_source_count,
+        offline_source_count: preflight.offline_source_count,
+        existing_identical_count: preflight.existing_identical_count,
+        collision_count: preflight.collision_count,
+        blockers: preflight.blockers,
+        warnings: preflight.warnings,
+    })
+}
+
+/// Executes one frozen local Export Manifest. It never reevaluates selection rules or follows a
+/// Studio recommendation, and it uses the same streaming verified-copy primitive as ingest.
+/// Calling it again on an interrupted/failed manifest safely resumes by recognizing verified
+/// destination matches; it never overwrites a differing existing file.
+pub fn export_production_manifest(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    manifest_id: &str,
+    cancelled: impl Fn() -> bool,
+    mut on_progress: impl FnMut(&ProductionExportProgress),
+) -> PersistenceResult<ProductionExportProgress> {
+    let preflight = preflight_production_export(repository, project_id, manifest_id)?;
+    if !preflight.can_start() {
+        return Err(PersistenceError::InvalidData(format!(
+            "Export cannot start: {}",
+            preflight.blockers.join(" ")
+        )));
+    }
+    let manifest = preflight.manifest;
+    let manifest_entries = preflight.entries;
+    if manifest.status != "ready" {
+        return Err(PersistenceError::InvalidData(
+            "refresh this Production Plan before exporting; its manifest is no longer current"
+                .into(),
+        ));
+    }
+    let destination_root = canonical_local_destination(&manifest.destination_path)?;
+    let execution_entries =
+        repository.export_manifest_execution_entries(project_id, manifest_id)?;
+    let started_at = Utc::now();
+    let job_id = Uuid::new_v4().to_string();
+    let background_job = BackgroundJob {
+        id: JobId::new(),
+        state: WorkflowRunState::Running,
+        stage: JobStage::ProductionExport,
+        items_completed: 0,
+        items_total: Some(execution_entries.len() as u64),
+        files_discovered: execution_entries.len() as u64,
+        files_processed: 0,
+        error_count: 0,
+        project_id: Some(project_id.clone()),
+        index_root_id: None,
+        error_message: None,
+        resume_metadata: Some(serde_json::json!({
+            "pipeline": "production-export",
+            "export_job_id": job_id,
+            "manifest_id": manifest_id,
+            "verification": "blake3_streaming",
+        })),
+        created_at: started_at,
+        updated_at: started_at,
+        finished_at: None,
+    };
+    let mut export_job = ExportJobRecord {
+        id: job_id.clone(),
+        plan_id: manifest.plan_id.clone(),
+        manifest_id: manifest.id.clone(),
+        background_job_id: background_job.id.to_string(),
+        state: "running".into(),
+        destination_path: destination_root.to_string_lossy().into_owned(),
+        items_total: execution_entries.len() as u64,
+        items_completed: 0,
+        verified_count: 0,
+        skipped_identical_count: 0,
+        failed_count: 0,
+        verified_bytes: 0,
+        created_at: started_at.to_rfc3339(),
+        updated_at: started_at.to_rfc3339(),
+        finished_at: None,
+        error_message: None,
+    };
+    let mut durable_job = background_job;
+    repository.create_export_job(&export_job, &durable_job)?;
+    let mut progress = production_export_progress(
+        &export_job,
+        "copying",
+        None,
+        Some("Verified local export started.".into()),
+    );
+    on_progress(&progress);
+
+    for execution in execution_entries {
+        if cancelled() {
+            repository.cancel_pending_export_job_entries(
+                &export_job.id,
+                "Export cancelled before this entry began; it is not a completed export file.",
+            )?;
+            export_job.state = "cancelled".into();
+            export_job.updated_at = Utc::now().to_rfc3339();
+            export_job.finished_at = Some(export_job.updated_at.clone());
+            durable_job.state = WorkflowRunState::Cancelled;
+            durable_job.stage = JobStage::Finalize;
+            durable_job.updated_at = Utc::now();
+            durable_job.finished_at = Some(durable_job.updated_at);
+            durable_job.error_message = Some(
+                "Export cancelled. Previously verified destination files remain valid.".into(),
+            );
+            repository.update_export_job(&export_job, &durable_job)?;
+            progress = production_export_progress(
+                &export_job,
+                "finalize",
+                None,
+                durable_job.error_message.clone(),
+            );
+            on_progress(&progress);
+            return Ok(progress);
+        }
+        let entry = execution.entry.clone();
+        let source = match safe_execution_source(&execution) {
+            Ok(path) => path,
+            Err(error) => {
+                record_export_entry_failure(
+                    repository,
+                    &mut export_job,
+                    &mut durable_job,
+                    &entry.id,
+                    &error.to_string(),
+                )?;
+                progress = production_export_progress(
+                    &export_job,
+                    "copying",
+                    Some(entry.original_filename),
+                    Some("A source is unavailable; continuing remaining entries.".into()),
+                );
+                on_progress(&progress);
+                continue;
+            }
+        };
+        let target =
+            destination_relative_target(&destination_root, &entry.destination_relative_path)?;
+        repository.update_export_job_entry(
+            &export_job.id,
+            &ExportJobEntryUpdate {
+                manifest_entry_id: entry.id.clone(),
+                state: "copying".into(),
+                copied_bytes: 0,
+                source_checksum: None,
+                destination_checksum: None,
+                error_message: None,
+            },
+        )?;
+        let mut observed_copied = 0_u64;
+        let outcome = copy_and_verify(&source, &destination_root, &target, &cancelled, |copied| {
+            observed_copied = copied;
+        });
+        match outcome {
+            Ok(CopyVerificationOutcome::Verified(result)) => {
+                let state = if result.reused_existing {
+                    "skipped_identical"
+                } else {
+                    "verified"
+                };
+                repository.update_export_job_entry(
+                    &export_job.id,
+                    &ExportJobEntryUpdate {
+                        manifest_entry_id: entry.id.clone(),
+                        state: state.into(),
+                        copied_bytes: result.byte_size,
+                        source_checksum: Some(result.source_hash),
+                        destination_checksum: Some(result.destination_hash),
+                        error_message: None,
+                    },
+                )?;
+                export_job.items_completed += 1;
+                export_job.verified_count += 1;
+                export_job.verified_bytes = export_job
+                    .verified_bytes
+                    .checked_add(result.byte_size)
+                    .ok_or_else(|| {
+                        PersistenceError::InvalidData("verified byte count overflow".into())
+                    })?;
+                if result.reused_existing {
+                    export_job.skipped_identical_count += 1;
+                }
+            }
+            Ok(CopyVerificationOutcome::Cancelled) => {
+                repository.update_export_job_entry(
+                    &export_job.id,
+                    &ExportJobEntryUpdate { manifest_entry_id: entry.id.clone(), state: "cancelled".into(), copied_bytes: observed_copied, source_checksum: None, destination_checksum: None, error_message: Some("Copy cancelled before verification; the CaptureOS partial is not a completed export file.".into()) },
+                )?;
+                repository.cancel_pending_export_job_entries(
+                    &export_job.id,
+                    "Export cancelled before this entry began; it is not a completed export file.",
+                )?;
+                export_job.state = "cancelled".into();
+                export_job.updated_at = Utc::now().to_rfc3339();
+                export_job.finished_at = Some(export_job.updated_at.clone());
+                durable_job.state = WorkflowRunState::Cancelled;
+                durable_job.stage = JobStage::Finalize;
+                durable_job.updated_at = Utc::now();
+                durable_job.finished_at = Some(durable_job.updated_at);
+                durable_job.error_message = Some(
+                    "Export cancelled. Previously verified destination files remain valid.".into(),
+                );
+                repository.update_export_job(&export_job, &durable_job)?;
+                progress = production_export_progress(
+                    &export_job,
+                    "finalize",
+                    Some(entry.original_filename),
+                    durable_job.error_message.clone(),
+                );
+                on_progress(&progress);
+                return Ok(progress);
+            }
+            Ok(CopyVerificationOutcome::Conflict { message })
+            | Ok(CopyVerificationOutcome::VerificationFailed { message })
+            | Ok(CopyVerificationOutcome::SourceChanged { message }) => {
+                record_export_entry_failure(
+                    repository,
+                    &mut export_job,
+                    &mut durable_job,
+                    &entry.id,
+                    &message,
+                )?;
+            }
+            Err(error) => {
+                record_export_entry_failure(
+                    repository,
+                    &mut export_job,
+                    &mut durable_job,
+                    &entry.id,
+                    &error.to_string(),
+                )?;
+            }
+        }
+        export_job.updated_at = Utc::now().to_rfc3339();
+        durable_job.items_completed = export_job.items_completed;
+        durable_job.files_processed = export_job.items_completed;
+        durable_job.error_count = export_job.failed_count;
+        durable_job.updated_at = Utc::now();
+        repository.update_export_job(&export_job, &durable_job)?;
+        progress =
+            production_export_progress(&export_job, "copying", Some(entry.original_filename), None);
+        on_progress(&progress);
+    }
+    export_job.state = if export_job.failed_count == 0 {
+        "completed"
+    } else {
+        "partially_completed"
+    }
+    .into();
+    export_job.updated_at = Utc::now().to_rfc3339();
+    export_job.finished_at = Some(export_job.updated_at.clone());
+    let plan = repository
+        .production_plan(project_id, &manifest.plan_id)?
+        .ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "Production Plan disappeared before report generation".into(),
+            )
+        })?;
+    let delivery_reference = delivery_reference(&manifest, &export_job);
+    if plan.plan_type == delivery_brain::ProductionPlanType::EditorWorkset {
+        let handoff = editor_handoff_manifest_payload(
+            &manifest,
+            &export_job,
+            &plan.name,
+            &manifest_entries,
+            &delivery_reference,
+        )?;
+        if let Err(error) =
+            write_local_editor_handoff_manifest(&destination_root, &delivery_reference, &handoff)
+        {
+            export_job.state = "partially_completed".into();
+            let message = format!(
+                "Verified media copy completed, but the local Editor Handoff Manifest could not be written: {error}"
+            );
+            export_job.error_message = Some(match export_job.error_message.take() {
+                Some(existing) => format!("{existing} {message}"),
+                None => message,
+            });
+        }
+    }
+    let (report_json, report_text) =
+        delivery_report_payload(&manifest, &export_job, &plan.name, &delivery_reference)?;
+    // Reports are part of a professional handoff. If a destination cannot receive one, the
+    // media copies remain verified but the execution must be visibly partial rather than falsely
+    // reported as complete.
+    let report_written = match write_local_delivery_report(
+        &destination_root,
+        &delivery_reference,
+        &report_json,
+        &report_text,
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            export_job.state = "partially_completed".into();
+            let message = format!(
+                "Verified media copy completed, but the local Delivery Report could not be written: {error}"
+            );
+            export_job.error_message = Some(match export_job.error_message.take() {
+                Some(existing) => format!("{existing} {message}"),
+                None => message,
+            });
+            false
+        }
+    };
+    if report_written {
+        if let Err(error) = repository.store_delivery_report(&DeliveryReportRecord {
+            id: Uuid::new_v4().to_string(),
+            export_job_id: export_job.id.clone(),
+            manifest_checksum: manifest.checksum.clone(),
+            report_json,
+            report_text,
+            created_at: export_job.updated_at.clone(),
+        }) {
+            export_job.state = "partially_completed".into();
+            let message = format!(
+                "Verified media copy and local Delivery Report completed, but its local catalog record could not be saved: {error}"
+            );
+            export_job.error_message = Some(match export_job.error_message.take() {
+                Some(existing) => format!("{existing} {message}"),
+                None => message,
+            });
+        }
+    }
+    durable_job.state = if export_job.state == "completed" {
+        WorkflowRunState::Completed
+    } else {
+        WorkflowRunState::Failed
+    };
+    durable_job.stage = JobStage::Finalize;
+    durable_job.items_completed = export_job.items_completed;
+    durable_job.files_processed = export_job.items_completed;
+    durable_job.error_count = export_job.failed_count;
+    durable_job.updated_at = Utc::now();
+    durable_job.finished_at = Some(durable_job.updated_at);
+    if export_job.error_message.is_none() && export_job.failed_count > 0 {
+        export_job.error_message = Some(format!(
+            "{} entries could not be verified. Previously verified destination files remain valid.",
+            export_job.failed_count
+        ));
+    }
+    durable_job.error_message = export_job.error_message.clone();
+    repository.update_export_job(&export_job, &durable_job)?;
+    progress = production_export_progress(
+        &export_job,
+        "finalize",
+        None,
+        if export_job.failed_count == 0 {
+            Some("All selected files were verified locally.".into())
+        } else {
+            durable_job.error_message.clone()
+        },
+    );
+    on_progress(&progress);
+    Ok(progress)
+}
+
+pub fn recover_interrupted_production_exports(
+    repository: &impl CatalogRepository,
+) -> PersistenceResult<u64> {
+    repository.recover_interrupted_production_exports()
+}
+
+#[derive(Debug, Clone)]
+struct ProductionLocalPreflight {
+    destination_writable: bool,
+    available_bytes: Option<u64>,
+    required_bytes: u64,
+    reserve_bytes: u64,
+    headroom_bytes: Option<u64>,
+    available_source_count: u64,
+    offline_source_count: u64,
+    existing_identical_count: u64,
+    collision_count: u64,
+    blockers: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn production_preview_from_draft(
+    plan: &ProductionPlanRecord,
+    manifest_draft: ManifestDraft,
+    source_roots: &BTreeMap<String, String>,
+    inspection: ProductionPlanInspection,
+) -> PersistenceResult<ProductionPlanPreview> {
+    let local = preflight_draft_entries(
+        plan.destination_path.as_deref(),
+        manifest_draft.estimated_bytes,
+        plan.destination_reserve_bytes,
+        &manifest_draft.entries,
+        source_roots,
+    )?;
+    let mut blockers = local.blockers;
+    blockers.extend(
+        manifest_draft
+            .issues
+            .iter()
+            .filter(|issue| issue.blocking)
+            .map(|issue| issue.message.clone()),
+    );
+    let mut warnings = local.warnings;
+    warnings.extend(
+        manifest_draft
+            .issues
+            .iter()
+            .filter(|issue| !issue.blocking)
+            .map(|issue| issue.message.clone()),
+    );
+    Ok(ProductionPlanPreview {
+        plan: plan.clone(),
+        destination_path: plan.destination_path.clone(),
+        required_bytes: local.required_bytes,
+        reserve_bytes: local.reserve_bytes,
+        manifest_summary: ProductionManifestPreviewSummary {
+            selected_file_count: manifest_draft.selected_file_count,
+            estimated_bytes: manifest_draft.estimated_bytes,
+            checksum: manifest_draft.checksum.clone(),
+            blocking_issue_count: manifest_draft
+                .issues
+                .iter()
+                .filter(|issue| issue.blocking)
+                .count() as u64,
+            warning_issue_count: manifest_draft
+                .issues
+                .iter()
+                .filter(|issue| !issue.blocking)
+                .count() as u64,
+        },
+        inspection,
+        manifest_draft: manifest_draft.clone(),
+        destination_writable: local.destination_writable,
+        available_bytes: local.available_bytes,
+        headroom_bytes: local.headroom_bytes,
+        available_source_count: local.available_source_count,
+        offline_source_count: local.offline_source_count,
+        existing_identical_count: local.existing_identical_count,
+        collision_count: local.collision_count,
+        blockers,
+        warnings,
+        naming_examples: manifest_draft
+            .entries
+            .iter()
+            .take(5)
+            .map(|entry| ProductionNamingExample {
+                original_filename: entry.original_filename.clone(),
+                destination_relative_path: entry.destination_relative_path.clone(),
+            })
+            .collect(),
+    })
+}
+
+fn production_plan_inspection_seed(
+    plan: &ProductionPlanRecord,
+    overrides: &[PlanOverride],
+    assets: &[delivery_brain::DeliveryAssetCandidate],
+    virtual_collection_asset_ids: Option<&[String]>,
+) -> ProductionPlanInspection {
+    const INSPECTION_LIMIT: usize = 120;
+    let overrides = overrides
+        .iter()
+        .map(|value| (value.media_asset_id.as_str(), value.kind))
+        .collect::<BTreeMap<_, _>>();
+    let virtual_collection_asset_ids = virtual_collection_asset_ids
+        .map(|ids| ids.iter().map(String::as_str).collect::<HashSet<_>>());
+    let mut sorted_assets = assets.iter().collect::<Vec<_>>();
+    sorted_assets.sort_by(|left, right| {
+        left.captured_at
+            .cmp(&right.captured_at)
+            .then_with(|| {
+                left.moment
+                    .as_ref()
+                    .map(|moment| moment.ordinal)
+                    .cmp(&right.moment.as_ref().map(|moment| moment.ordinal))
+            })
+            .then_with(|| left.asset_id.cmp(&right.asset_id))
+    });
+
+    let mut inspection = ProductionPlanInspection::default();
+    let mut all_items = Vec::with_capacity(sorted_assets.len().min(INSPECTION_LIMIT));
+    for asset in sorted_assets {
+        let override_kind = overrides.get(asset.asset_id.as_str()).copied();
+        let selected = match override_kind {
+            Some(PlanOverrideKind::ForceInclude) => true,
+            Some(PlanOverrideKind::ForceExclude) => false,
+            None => {
+                virtual_collection_asset_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(asset.asset_id.as_str()))
+                    && plan.selection_rules.matches(asset)
+            }
+        };
+        let item = if selected {
+            inspection.included_count += 1;
+            ProductionPlanInspectionItem {
+                asset_id: asset.asset_id.clone(),
+                original_filename: asset.original_filename.clone(),
+                human_decision: asset.human_decision.clone(),
+                state: "included".into(),
+                destination_relative_path: None,
+                reason: None,
+                plan_override: override_kind,
+            }
+        } else {
+            inspection.excluded_count += 1;
+            let reason = match override_kind {
+                Some(PlanOverrideKind::ForceExclude) => {
+                    "Excluded by this plan's local override.".into()
+                }
+                Some(PlanOverrideKind::ForceInclude) => {
+                    "The forced inclusion could not be resolved into this preview.".into()
+                }
+                None => "Does not meet this plan's explicit human selection rules.".into(),
+            };
+            ProductionPlanInspectionItem {
+                asset_id: asset.asset_id.clone(),
+                original_filename: asset.original_filename.clone(),
+                human_decision: asset.human_decision.clone(),
+                state: "excluded".into(),
+                destination_relative_path: None,
+                reason: Some(reason),
+                plan_override: override_kind,
+            }
+        };
+        if all_items.len() < INSPECTION_LIMIT {
+            all_items.push(item);
+        }
+    }
+    inspection.remaining_count = inspection
+        .included_count
+        .saturating_add(inspection.excluded_count)
+        .saturating_add(inspection.blocked_count)
+        .saturating_sub(all_items.len() as u64);
+    inspection.items = all_items;
+    inspection
+}
+
+fn production_plan_inspection_from_seed(
+    mut inspection: ProductionPlanInspection,
+    manifest_draft: &ManifestDraft,
+) -> ProductionPlanInspection {
+    let entries = manifest_draft
+        .entries
+        .iter()
+        .map(|entry| (entry.media_asset_id.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let blocked_total = manifest_draft
+        .entries
+        .iter()
+        .filter(|entry| entry.status != delivery_brain::ManifestEntryStatus::Planned)
+        .count() as u64;
+    inspection.included_count = inspection.included_count.saturating_sub(blocked_total);
+    inspection.blocked_count = blocked_total;
+    for item in &mut inspection.items {
+        let Some(entry) = entries.get(item.asset_id.as_str()) else {
+            continue;
+        };
+        item.destination_relative_path = Some(entry.destination_relative_path.clone());
+        item.reason = entry.issue.clone();
+        if entry.status != delivery_brain::ManifestEntryStatus::Planned {
+            item.state = "blocked".into();
+        }
+    }
+    inspection
+}
+
+fn preflight_draft_entries(
+    destination_path: Option<&str>,
+    estimated_bytes: u64,
+    reserve_bytes: u64,
+    entries: &[delivery_brain::ManifestEntryDraft],
+    source_roots: &BTreeMap<String, String>,
+) -> PersistenceResult<ProductionLocalPreflight> {
+    let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
+    let required_bytes = estimated_bytes.checked_add(reserve_bytes).ok_or_else(|| {
+        PersistenceError::InvalidData("destination space requirement overflow".into())
+    })?;
+    let Some(destination_path) = destination_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(ProductionLocalPreflight {
+            destination_writable: false,
+            available_bytes: None,
+            required_bytes,
+            reserve_bytes,
+            headroom_bytes: None,
+            available_source_count: 0,
+            offline_source_count: entries.len() as u64,
+            existing_identical_count: 0,
+            collision_count: 0,
+            blockers: vec!["A local destination is required before this plan can export.".into()],
+            warnings,
+        });
+    };
+    let destination_root = match canonical_local_destination(destination_path) {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(ProductionLocalPreflight {
+                destination_writable: false,
+                available_bytes: None,
+                required_bytes,
+                reserve_bytes,
+                headroom_bytes: None,
+                available_source_count: 0,
+                offline_source_count: entries.len() as u64,
+                existing_identical_count: 0,
+                collision_count: 0,
+                blockers: vec![format!("Destination unavailable: {error}")],
+                warnings,
+            });
+        }
+    };
+    let destination_writable = fs::metadata(&destination_root)
+        .map(|metadata| !metadata.permissions().readonly())
+        .unwrap_or(false);
+    if !destination_writable {
+        blockers.push("Destination appears read-only or is not writable.".into());
+    }
+    let available_bytes = storage::available_bytes(&destination_root).ok();
+    if let Some(available) = available_bytes {
+        if available < required_bytes {
+            blockers.push(format!(
+                "Destination needs approximately {} including the safety reserve; only {} is available.",
+                format_bytes(required_bytes),
+                format_bytes(available)
+            ));
+        }
+    } else {
+        warnings.push("Available destination capacity could not be measured locally.".into());
+    }
+    let headroom_bytes =
+        available_bytes.and_then(|available| available.checked_sub(estimated_bytes));
+    let mut available_source_count = 0_u64;
+    let mut offline_source_count = 0_u64;
+    let mut identical = 0_u64;
+    let mut collisions = 0_u64;
+    let mut source_roots_seen = HashSet::<PathBuf>::new();
+    for entry in entries {
+        if entry.status != delivery_brain::ManifestEntryStatus::Planned {
+            continue;
+        }
+        let source = entry
+            .selected_file_instance_id
+            .as_deref()
+            .and_then(|instance_id| source_roots.get(instance_id))
+            .zip(entry.source_relative_path.as_deref())
+            .and_then(|(root, relative)| safe_source_path(root, relative).ok());
+        let Some(source) = source else {
+            offline_source_count += 1;
+            continue;
+        };
+        if fs::metadata(&source).map(|metadata| metadata.len()).ok()
+            != Some(entry.expected_byte_size)
+        {
+            offline_source_count += 1;
+            continue;
+        }
+        available_source_count += 1;
+        if let Some(root) = entry
+            .selected_file_instance_id
+            .as_deref()
+            .and_then(|instance_id| source_roots.get(instance_id))
+            .and_then(|root| Path::new(root).canonicalize().ok())
+        {
+            source_roots_seen.insert(root);
+        }
+        let target = match destination_relative_target(
+            &destination_root,
+            &entry.destination_relative_path,
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                blockers.push(format!(
+                    "Unsafe destination name for {}: {error}",
+                    entry.original_filename
+                ));
+                continue;
+            }
+        };
+        if source == target {
+            blockers.push(format!(
+                "{} resolves to the same source and destination file path.",
+                entry.original_filename
+            ));
+            continue;
+        }
+        if target.exists() {
+            match fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    collisions += 1;
+                    blockers.push(format!(
+                        "{} already exists at the destination but is not a safe regular file.",
+                        entry.destination_relative_path
+                    ));
+                }
+                Ok(_) => match (hash_file(&source), hash_file(&target)) {
+                    (Ok(source_hash), Ok(destination_hash)) if source_hash == destination_hash => {
+                        identical += 1;
+                    }
+                    (Ok(_), Ok(_)) => {
+                        collisions += 1;
+                        blockers.push(format!(
+                            "{} already exists with different content; CaptureOS will not overwrite it.",
+                            entry.destination_relative_path
+                        ));
+                    }
+                    _ => {
+                        collisions += 1;
+                        blockers.push(format!(
+                            "{} cannot be safely compared with existing destination content.",
+                            entry.destination_relative_path
+                        ));
+                    }
+                },
+                Err(error) => {
+                    collisions += 1;
+                    blockers.push(format!(
+                        "Cannot inspect existing destination {}: {error}",
+                        entry.destination_relative_path
+                    ));
+                }
+            }
+        }
+    }
+    if offline_source_count > 0 {
+        blockers.push(format!(
+            "{offline_source_count} selected original{} offline or unavailable.",
+            if offline_source_count == 1 {
+                " is"
+            } else {
+                "s are"
+            }
+        ));
+    }
+    if !source_roots_seen.is_empty()
+        && source_roots_seen.iter().any(|source_root| {
+            destination_root == *source_root || destination_root.starts_with(source_root)
+        })
+    {
+        blockers.push("Destination is inside a selected source root, which could change the source inventory during export.".into());
+    }
+    Ok(ProductionLocalPreflight {
+        destination_writable,
+        available_bytes,
+        required_bytes,
+        reserve_bytes,
+        headroom_bytes,
+        available_source_count,
+        offline_source_count,
+        existing_identical_count: identical,
+        collision_count: collisions,
+        blockers,
+        warnings,
+    })
+}
+
+fn production_preflight_from_entries(
+    destination_path: &str,
+    estimated_bytes: u64,
+    reserve_bytes: u64,
+    entries: &[persistence::ExportManifestEntryRecord],
+    execution_entries: &[persistence::ExportManifestExecutionEntry],
+) -> PersistenceResult<ProductionLocalPreflight> {
+    let source_roots = execution_entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .entry
+                .selected_file_instance_id
+                .as_ref()
+                .zip(entry.source_root_path.as_ref())
+                .map(|(instance_id, root)| (instance_id.clone(), root.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let drafts = entries
+        .iter()
+        .zip(execution_entries)
+        .map(|(entry, execution)| delivery_brain::ManifestEntryDraft {
+            media_asset_id: entry.media_asset_id.clone(),
+            selected_file_instance_id: entry.selected_file_instance_id.clone(),
+            source_relative_path: execution.source_relative_path.clone(),
+            original_filename: entry.original_filename.clone(),
+            destination_relative_path: entry.destination_relative_path.clone(),
+            destination_filename: entry.destination_filename.clone(),
+            expected_byte_size: entry.expected_byte_size,
+            source_checksum: entry.source_checksum.clone(),
+            human_decision: entry.human_decision.clone(),
+            rating: entry.rating,
+            starred: entry.starred,
+            moment_id: entry.moment_id.clone(),
+            moment_label: entry.moment_label.clone(),
+            status: match entry.status.as_str() {
+                "planned" => delivery_brain::ManifestEntryStatus::Planned,
+                "blocked_source_unavailable" => {
+                    delivery_brain::ManifestEntryStatus::BlockedSourceUnavailable
+                }
+                _ => delivery_brain::ManifestEntryStatus::BlockedInternalCollision,
+            },
+            issue: entry.issue.clone(),
+        })
+        .collect::<Vec<_>>();
+    preflight_draft_entries(
+        Some(destination_path),
+        estimated_bytes,
+        reserve_bytes,
+        &drafts,
+        &source_roots,
+    )
+}
+
+fn canonical_local_destination(value: &str) -> PersistenceResult<PathBuf> {
+    let path = Path::new(value).canonicalize().map_err(|error| {
+        PersistenceError::InvalidData(format!("destination is unavailable: {error}"))
+    })?;
+    if !path.is_dir() {
+        return Err(PersistenceError::InvalidData(
+            "destination must be an existing local folder".into(),
+        ));
+    }
+    Ok(path)
+}
+
+fn safe_source_path(root: &str, relative: &str) -> PersistenceResult<PathBuf> {
+    let root = Path::new(root).canonicalize().map_err(|error| {
+        PersistenceError::InvalidData(format!("source root is unavailable: {error}"))
+    })?;
+    if !root.is_dir() {
+        return Err(PersistenceError::InvalidData(
+            "source root is not a folder".into(),
+        ));
+    }
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(PersistenceError::InvalidData(
+            "source relative path is unsafe".into(),
+        ));
+    }
+    let path = root.join(relative_path);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        PersistenceError::InvalidData(format!("source is unavailable: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(PersistenceError::InvalidData(
+            "source is not a safe regular local file".into(),
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|error| {
+        PersistenceError::InvalidData(format!("source is unavailable: {error}"))
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(PersistenceError::InvalidData(
+            "source path escaped its approved root".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn safe_execution_source(
+    execution: &persistence::ExportManifestExecutionEntry,
+) -> PersistenceResult<PathBuf> {
+    if !execution.source_available {
+        return Err(PersistenceError::InvalidData(
+            "selected source FileInstance is offline".into(),
+        ));
+    }
+    let root = execution.source_root_path.as_deref().ok_or_else(|| {
+        PersistenceError::InvalidData("selected FileInstance has no approved index root".into())
+    })?;
+    let relative = execution.source_relative_path.as_deref().ok_or_else(|| {
+        PersistenceError::InvalidData(
+            "selected FileInstance has no safe relative source path".into(),
+        )
+    })?;
+    safe_source_path(root, relative)
+}
+
+fn destination_relative_target(root: &Path, relative: &str) -> PersistenceResult<PathBuf> {
+    if !delivery_brain::safe_destination_relative_path(relative) {
+        return Err(PersistenceError::InvalidData(
+            "destination relative path is unsafe".into(),
+        ));
+    }
+    let mut target = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let Component::Normal(component) = component else {
+            return Err(PersistenceError::InvalidData(
+                "destination relative path contains traversal".into(),
+            ));
+        };
+        target.push(component);
+    }
+    Ok(target)
+}
+
+fn record_export_entry_failure(
+    repository: &impl CatalogRepository,
+    export_job: &mut ExportJobRecord,
+    durable_job: &mut BackgroundJob,
+    entry_id: &str,
+    message: &str,
+) -> PersistenceResult<()> {
+    repository.update_export_job_entry(
+        &export_job.id,
+        &ExportJobEntryUpdate {
+            manifest_entry_id: entry_id.into(),
+            state: "failed".into(),
+            copied_bytes: 0,
+            source_checksum: None,
+            destination_checksum: None,
+            error_message: Some(message.into()),
+        },
+    )?;
+    export_job.items_completed += 1;
+    export_job.failed_count += 1;
+    export_job.updated_at = Utc::now().to_rfc3339();
+    durable_job.items_completed = export_job.items_completed;
+    durable_job.files_processed = export_job.items_completed;
+    durable_job.error_count = export_job.failed_count;
+    durable_job.updated_at = Utc::now();
+    repository.update_export_job(export_job, durable_job)
+}
+
+fn production_export_progress(
+    export_job: &ExportJobRecord,
+    stage: &str,
+    current_filename: Option<String>,
+    message: Option<String>,
+) -> ProductionExportProgress {
+    ProductionExportProgress {
+        export_job_id: export_job.id.clone(),
+        manifest_id: export_job.manifest_id.clone(),
+        state: export_job.state.clone(),
+        stage: stage.into(),
+        items_completed: export_job.items_completed,
+        items_total: export_job.items_total,
+        verified_count: export_job.verified_count,
+        skipped_identical_count: export_job.skipped_identical_count,
+        failed_count: export_job.failed_count,
+        verified_bytes: export_job.verified_bytes,
+        current_filename,
+        message,
+    }
+}
+
+fn delivery_report_payload(
+    manifest: &ExportManifestRecord,
+    export_job: &ExportJobRecord,
+    plan_name: &str,
+    delivery_reference: &str,
+) -> PersistenceResult<(serde_json::Value, String)> {
+    let report = serde_json::json!({
+        "formatVersion": 1,
+        "deliveryReference": delivery_reference,
+        "planName": plan_name,
+        "manifestChecksum": manifest.checksum,
+        "completedAt": export_job.finished_at,
+        "filesVerified": export_job.verified_count,
+        "filesAlreadyPresent": export_job.skipped_identical_count,
+        "failedCount": export_job.failed_count,
+        "verifiedBytes": export_job.verified_bytes,
+        "status": export_job.state,
+        "destinationType": "local_folder",
+        "verificationPolicy": "streaming blake3 source-to-destination equivalence",
+        "privacy": "No notes, AI scores, Studio Brain predictions, embeddings, source paths, or internal asset identifiers are included.",
+    });
+    let text = format!(
+        "CaptureOS Delivery Report\n\nPlan: {plan_name}\n\nFiles: {} verified{}\nTotal: {}\nStatus: {}\nVerification: streaming BLAKE3 source-to-destination equivalence\n",
+        export_job.verified_count,
+        if export_job.failed_count > 0 { format!(", {} failed", export_job.failed_count) } else { String::new() },
+        format_bytes(export_job.verified_bytes),
+        export_job.state,
+    );
+    Ok((report, text))
+}
+
+fn write_local_delivery_report(
+    destination_root: &Path,
+    delivery_reference: &str,
+    report: &serde_json::Value,
+    text: &str,
+) -> PersistenceResult<()> {
+    let reports = safe_delivery_reports_directory(destination_root)?;
+    let json_path = reports.join(format!(
+        "CaptureOS_Delivery_Report_{delivery_reference}.json"
+    ));
+    let text_path = reports.join(format!(
+        "CaptureOS_Delivery_Report_{delivery_reference}.txt"
+    ));
+    let json_text = serde_json::to_string_pretty(&report)
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    let mut json_file = production_io(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(json_path),
+    )?;
+    production_io(json_file.write_all(json_text.as_bytes()))?;
+    production_io(json_file.sync_all())?;
+    let mut text_file = production_io(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(text_path),
+    )?;
+    production_io(text_file.write_all(text.as_bytes()))?;
+    production_io(text_file.sync_all())?;
+    Ok(())
+}
+
+fn editor_handoff_manifest_payload(
+    manifest: &ExportManifestRecord,
+    export_job: &ExportJobRecord,
+    plan_name: &str,
+    entries: &[persistence::ExportManifestEntryRecord],
+    delivery_reference: &str,
+) -> PersistenceResult<serde_json::Value> {
+    Ok(serde_json::json!({
+        "formatVersion": 1,
+        "kind": "captureos_editor_handoff",
+        "planName": plan_name,
+        "deliveryReference": delivery_reference,
+        "manifestChecksum": manifest.checksum,
+        "status": export_job.state,
+        "files": entries.iter().map(|entry| serde_json::json!({
+            "originalFilename": entry.original_filename,
+            "destinationRelativePath": entry.destination_relative_path,
+            "destinationFilename": entry.destination_filename,
+            "humanDecision": entry.human_decision,
+            "rating": entry.rating,
+            "starred": entry.starred,
+            "momentLabel": entry.moment_label,
+            "status": entry.status,
+        })).collect::<Vec<_>>(),
+        "privacy": "No notes, source paths, internal asset identifiers, AI scores, Studio Brain predictions, embeddings, or model data are included.",
+    }))
+}
+
+fn write_local_editor_handoff_manifest(
+    destination_root: &Path,
+    delivery_reference: &str,
+    handoff: &serde_json::Value,
+) -> PersistenceResult<()> {
+    let reports = safe_delivery_reports_directory(destination_root)?;
+    let path = reports.join(format!(
+        "CaptureOS_Editor_Handoff_Manifest_{delivery_reference}.json"
+    ));
+    let text = serde_json::to_string_pretty(handoff)
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    let mut file = production_io(OpenOptions::new().write(true).create_new(true).open(path))?;
+    production_io(file.write_all(text.as_bytes()))?;
+    production_io(file.sync_all())?;
+    Ok(())
+}
+
+/// A client-visible delivery reference deliberately excludes internal database identifiers. It
+/// combines the immutable manifest checksum with an already-visible completion timestamp and is
+/// safe to include in destination filenames.
+fn delivery_reference(manifest: &ExportManifestRecord, export_job: &ExportJobRecord) -> String {
+    let completed = export_job
+        .finished_at
+        .as_deref()
+        .unwrap_or(export_job.updated_at.as_str())
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>();
+    let checksum = manifest.checksum.get(..12).unwrap_or("manifest");
+    format!("delivery-{completed}-{checksum}")
+}
+
+fn safe_delivery_reports_directory(destination_root: &Path) -> PersistenceResult<PathBuf> {
+    let reports = destination_root.join("CaptureOS_Delivery_Reports");
+    if reports.exists() {
+        let metadata = production_io(fs::symlink_metadata(&reports))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(PersistenceError::InvalidData(
+                "delivery report folder is not a safe directory".into(),
+            ));
+        }
+    } else {
+        production_io(fs::create_dir(&reports))?;
+    }
+    Ok(reports)
+}
+
+fn format_bytes(value: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if value >= GIB {
+        format!("{:.1} GB", value as f64 / GIB as f64)
+    } else if value >= MIB {
+        format!("{:.1} MB", value as f64 / MIB as f64)
+    } else {
+        format!("{value} B")
+    }
+}
+
+fn production_io<T>(result: std::io::Result<T>) -> PersistenceResult<T> {
+    result.map_err(|error| {
+        PersistenceError::InvalidData(format!(
+            "local production filesystem operation failed: {error}"
+        ))
+    })
 }
 
 /// Runs one explicit local retrain. The desktop calls this from a separate SQLite connection and
@@ -9667,6 +11104,312 @@ mod tests {
             load_project_home(&repository, &project_id, MediaBrowserFilter::All, 0, 50).unwrap();
         assert_eq!(after_reindex.media.len(), 4);
         assert_eq!(repository.counts().unwrap().file_instances, 4);
+    }
+
+    #[test]
+    fn production_plan_exports_only_explicit_human_keeps_with_verified_resume_and_private_reports()
+    {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("delivery");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(
+            source.join("KEEP.JPG"),
+            b"first photographer-owned source bytes",
+        )
+        .unwrap();
+        fs::write(
+            source.join("REVIEW.JPG"),
+            b"second photographer-owned source bytes",
+        )
+        .unwrap();
+        let original_keep = fs::read(source.join("KEEP.JPG")).unwrap();
+
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = create_local_project(&repository, "Delivery fixture").unwrap();
+        let project_id = ProjectId::try_from(project.id.as_str()).unwrap();
+        index_local_folder(&repository, &project_id, source.to_str().unwrap(), |_| {}).unwrap();
+        let indexed =
+            load_project_home(&repository, &project_id, MediaBrowserFilter::All, 0, 20).unwrap();
+        let keep_id = MediaAssetId::try_from(
+            indexed
+                .media
+                .iter()
+                .find(|item| item.filename == "KEEP.JPG")
+                .unwrap()
+                .asset_id
+                .as_str(),
+        )
+        .unwrap();
+        let review_id = MediaAssetId::try_from(
+            indexed
+                .media
+                .iter()
+                .find(|item| item.filename == "REVIEW.JPG")
+                .unwrap()
+                .asset_id
+                .as_str(),
+        )
+        .unwrap();
+        repository
+            .update_culling_decision(
+                &project_id,
+                &keep_id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        repository
+            .update_culling_decision(
+                &project_id,
+                &review_id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Review),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: Some("Private client detail must not leave the catalog".into()),
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+
+        let plan = create_production_plan(
+            &repository,
+            &project_id,
+            &ProductionPlanInput {
+                name: "Client delivery".into(),
+                plan_type: delivery_brain::ProductionPlanType::ClientDelivery,
+                selection_rules: delivery_brain::SelectionRules::client_delivery(),
+                organization: delivery_brain::OrganizationStrategy::SingleFolder,
+                filename_strategy: delivery_brain::FilenameStrategy::PreserveOriginal,
+            },
+        )
+        .unwrap();
+        update_production_plan_destination(
+            &repository,
+            &project_id,
+            &plan.id,
+            Some(destination.to_str().unwrap()),
+        )
+        .unwrap();
+        let preview = preview_production_plan(&repository, &project_id, &plan.id).unwrap();
+        assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+        assert_eq!(preview.manifest_draft.selected_file_count, 1);
+        assert_eq!(
+            preview.manifest_draft.entries[0].original_filename,
+            "KEEP.JPG"
+        );
+        assert_eq!(preview.inspection.included_count, 1);
+        assert_eq!(preview.inspection.excluded_count, 1);
+        assert!(preview
+            .inspection
+            .items
+            .iter()
+            .any(|item| item.original_filename == "KEEP.JPG" && item.state == "included"));
+        assert!(preview
+            .inspection
+            .items
+            .iter()
+            .any(|item| item.original_filename == "REVIEW.JPG" && item.state == "excluded"));
+        assert!(
+            !destination.join("KEEP.JPG").exists(),
+            "dry run must not write media"
+        );
+
+        let manifest =
+            create_production_export_manifest(&repository, &project_id, &plan.id).unwrap();
+        let first =
+            export_production_manifest(&repository, &project_id, &manifest.id, || false, |_| {})
+                .unwrap();
+        assert_eq!(first.state, "completed");
+        assert_eq!(first.verified_count, 1);
+        assert_eq!(
+            fs::read(destination.join("KEEP.JPG")).unwrap(),
+            original_keep
+        );
+        assert!(!destination.join("REVIEW.JPG").exists());
+        assert_eq!(
+            fs::read(source.join("KEEP.JPG")).unwrap(),
+            original_keep,
+            "export must not alter source media"
+        );
+        let report_path = fs::read_dir(destination.join("CaptureOS_Delivery_Reports"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("CaptureOS_Delivery_Report_") && name.ends_with(".json")
+                    })
+            })
+            .unwrap();
+        let report = fs::read_to_string(report_path).unwrap();
+        assert!(report.contains("Client delivery"));
+        assert!(!report.contains("Private client detail"));
+        assert!(!report.contains(source.to_str().unwrap()));
+        assert!(!report.contains(&keep_id.to_string()));
+        assert!(!report.contains(&first.export_job_id));
+        assert!(!report.contains("\"jobId\""));
+
+        let resumed =
+            export_production_manifest(&repository, &project_id, &manifest.id, || false, |_| {})
+                .unwrap();
+        assert_eq!(resumed.state, "completed");
+        assert_eq!(resumed.verified_count, 1);
+        assert_eq!(
+            resumed.skipped_identical_count, 1,
+            "same frozen manifest must safely reuse verified content"
+        );
+        let cancelled =
+            export_production_manifest(&repository, &project_id, &manifest.id, || true, |_| {})
+                .unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        assert_eq!(
+            fs::read(destination.join("KEEP.JPG")).unwrap(),
+            original_keep,
+            "cancellation must retain an already verified destination file"
+        );
+        let history = load_production_workspace(&repository, &project_id).unwrap();
+        assert_eq!(history.recent_exports.len(), 3);
+
+        let editor_destination = directory.path().join("editor-workset");
+        fs::create_dir_all(&editor_destination).unwrap();
+        let editor_plan = create_production_plan(
+            &repository,
+            &project_id,
+            &ProductionPlanInput {
+                name: "Editor handoff".into(),
+                plan_type: delivery_brain::ProductionPlanType::EditorWorkset,
+                selection_rules: delivery_brain::SelectionRules::editor_workset(),
+                organization: delivery_brain::OrganizationStrategy::SingleFolder,
+                filename_strategy: delivery_brain::FilenameStrategy::PreserveOriginal,
+            },
+        )
+        .unwrap();
+        update_production_plan_destination(
+            &repository,
+            &project_id,
+            &editor_plan.id,
+            Some(editor_destination.to_str().unwrap()),
+        )
+        .unwrap();
+        let editor_manifest =
+            create_production_export_manifest(&repository, &project_id, &editor_plan.id).unwrap();
+        let editor_export = export_production_manifest(
+            &repository,
+            &project_id,
+            &editor_manifest.id,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(editor_export.state, "completed");
+        assert!(editor_destination.join("KEEP.JPG").is_file());
+        assert!(editor_destination.join("REVIEW.JPG").is_file());
+        let handoff_path = fs::read_dir(editor_destination.join("CaptureOS_Delivery_Reports"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("CaptureOS_Editor_Handoff_Manifest_")
+                            && name.ends_with(".json")
+                    })
+            })
+            .unwrap();
+        let handoff = fs::read_to_string(handoff_path).unwrap();
+        assert!(handoff.contains("REVIEW.JPG"));
+        assert!(handoff.contains("\"humanDecision\": \"review\""));
+        assert!(!handoff.contains("Private client detail"));
+        assert!(!handoff.contains(source.to_str().unwrap()));
+        assert!(!handoff.contains(&keep_id.to_string()));
+        assert!(!handoff.contains(&review_id.to_string()));
+        assert!(!handoff.contains(&editor_export.export_job_id));
+        assert!(!handoff.contains("\"jobId\""));
+    }
+
+    #[test]
+    fn production_preview_blocks_a_different_destination_collision_without_writing() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("delivery");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("IMG_0001.JPG"), b"trusted source bytes").unwrap();
+        fs::write(
+            destination.join("IMG_0001.JPG"),
+            b"different existing destination bytes",
+        )
+        .unwrap();
+        let original_collision = fs::read(destination.join("IMG_0001.JPG")).unwrap();
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = create_local_project(&repository, "No overwrite").unwrap();
+        let project_id = ProjectId::try_from(project.id.as_str()).unwrap();
+        index_local_folder(&repository, &project_id, source.to_str().unwrap(), |_| {}).unwrap();
+        let asset_id = MediaAssetId::try_from(
+            load_project_home(&repository, &project_id, MediaBrowserFilter::All, 0, 10)
+                .unwrap()
+                .media[0]
+                .asset_id
+                .as_str(),
+        )
+        .unwrap();
+        repository
+            .update_culling_decision(
+                &project_id,
+                &asset_id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        let plan = create_production_plan(
+            &repository,
+            &project_id,
+            &ProductionPlanInput {
+                name: "Collision check".into(),
+                plan_type: delivery_brain::ProductionPlanType::ClientDelivery,
+                selection_rules: delivery_brain::SelectionRules::client_delivery(),
+                organization: delivery_brain::OrganizationStrategy::SingleFolder,
+                filename_strategy: delivery_brain::FilenameStrategy::PreserveOriginal,
+            },
+        )
+        .unwrap();
+        update_production_plan_destination(
+            &repository,
+            &project_id,
+            &plan.id,
+            Some(destination.to_str().unwrap()),
+        )
+        .unwrap();
+        let preview = preview_production_plan(&repository, &project_id, &plan.id).unwrap();
+        assert!(preview
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("different content")));
+        assert!(create_production_export_manifest(&repository, &project_id, &plan.id).is_err());
+        assert_eq!(
+            fs::read(destination.join("IMG_0001.JPG")).unwrap(),
+            original_collision
+        );
     }
 
     fn metadata_inspection_for_capture_time(

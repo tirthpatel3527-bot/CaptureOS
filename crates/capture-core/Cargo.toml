@@ -8,6 +8,7 @@ license.workspace = true
 blake3.workspace = true
 capture-graph = { path = "../capture-graph" }
 capture-intelligence = { path = "../capture-intelligence" }
+delivery-brain = { path = "../delivery-brain" }
 chrono.workspace = true
 ingest = { path = "../ingest" }
 media-model = { path = "../media-model" }

@@ -10,6 +10,7 @@ members = [
   "crates/magic-search",
   "crates/moment-brain",
   "crates/studio-brain",
+  "crates/delivery-brain",
   "crates/storage",
   "crates/ingest",
   "crates/integrity",
@@ -18,6 +19,7 @@ members = [
   "research/magic-search-bench",
   "research/moment-brain-bench",
   "research/studio-brain-bench",
+  "research/delivery-brain-bench",
 ]
 resolver = "2"
 

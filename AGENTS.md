@@ -92,3 +92,17 @@ CaptureOS is local-first software for professional camera media. Preserve these 
 - Confidence bands and explanations must come from actual available features/calibration. Prefer `NOT ENOUGH EVIDENCE` or `REVIEW` to a fabricated personalized conclusion.
 - Never upload preference examples, decisions, ratings, stars, models, metrics, features, cached previews, embeddings, project names, paths, notes, or media. Studio Brain must remain offline-capable and free of mandatory cloud, telemetry, or paid APIs.
 - Limit Milestone 8 to current photographer-controlled culling recommendations, explicit local training, local model lifecycle, Smart Cull/Similar Set advisory surfaces, and synthetic evaluation. Do not start Milestone 9, auto-culling, deletion, People Brain, event intelligence, editing/style training, video/audio intelligence, cloud, collaboration, billing, or write-back.
+
+## Milestone 9 Delivery Brain and Production Pipeline I rules
+
+- Never modify, move, rename, delete, format, write metadata/sidecars beside, or otherwise alter source media while planning or exporting. Production organization is virtual until an explicitly requested verified copy to a user-selected local destination.
+- A Production Plan is photographer intent, an Export Manifest is an immutable validated snapshot, and an Export Job is one execution. Never conflate them or re-evaluate a manifest during export.
+- Human Keep/Reject/Review, ratings, stars, notes, and representatives remain authoritative and separate. Studio Brain recommendations are advisory only and must never become final delivery selection without an explicit human decision.
+- Plan-local include/exclude overrides and Virtual Collection membership are organizational metadata only. They must never rewrite Smart Cull decisions, decision history, source media, or Moment organization.
+- Require a dry run before creating an exportable manifest and require current preflight before writes. If a plan setting, human decision, Moment organization, or static Virtual Collection membership changes during creation, reject the stale candidate rather than silently snapshotting a race.
+- Select only an available, catalog-approved `FileInstance`; prefer independent verified-copy evidence when available. Treat source/destination paths, labels, filenames, templates, and existing destination content as untrusted.
+- Never silently overwrite a destination file. Reuse only a content-identical verified file; otherwise report a collision. Keep partial files marked incomplete and preserve already verified destination files on cancel, disconnect, failure, or restart.
+- An Export Job is complete only after streaming BLAKE3 source-to-destination verification. A partial or interrupted run must be labeled honestly and be resumable without trusting an unverified file.
+- M9 remains local/offline and has no artificial project, media, file-count, or storage limit. Do not add cloud delivery, telemetry, hosted storage, Adobe/NLE integrations, rendering/editing, write-back, automatic delivery, or deletion.
+- Client-facing delivery reports must exclude private notes, source paths, internal IDs, AI technical scores, Studio recommendations, raw embeddings, and model data by default.
+- Stop at the requested milestone. Do not begin Milestone 10 without explicit approval.

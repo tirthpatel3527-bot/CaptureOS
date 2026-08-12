@@ -4,32 +4,40 @@ use capture_core::{
     analyze_capture_intelligence, apply_culling_decision, clear_magic_search_history,
     clear_visual_cache, complete_culling_group,
     create_coverage_checklist_item as create_coverage_checklist_item_core, create_local_project,
+    create_production_export_manifest, create_production_plan, create_virtual_collection,
     export_culling_report, export_studio_brain_preference_examples, find_similar,
     finish_culling_review, index_local_folder, index_semantic_embeddings, ingest_history,
     ingest_report, list_local_projects, load_capture_intelligence_summary, load_culling_progress,
     load_culling_workspace, load_magic_search_history, load_media_asset_detail,
     load_moment_checklists, load_moment_detail, load_moment_timeline, load_moment_timeline_status,
-    load_project_home, load_project_library, load_semantic_index_status, load_similarity_group,
-    load_studio_brain_status, load_visual_media_page, load_visual_preparation_summary,
-    merge_adjacent_moments as merge_adjacent_moments_core, preflight_ingest, prepare_visual_media,
+    load_production_workspace, load_project_home, load_project_library, load_semantic_index_status,
+    load_similarity_group, load_studio_brain_status, load_visual_media_page,
+    load_visual_preparation_summary, merge_adjacent_moments as merge_adjacent_moments_core,
+    preflight_ingest, preflight_production_export, prepare_visual_media,
     recover_interrupted_capture_intelligence, recover_interrupted_ingests,
-    recover_interrupted_moment_analysis, recover_interrupted_semantic_indexing,
-    recover_interrupted_studio_training, recover_interrupted_visual_preparations,
-    refresh_capture_metadata, rename_moment as rename_moment_core,
-    reset_studio_brain_personalization, restart_ingest, retry_failed_visual_media,
-    save_human_intelligence_decision, search_magic, search_moments,
+    recover_interrupted_moment_analysis, recover_interrupted_production_exports,
+    recover_interrupted_semantic_indexing, recover_interrupted_studio_training,
+    recover_interrupted_visual_preparations, refresh_capture_metadata,
+    rename_moment as rename_moment_core, reset_studio_brain_personalization, restart_ingest,
+    retry_failed_visual_media, save_human_intelligence_decision, search_magic, search_moments,
     set_culling_group_representative,
     set_moment_human_representative as set_moment_human_representative_core,
-    set_studio_brain_enabled, set_studio_brain_project_included, split_moment as split_moment_core,
-    start_ingest, start_moment_analysis as run_moment_analysis, train_studio_brain,
+    set_production_plan_override, set_static_virtual_collection_member,
+    set_static_virtual_collection_members, set_studio_brain_enabled,
+    set_studio_brain_project_included, split_moment as split_moment_core, start_ingest,
+    start_moment_analysis as run_moment_analysis, train_studio_brain,
     update_coverage_confirmation as update_coverage_confirmation_core, update_culling_position,
-    CaptureIntelligenceProgress, CreateCoverageChecklistItemInput, FindSimilarRequest,
-    IngestPreflightView, JobView, MagicSearchHistoryEntry, MagicSearchRequest, MagicSearchResponse,
-    MediaPreparationProgress, MetadataRefreshProgress, MomentAnalysisProgress, MomentChecklistView,
-    MomentDetailView, MomentSearchRequest, MomentSearchResponse, MomentTimelineView, ProjectHome,
-    ProjectLibraryItem, ProjectView, SemanticIndexProgress, SemanticStorageRoots,
-    SiglipProviderCache, StudioBrainProgress, UpdateCoverageConfirmationInput,
+    update_production_plan_configuration, update_production_plan_destination,
+    update_production_plan_destination_reserve, CaptureIntelligenceProgress,
+    CreateCoverageChecklistItemInput, FindSimilarRequest, IngestPreflightView, JobView,
+    MagicSearchHistoryEntry, MagicSearchRequest, MagicSearchResponse, MediaPreparationProgress,
+    MetadataRefreshProgress, MomentAnalysisProgress, MomentChecklistView, MomentDetailView,
+    MomentSearchRequest, MomentSearchResponse, MomentTimelineView, ProductionExportProgress,
+    ProductionPlanPreview, ProjectHome, ProjectLibraryItem, ProjectView, SemanticIndexProgress,
+    SemanticStorageRoots, SiglipProviderCache, StudioBrainProgress,
+    UpdateCoverageConfirmationInput,
 };
+use delivery_brain::PlanOverrideKind;
 use ingest::IngestRequest;
 use media_model::{
     AnalysisResourceMode, CullingDecisionValue, HumanDecisionValue, IngestJobId,
@@ -37,8 +45,10 @@ use media_model::{
 };
 use persistence::{
     CatalogRepository, CullingDecisionUpdate, CullingDecisionView, CullingProgress, CullingQuery,
-    CullingWorkspaceView, IngestJobSummary, IngestReport, MediaAssetDetail, MediaBrowserFilter,
-    PersistenceError, ReviewSessionView, SimilarityGroupView, SqliteRepository, VisualMediaFilter,
+    CullingWorkspaceView, ExportManifestRecord, IngestJobSummary, IngestReport, MediaAssetDetail,
+    MediaBrowserFilter, PersistenceError, ProductionPlanInput, ProductionPlanRecord,
+    ProductionPreflight, ProductionWorkspaceView, ReviewSessionView, SimilarityGroupView,
+    SqliteRepository, VirtualCollectionInput, VirtualCollectionRecord, VisualMediaFilter,
     VisualMediaPage, VisualMediaQuery, VisualMediaSort,
 };
 use serde::{Deserialize, Serialize};
@@ -71,6 +81,8 @@ struct AppState {
     active_moment_projects: Arc<Mutex<HashSet<String>>>,
     moment_pause_controls: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     active_studio_profiles: Arc<Mutex<HashSet<String>>>,
+    active_production_manifests: Arc<Mutex<HashSet<String>>>,
+    production_cancel_controls: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 /// Studio Brain training and its settings are profile-scoped, rather than project-scoped. This
@@ -138,6 +150,41 @@ fn begin_moment_project_mutation(
     Ok(MomentProjectMutationGuard {
         active_projects: Arc::clone(active_projects),
         project_key,
+    })
+}
+
+/// A frozen manifest represents one exact local copy plan. This process-level guard closes the
+/// short gap before the durable active-job constraint is created, while SQLite remains the
+/// authoritative guard across windows or processes.
+struct ProductionManifestMutationGuard {
+    active_manifests: Arc<Mutex<HashSet<String>>>,
+    manifest_key: String,
+}
+
+impl Drop for ProductionManifestMutationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active_manifests.lock() {
+            active.remove(&self.manifest_key);
+        }
+    }
+}
+
+fn begin_production_manifest_mutation(
+    active_manifests: &Arc<Mutex<HashSet<String>>>,
+    manifest_key: String,
+) -> Result<ProductionManifestMutationGuard, String> {
+    let mut active = active_manifests
+        .lock()
+        .map_err(|_| "Production export lock was poisoned".to_owned())?;
+    if !active.insert(manifest_key.clone()) {
+        return Err(
+            "This frozen Delivery Manifest is already exporting locally. Wait for it to finish or cancel it."
+                .into(),
+        );
+    }
+    Ok(ProductionManifestMutationGuard {
+        active_manifests: Arc::clone(active_manifests),
+        manifest_key,
     })
 }
 
@@ -1256,6 +1303,337 @@ fn reset_studio_brain_personalization_command(
     reset_studio_brain_personalization(&*repository, &project_id).map_err(|error| error.to_string())
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductionScopedEvent<T> {
+    project_id: String,
+    manifest_id: String,
+    progress: T,
+}
+
+/// Cheap project-scoped production projection. It does not inspect destinations, build a
+/// manifest, or start a file operation simply because the photographer opened the workspace.
+#[tauri::command(rename_all = "camelCase")]
+fn production_workspace_command(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProductionWorkspaceView, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    load_production_workspace(&*repository, &project_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn create_production_plan_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    input: ProductionPlanInput,
+) -> Result<ProductionPlanRecord, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    create_production_plan(&*repository, &project_id, &input).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn update_production_plan_configuration_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    plan_id: String,
+    input: ProductionPlanInput,
+) -> Result<ProductionPlanRecord, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    update_production_plan_configuration(&*repository, &project_id, &plan_id, &input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn set_production_plan_destination_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    plan_id: String,
+    destination_path: Option<String>,
+) -> Result<ProductionPlanRecord, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    update_production_plan_destination(
+        &*repository,
+        &project_id,
+        &plan_id,
+        destination_path.as_deref(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Changes only the per-plan free-space headroom required before a local export. This cannot
+/// alter source media or create a storage/file-count limit; it simply requires a fresh manifest.
+#[tauri::command(rename_all = "camelCase")]
+fn set_production_plan_destination_reserve_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    plan_id: String,
+    reserve_bytes: u64,
+) -> Result<ProductionPlanRecord, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    update_production_plan_destination_reserve(&*repository, &project_id, &plan_id, reserve_bytes)
+        .map_err(|error| error.to_string())
+}
+
+/// This is a plan-local organizational exception only. It cannot mutate Keep/Reject/Review,
+/// ratings, notes, Studio advice, or source media.
+#[tauri::command(rename_all = "camelCase")]
+fn set_production_plan_override_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    plan_id: String,
+    asset_id: String,
+    kind: Option<PlanOverrideKind>,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let asset_id = MediaAssetId::try_from(asset_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    set_production_plan_override(&*repository, &project_id, &plan_id, &asset_id, kind)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn create_virtual_collection_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    input: VirtualCollectionInput,
+) -> Result<VirtualCollectionRecord, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    create_virtual_collection(&*repository, &project_id, &input).map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn set_static_virtual_collection_members_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    collection_id: String,
+    asset_ids: Vec<String>,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let asset_ids = asset_ids
+        .iter()
+        .map(|id| MediaAssetId::try_from(id.as_str()).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    set_static_virtual_collection_members(&*repository, &project_id, &collection_id, &asset_ids)
+        .map_err(|error| error.to_string())
+}
+
+/// Bounded one-asset collection mutation for the Production inspection view. It is a local
+/// reference update only and cannot alter a Smart Cull decision or source media.
+#[tauri::command(rename_all = "camelCase")]
+fn set_static_virtual_collection_member_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    collection_id: String,
+    asset_id: String,
+    included: bool,
+) -> Result<(), String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let asset_id = MediaAssetId::try_from(asset_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    set_static_virtual_collection_member(
+        &*repository,
+        &project_id,
+        &collection_id,
+        &asset_id,
+        included,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn production_plan_preview_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    plan_id: String,
+) -> Result<ProductionPlanPreview, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    capture_core::preview_production_plan(&*repository, &project_id, &plan_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn create_production_manifest_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    plan_id: String,
+) -> Result<ExportManifestRecord, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    create_production_export_manifest(&*repository, &project_id, &plan_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn production_manifest_preflight_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    manifest_id: String,
+) -> Result<ProductionPreflight, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    preflight_production_export(&*repository, &project_id, &manifest_id)
+        .map_err(|error| error.to_string())
+}
+
+/// Starts an explicit local export from an immutable manifest. A fresh repository connection
+/// permits browsing and culling while the verified copier runs. Both this guard and the durable
+/// partial unique index reject duplicate starts.
+#[tauri::command(rename_all = "camelCase")]
+fn start_production_export_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+    manifest_id: String,
+) -> Result<ProductionExportProgress, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let manifest_key = manifest_id.trim().to_owned();
+    if manifest_key.is_empty() {
+        return Err("Choose a frozen Delivery Manifest before exporting".into());
+    }
+    let mutation_guard = begin_production_manifest_mutation(
+        &state.active_production_manifests,
+        manifest_key.clone(),
+    )?;
+    let cancellation = Arc::new(AtomicBool::new(false));
+    state
+        .production_cancel_controls
+        .lock()
+        .map_err(|_| "Production export cancellation lock was poisoned".to_owned())?
+        .insert(manifest_key.clone(), Arc::clone(&cancellation));
+    let catalog_path = state.catalog_path.clone();
+    let event_project_id = project_id.to_string();
+    let event_manifest_id = manifest_key.clone();
+    let cancellation_controls = Arc::clone(&state.production_cancel_controls);
+    let _worker = tauri::async_runtime::spawn_blocking(move || {
+        let _manifest_mutation = mutation_guard;
+        let result = (|| {
+            let repository =
+                SqliteRepository::open(catalog_path).map_err(|error| error.to_string())?;
+            capture_core::export_production_manifest(
+                &repository,
+                &project_id,
+                &manifest_key,
+                || cancellation.load(Ordering::Relaxed),
+                |progress| {
+                    let _ = app.emit(
+                        "production-export-progress",
+                        ProductionScopedEvent {
+                            project_id: event_project_id.clone(),
+                            manifest_id: event_manifest_id.clone(),
+                            progress: progress.clone(),
+                        },
+                    );
+                },
+            )
+            .map_err(|error| error.to_string())
+        })();
+        if let Ok(mut controls) = cancellation_controls.lock() {
+            controls.remove(&manifest_key);
+        }
+        if let Err(error) = result {
+            let _ = app.emit(
+                "production-export-progress",
+                ProductionScopedEvent {
+                    project_id: event_project_id,
+                    manifest_id: event_manifest_id,
+                    progress: ProductionExportProgress {
+                        export_job_id: String::new(),
+                        manifest_id: manifest_key,
+                        state: "failed".into(),
+                        stage: "finalize".into(),
+                        items_completed: 0,
+                        items_total: 0,
+                        verified_count: 0,
+                        skipped_identical_count: 0,
+                        failed_count: 1,
+                        verified_bytes: 0,
+                        current_filename: None,
+                        message: Some("The local export could not be started or completed. No source media was changed.".into()),
+                    },
+                },
+            );
+            eprintln!("Production export worker diagnostic: {error}");
+        }
+    });
+    Ok(ProductionExportProgress {
+        export_job_id: String::new(),
+        manifest_id,
+        state: "queued".into(),
+        stage: "queued".into(),
+        items_completed: 0,
+        items_total: 0,
+        verified_count: 0,
+        skipped_identical_count: 0,
+        failed_count: 0,
+        verified_bytes: 0,
+        current_filename: None,
+        message: Some(
+            "Verified local export is queued and will not block project browsing.".into(),
+        ),
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn cancel_production_export_command(
+    state: State<'_, AppState>,
+    manifest_id: String,
+) -> Result<(), String> {
+    let controls = state
+        .production_cancel_controls
+        .lock()
+        .map_err(|_| "Production export cancellation lock was poisoned".to_owned())?;
+    let cancellation = controls
+        .get(manifest_id.trim())
+        .ok_or_else(|| "No active local export was found for this Delivery Manifest".to_owned())?;
+    cancellation.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn update_culling_decision_command(
     state: State<'_, AppState>,
@@ -1857,6 +2235,7 @@ fn main() {
             recover_interrupted_semantic_indexing(&repository)?;
             recover_interrupted_moment_analysis(&repository)?;
             recover_interrupted_studio_training(&repository)?;
+            recover_interrupted_production_exports(&repository)?;
             let data_directory = app_data_directory(app.handle())?;
             let preview_cache_root = data_directory.join("preview-cache");
             // These roots contain only CaptureOS-managed derived data and operator-installed
@@ -1881,6 +2260,8 @@ fn main() {
                 active_moment_projects: Arc::new(Mutex::new(HashSet::new())),
                 moment_pause_controls: Arc::new(Mutex::new(HashMap::new())),
                 active_studio_profiles: Arc::new(Mutex::new(HashSet::new())),
+                active_production_manifests: Arc::new(Mutex::new(HashSet::new())),
+                production_cancel_controls: Arc::new(Mutex::new(HashMap::new())),
             });
             Ok(())
         })
@@ -1926,6 +2307,20 @@ fn main() {
             set_studio_brain_project_included_command,
             set_studio_brain_enabled_command,
             reset_studio_brain_personalization_command,
+            production_workspace_command,
+            create_production_plan_command,
+            update_production_plan_configuration_command,
+            set_production_plan_destination_command,
+            set_production_plan_destination_reserve_command,
+            set_production_plan_override_command,
+            create_virtual_collection_command,
+            set_static_virtual_collection_members_command,
+            set_static_virtual_collection_member_command,
+            production_plan_preview_command,
+            create_production_manifest_command,
+            production_manifest_preflight_command,
+            start_production_export_command,
+            cancel_production_export_command,
             update_culling_decision_command,
             update_culling_position_command,
             set_culling_group_representative_command,
@@ -1995,6 +2390,19 @@ mod tests {
     }
 
     #[test]
+    fn production_manifest_guard_rejects_a_duplicate_start_until_the_worker_releases_it() {
+        let active_manifests = Arc::new(Mutex::new(HashSet::new()));
+        let first =
+            begin_production_manifest_mutation(&active_manifests, "manifest-1".into()).unwrap();
+        assert!(
+            begin_production_manifest_mutation(&active_manifests, "manifest-1".into()).is_err()
+        );
+        assert!(begin_production_manifest_mutation(&active_manifests, "manifest-2".into()).is_ok());
+        drop(first);
+        assert!(begin_production_manifest_mutation(&active_manifests, "manifest-1".into()).is_ok());
+    }
+
+    #[test]
     fn preview_bridge_serves_a_registered_ready_artifact_and_rejects_unknown_ids() {
         let directory = tempdir().unwrap();
         let cache_root = directory.path().join("preview-cache");
@@ -2060,6 +2468,8 @@ mod tests {
             active_moment_projects: Arc::new(Mutex::new(HashSet::new())),
             moment_pause_controls: Arc::new(Mutex::new(HashMap::new())),
             active_studio_profiles: Arc::new(Mutex::new(HashSet::new())),
+            active_production_manifests: Arc::new(Mutex::new(HashSet::new())),
+            production_cancel_controls: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let request = http::Request::builder()

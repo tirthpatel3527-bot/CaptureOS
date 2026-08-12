@@ -39,6 +39,14 @@ import type {
   ProjectHome,
   ProjectLibraryItem,
   ProjectView,
+  ProductionExportProgress,
+  ProductionPlanInput,
+  ProductionPlanPreview,
+  ProductionPlanType,
+  ProductionWorkspaceView,
+  ExportManifestView,
+  ProductionPreflight,
+  VirtualCollectionInput,
   SemanticIndexProgress,
   SemanticResourceMode,
   SimilarityGroupView,
@@ -65,10 +73,11 @@ const filters: { id: MediaFilter; label: string }[] = [
   { id: "unknown", label: "Unknown" },
 ];
 
-type ProjectSurface = "media" | "ingest" | "cull" | "timeline" | "studio";
+type ProjectSurface = "media" | "ingest" | "cull" | "timeline" | "studio" | "production";
 type AppRoute = { kind: "home" } | { kind: "project"; projectId: string; surface: ProjectSurface; momentId?: string };
 type ProjectScopedEvent<T> = { projectId: string; progress: T };
 type StudioProfileScopedEvent<T> = { projectId: string; profileId: string; progress: T };
+type ProductionScopedEvent<T> = { projectId: string; manifestId: string; progress: T };
 
 function routeHash(route: AppRoute) {
   if (route.kind === "home") return "#/";
@@ -81,6 +90,8 @@ function routeHash(route: AppRoute) {
         ? `/timeline${momentSuffix}`
         : route.surface === "studio"
           ? "/studio"
+          : route.surface === "production"
+            ? "/production"
         : "";
   return `#/project/${encodeURIComponent(route.projectId)}${suffix}`;
 }
@@ -96,6 +107,8 @@ function readRoute(): AppRoute {
         ? "timeline"
         : segments[2] === "studio"
           ? "studio"
+          : segments[2] === "production"
+            ? "production"
         : "media";
   return {
     kind: "project",
@@ -327,12 +340,13 @@ export function App() {
       {error ? <p className="error" role="alert">{error}</p> : null}
       {showCreateProject ? <ProjectCreation onCancel={() => setShowCreateProject(false)} name={newProjectName} onName={setNewProjectName} onSubmit={createProject} /> : null}
       {route.kind === "home" ? <ProjectLibrary projects={projects} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onCreate={() => setShowCreateProject(true)} /> : null}
-      {project && route.kind === "project" ? <ProjectHeader project={project} projects={projects} surface={route.surface} isIndexing={isIndexing} isIngesting={isIngesting} onHome={() => navigate({ kind: "home" })} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} /> : null}
-      {project && route.kind === "project" && route.surface === "media" && activeHome ? <ProjectWorkspace key={project.id} home={activeHome} cullingProgress={cullingProgress} job={liveJob} filter={filter} onFilter={changeFilter} hasMoreMedia={hasMoreMedia} isLoadingMore={isLoadingMore} onLoadMore={loadMoreMedia} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onMoments={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} /> : null}
+      {project && route.kind === "project" ? <ProjectHeader project={project} projects={projects} surface={route.surface} isIndexing={isIndexing} isIngesting={isIngesting} onHome={() => navigate({ kind: "home" })} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} onProduction={() => navigate({ kind: "project", projectId: project.id, surface: "production" })} /> : null}
+      {project && route.kind === "project" && route.surface === "media" && activeHome ? <ProjectWorkspace key={project.id} home={activeHome} cullingProgress={cullingProgress} job={liveJob} filter={filter} onFilter={changeFilter} hasMoreMedia={hasMoreMedia} isLoadingMore={isLoadingMore} onLoadMore={loadMoreMedia} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onMoments={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} onProduction={() => navigate({ kind: "project", projectId: project.id, surface: "production" })} /> : null}
       {project && route.kind === "project" && route.surface === "ingest" ? <IngestWorkspace key={project.id} project={project} history={ingestHistory} report={ingestReport} isIngesting={isIngesting} onReport={setIngestReport} onHistory={setIngestHistory} onIngesting={setIsIngesting} onError={setError} /> : null}
       {project && route.kind === "project" && route.surface === "cull" ? <CullingWorkspace key={`${project.id}:${route.momentId ?? "all"}`} project={project} momentId={route.momentId} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: route.momentId ? "timeline" : "media", ...(route.momentId ? { momentId: route.momentId } : {}) })} onError={setError} /> : null}
       {project && route.kind === "project" && route.surface === "timeline" ? <MomentTimelineWorkspace key={`${project.id}:${route.momentId ?? "timeline"}`} project={project} initialMomentId={route.momentId} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} onShowTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onOpenMoment={(momentId) => navigate({ kind: "project", projectId: project.id, surface: "timeline", momentId })} onCullMoment={(momentId) => navigate({ kind: "project", projectId: project.id, surface: "cull", momentId })} onError={setError} /> : null}
       {project && route.kind === "project" && route.surface === "studio" ? <StudioBrainWorkspace key={project.id} project={project} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} /> : null}
+      {project && route.kind === "project" && route.surface === "production" ? <ProductionWorkspace key={project.id} project={project} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} /> : null}
     </main>
   );
 }
@@ -345,7 +359,7 @@ function ProjectLibrary({ projects, onOpen, onCreate }: { projects: ProjectLibra
   return <section className="project-library"><div className="library-hero"><div><p className="eyebrow">CAPTUREOS</p><h1>Your shoots</h1><p className="lede">A local library for every production. Choose a project, or start a clean one.</p></div><button className="primary library-create" onClick={onCreate}>New Project</button></div><div className="library-heading"><h2>Recent projects</h2><small>{projects.length === 1 ? "1 project" : `${projects.length} projects`}</small></div>{projects.length ? <div className="project-cards">{projects.map((item) => <button className="project-card" key={item.id} onClick={() => onOpen(item.id)} aria-label={`Open ${item.name}`}><span className="project-cover" aria-hidden="true">COS</span><strong>{item.name}</strong><span className="project-card-meta"><span>Media <b>{item.mediaAssetCount}</b></span><span>{item.storageVolumeCount ? `${item.storageVolumeCount} storage volume${item.storageVolumeCount === 1 ? "" : "s"}` : "No storage indexed"}</span><span>Protection {protectionLabel(item.protectionState)}</span></span><small>Last activity {formatProjectDate(item.lastActivityAt)}</small></button>)}</div> : <StatusCard><div className="project-empty"><p className="eyebrow">YOUR SHOOT STARTS HERE</p><h2>There are no projects yet.</h2><p className="muted">Index existing media or ingest camera cards after you create your first project.</p><button className="primary" onClick={onCreate}>New Project</button></div></StatusCard>}</section>;
 }
 
-function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, onHome, onOpen, onIndex, onIngest, onCull, onTimeline, onStudio }: { project: ProjectView; projects: ProjectLibraryItem[]; surface: ProjectSurface; isIndexing: boolean; isIngesting: boolean; onHome: () => void; onOpen: (projectId: string) => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onTimeline: () => void; onStudio: () => void }) {
+function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, onHome, onOpen, onIndex, onIngest, onCull, onTimeline, onStudio, onProduction }: { project: ProjectView; projects: ProjectLibraryItem[]; surface: ProjectSurface; isIndexing: boolean; isIngesting: boolean; onHome: () => void; onOpen: (projectId: string) => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onTimeline: () => void; onStudio: () => void; onProduction: () => void }) {
   const lede = surface === "ingest"
     ? "Safe ingest remains attached to this project."
     : surface === "cull"
@@ -355,7 +369,7 @@ function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, on
       : surface === "studio"
         ? "Local, explainable preference modeling from your explicit human decisions."
         : "Index and analyze local media in this selected project.";
-  return <section className="project-header"><div><button className="back-link" onClick={onHome}>← All Projects</button><p className="eyebrow">PROJECT WORKSPACE</p><h1>{project.name}</h1><p className="lede">{lede}</p></div><div className="project-actions"><select aria-label="Switch project" value={project.id} onChange={(event) => onOpen(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className={surface === "timeline" ? "primary" : "secondary"} onClick={onTimeline}>Moments</button><button className={surface === "cull" ? "primary" : "secondary"} onClick={onCull}>Smart Cull</button><button className={surface === "studio" ? "primary" : "secondary"} onClick={onStudio}>Studio Brain</button><button className={surface === "ingest" ? "primary" : "secondary"} disabled={isIngesting} onClick={onIngest}>Ingest Shoot</button><button className={surface === "media" ? "primary" : "secondary"} disabled={isIndexing} onClick={onIndex}>{isIndexing ? "Indexing…" : "Index Folder"}</button></div></section>;
+  return <section className="project-header"><div><button className="back-link" onClick={onHome}>← All Projects</button><p className="eyebrow">PROJECT WORKSPACE</p><h1>{project.name}</h1><p className="lede">{lede}</p></div><div className="project-actions"><select aria-label="Switch project" value={project.id} onChange={(event) => onOpen(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className={surface === "timeline" ? "primary" : "secondary"} onClick={onTimeline}>Moments</button><button className={surface === "cull" ? "primary" : "secondary"} onClick={onCull}>Smart Cull</button><button className={surface === "studio" ? "primary" : "secondary"} onClick={onStudio}>Studio Brain</button><button className={surface === "production" ? "primary" : "secondary"} onClick={onProduction}>Production</button><button className={surface === "ingest" ? "primary" : "secondary"} disabled={isIngesting} onClick={onIngest}>Ingest Shoot</button><button className={surface === "media" ? "primary" : "secondary"} disabled={isIndexing} onClick={onIndex}>{isIndexing ? "Indexing…" : "Index Folder"}</button></div></section>;
 }
 
 function formatProjectDate(value: string) {
@@ -369,7 +383,7 @@ function protectionLabel(value: string) {
   return "not recorded";
 }
 
-function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMoreMedia, isLoadingMore, onLoadMore, onIndex, onIngest, onCull, onMoments, onStudio }: { home: ProjectHome; cullingProgress: CullingProgress | null; job: JobView | null; filter: MediaFilter; onFilter: (filter: MediaFilter) => void; hasMoreMedia: boolean; isLoadingMore: boolean; onLoadMore: () => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onMoments: () => void; onStudio: () => void }) {
+function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMoreMedia, isLoadingMore, onLoadMore, onIndex, onIngest, onCull, onMoments, onStudio, onProduction }: { home: ProjectHome; cullingProgress: CullingProgress | null; job: JobView | null; filter: MediaFilter; onFilter: (filter: MediaFilter) => void; hasMoreMedia: boolean; isLoadingMore: boolean; onLoadMore: () => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onMoments: () => void; onStudio: () => void; onProduction: () => void }) {
   const [visual, setVisual] = useState<VisualMediaPage | null>(null);
   const [visualFilter, setVisualFilter] = useState<VisualMediaFilter>("all");
   const [visualSort, setVisualSort] = useState<VisualMediaSort>("captureTime");
@@ -795,6 +809,7 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
       <section className="culling-entry" aria-label="Moments timeline entry"><div><p className="section-label">Moment Brain</p><h2>Moments timeline</h2><p className="muted">{home.summary.momentCount ? `${home.summary.momentCount.toLocaleString()} local Moment${home.summary.momentCount === 1 ? "" : "s"} detected. ` : "No Moment analysis yet. "}Review a local structural timeline built from capture evidence. It never starts analysis while this project opens, never changes Similar Sets, and keeps your labels and split/merge choices authoritative.</p></div><button className="secondary" onClick={onMoments}>Open Moments</button></section>
       <section className="culling-entry" aria-label="Culling workspace entry"><div><p className="section-label">Human review</p><h2>Smart Culling Workspace</h2><p className="muted">{cullingProgress ? `${cullingProgress.reviewed.toLocaleString()} / ${cullingProgress.total.toLocaleString()} reviewed · Keep ${cullingProgress.keep.toLocaleString()} · Review ${cullingProgress.review.toLocaleString()} · Reject ${cullingProgress.reject.toLocaleString()}. ` : ""}AI technical evidence can help you begin, but Keep, Reject, Review, stars, ratings, notes, and representatives remain your local decisions.</p></div><button className="primary" onClick={onCull}>{cullingProgress?.reviewed ? "Resume Culling" : "Cull Photos"}</button></section>
       <StudioBrainEntry projectId={home.project.id} onOpen={onStudio} />
+      <section className="culling-entry" aria-label="Production entry"><div><p className="section-label">Delivery Brain</p><h2>Production plans</h2><p className="muted">Create local delivery or editor worksets from your explicit human decisions. Preview a frozen manifest before any verified copy; originals and culling decisions remain unchanged.</p></div><button className="secondary" onClick={onProduction}>Open Production</button></section>
       {intelligenceError ? <p className="error intelligence-error" role="alert">{intelligenceError}</p> : null}
 
       <section className="visual-toolbar" aria-label="Visual media controls">
@@ -984,6 +999,1202 @@ function StudioBrainWorkspace({ project, onReturn }: { project: ProjectView; onR
     <section className="metrics-strip" aria-label="Studio Brain training data"><Metric label="Keep" value={status?.keepCount ?? 0} /><Metric label="Review" value={status?.reviewCount ?? 0} /><Metric label="Reject" value={status?.rejectCount ?? 0} /><Metric label="Ratings" value={status?.ratingCount ?? 0} /><Metric label="Stars" value={status?.starredCount ?? 0} /><Metric label="Representatives" value={status?.representativeCount ?? 0} /></section>
     <details><summary>Developer Details</summary><p>Profile {status?.profileName ?? "unavailable"} · active model {status?.activeModelVersion ?? "none"} · contributing projects {status?.contributingProjectCount ?? 0}.</p>{status?.readiness.conditions?.length ? <ul>{status.readiness.conditions.map((condition) => <li key={condition.key}>{condition.met ? "Met" : "Not met"}: {condition.message}</li>)}</ul> : null}{developerError ? <pre>{developerError}</pre> : null}</details>
   </section>;
+}
+
+const emptyProductionRules = () => ({
+  decisions: [] as string[],
+  minimumRating: null as number | null,
+  starredOnly: false,
+  momentIds: [] as string[],
+  staticAssetIds: [] as string[],
+  virtualCollectionId: null as string | null,
+});
+const gibibyte = 1024 * 1024 * 1024;
+const minimumProductionReserveGiB = 0.125;
+
+function productionPlanTemplate(type: ProductionPlanType): ProductionPlanInput {
+  const names: Record<ProductionPlanType, string> = {
+    client_delivery: "Client Delivery",
+    editor_workset: "Editor Workset",
+    portfolio_selects: "Portfolio Selects",
+    proof_gallery: "Proof Gallery",
+    backup_archive: "Backup Archive",
+    custom: "Custom Production Plan",
+  };
+  return {
+    name: names[type],
+    planType: type,
+    selectionRules: {
+      ...emptyProductionRules(),
+      decisions: type === "editor_workset" ? ["keep", "review"] : ["keep"],
+    },
+    organization: "by_moment",
+    filenameStrategy: { kind: "preserve_original" },
+  };
+}
+
+function productionByteLabel(bytes: number | null | undefined) {
+  if (bytes === null || bytes === undefined) return "Unavailable";
+  if (bytes >= 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${bytes.toLocaleString()} B`;
+}
+
+function ProductionWorkspace({
+  project,
+  onReturn,
+}: {
+  project: ProjectView;
+  onReturn: () => void;
+}) {
+  const [workspace, setWorkspace] = useState<ProductionWorkspaceView | null>(
+    null,
+  );
+  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
+  const [planName, setPlanName] = useState("");
+  const [planType, setPlanType] =
+    useState<ProductionPlanType>("client_delivery");
+  const [decisions, setDecisions] = useState<string[]>(["keep"]);
+  const [minimumRating, setMinimumRating] = useState<number | null>(null);
+  const [starredOnly, setStarredOnly] = useState(false);
+  const [momentIds, setMomentIds] = useState<string[]>([]);
+  const [planMoments, setPlanMoments] = useState<MomentTimelineView | null>(
+    null,
+  );
+  const [isLoadingPlanMoments, setIsLoadingPlanMoments] = useState(false);
+  const [organization, setOrganization] = useState<
+    "single_folder" | "by_moment"
+  >("by_moment");
+  const [filenameKind, setFilenameKind] = useState("preserve_original");
+  const [filenameTemplate, setFilenameTemplate] = useState("{original}");
+  const [destinationPath, setDestinationPath] = useState("");
+  const [destinationReserveGiB, setDestinationReserveGiB] = useState("1");
+  const [virtualCollectionId, setVirtualCollectionId] = useState<string | null>(null);
+  const [staticCollectionId, setStaticCollectionId] = useState<string | null>(null);
+  const [preview, setPreview] = useState<ProductionPlanPreview | null>(null);
+  const [manifest, setManifest] = useState<ExportManifestView | null>(null);
+  const [preflight, setPreflight] = useState<ProductionPreflight | null>(null);
+  const [progress, setProgress] = useState<ProductionExportProgress | null>(
+    null,
+  );
+  const [notice, setNotice] = useState<string | null>(null);
+  const [developerError, setDeveloperError] = useState<string | null>(null);
+  const [isMutating, setIsMutating] = useState(false);
+  const actionRef = useRef(false);
+
+  const selectedPlan =
+    workspace?.plans.find((plan) => plan.id === selectedPlanId) ?? null;
+  const exportActive =
+    progress?.state === "queued" || progress?.state === "running";
+
+  const load = useCallback(async () => {
+    const next = await invoke<ProductionWorkspaceView>(
+      "production_workspace_command",
+      { projectId: project.id },
+    );
+    setWorkspace(next);
+    setSelectedPlanId((current) =>
+      current && next.plans.some((plan) => plan.id === current)
+        ? current
+        : (next.plans[0]?.id ?? null),
+    );
+    return next;
+  }, [project.id]);
+
+  useEffect(() => {
+    void load().catch((reason) => {
+      setNotice(
+        "Production Plans could not be loaded. Project media and human decisions remain available.",
+      );
+      setDeveloperError(toMessage(reason));
+    });
+  }, [load]);
+  useEffect(() => {
+    if (!selectedPlan) return;
+    setPlanName(selectedPlan.name);
+    setPlanType(selectedPlan.planType as ProductionPlanType);
+    setDecisions(selectedPlan.selectionRules.decisions);
+    setMinimumRating(selectedPlan.selectionRules.minimumRating);
+    setStarredOnly(selectedPlan.selectionRules.starredOnly);
+    setMomentIds(selectedPlan.selectionRules.momentIds);
+    setPlanMoments(null);
+    setOrganization(selectedPlan.organization as "single_folder" | "by_moment");
+    setFilenameKind(selectedPlan.filenameStrategy.kind);
+    setFilenameTemplate(
+      selectedPlan.filenameStrategy.kind === "custom_template"
+        ? selectedPlan.filenameStrategy.template
+        : "{original}",
+    );
+    setDestinationPath(selectedPlan.destinationPath ?? "");
+    setDestinationReserveGiB(
+      (selectedPlan.destinationReserveBytes / gibibyte)
+        .toFixed(3)
+        .replace(/\.?0+$/, ""),
+    );
+    setVirtualCollectionId(selectedPlan.selectionRules.virtualCollectionId);
+    setPreview(null);
+    setManifest(null);
+    setPreflight(null);
+    setProgress(null);
+  }, [selectedPlan?.id]);
+  useEffect(() => {
+    const staticCollections = workspace?.collections.filter((collection) => collection.kind === "static") ?? [];
+    setStaticCollectionId((current) =>
+      current && staticCollections.some((collection) => collection.id === current)
+        ? current
+        : (staticCollections[0]?.id ?? null),
+    );
+  }, [workspace?.collections]);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<ProductionScopedEvent<ProductionExportProgress>>(
+      "production-export-progress",
+      ({ payload }) => {
+        if (payload.projectId !== project.id) return;
+        setProgress(payload.progress);
+        setManifest((current) =>
+          current?.id === payload.manifestId ? current : current,
+        );
+        if (payload.progress.message) setNotice(payload.progress.message);
+        if (!["queued", "running"].includes(payload.progress.state))
+          void load().catch(() => undefined);
+      },
+    ).then((stop) => {
+      unlisten = stop;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [load, project.id]);
+
+  const currentInput = (): ProductionPlanInput => ({
+    name: planName.trim(),
+    planType,
+    selectionRules: {
+      ...emptyProductionRules(),
+      decisions,
+      minimumRating,
+      starredOnly,
+      momentIds,
+      staticAssetIds: selectedPlan?.selectionRules.staticAssetIds ?? [],
+      virtualCollectionId,
+    },
+    organization,
+    filenameStrategy:
+      filenameKind === "custom_template"
+        ? { kind: "custom_template", template: filenameTemplate }
+        : {
+            kind: filenameKind as
+              | "preserve_original"
+              | "sequential"
+              | "project_sequence"
+              | "moment_sequence",
+          },
+  });
+  const changeDecision = (decision: string, checked: boolean) =>
+    setDecisions((current) =>
+      checked
+        ? [...new Set([...current, decision])]
+        : current.filter((value) => value !== decision),
+    );
+  const changeMoment = (momentId: string, checked: boolean) =>
+    setMomentIds((current) =>
+      checked
+        ? [...new Set([...current, momentId])]
+        : current.filter((value) => value !== momentId),
+    );
+  async function loadPlanMoments() {
+    if (isLoadingPlanMoments) return;
+    setIsLoadingPlanMoments(true);
+    setNotice(null);
+    setDeveloperError(null);
+    try {
+      const next = await invoke<MomentTimelineView>("moment_timeline", {
+        projectId: project.id,
+        limit: 120,
+        offset: 0,
+      });
+      setPlanMoments(next);
+    } catch (reason) {
+      setNotice(
+        "Moments could not be loaded for this optional selection rule. Existing plan settings and media are unchanged.",
+      );
+      setDeveloperError(toMessage(reason));
+    } finally {
+      setIsLoadingPlanMoments(false);
+    }
+  }
+  const run = async (action: () => Promise<void>) => {
+    if (actionRef.current || isMutating || exportActive) return;
+    actionRef.current = true;
+    setIsMutating(true);
+    setNotice(null);
+    setDeveloperError(null);
+    try {
+      await action();
+    } catch (reason) {
+      setNotice(
+        "Production Plan could not be updated. No source media or human decisions were changed.",
+      );
+      setDeveloperError(toMessage(reason));
+    } finally {
+      actionRef.current = false;
+      setIsMutating(false);
+    }
+  };
+  async function createPlan(type: ProductionPlanType) {
+    await run(async () => {
+      const created = await invoke<{ id: string }>(
+        "create_production_plan_command",
+        { projectId: project.id, input: productionPlanTemplate(type) },
+      );
+      await load();
+      setSelectedPlanId(created.id);
+      setNotice(
+        `${productionPlanTemplate(type).name} is ready to configure. No files have been selected or copied.`,
+      );
+    });
+  }
+  async function saveConfiguration() {
+    if (!selectedPlan || !planName.trim()) return;
+    await run(async () => {
+      const updated = await invoke<{ id: string }>(
+        "update_production_plan_configuration_command",
+        {
+          projectId: project.id,
+          planId: selectedPlan.id,
+          input: currentInput(),
+        },
+      );
+      await load();
+      setSelectedPlanId(updated.id);
+      setNotice(
+        "Plan configuration saved. Create a fresh preview before any export.",
+      );
+    });
+  }
+  async function chooseDestination() {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Choose local Delivery destination",
+    });
+    if (typeof selected === "string") setDestinationPath(selected);
+  }
+  async function saveDestination() {
+    if (!selectedPlan) return;
+    await run(async () => {
+      const updated = await invoke<{ id: string }>(
+        "set_production_plan_destination_command",
+        {
+          projectId: project.id,
+          planId: selectedPlan.id,
+          destinationPath: destinationPath.trim() || null,
+        },
+      );
+      await load();
+      setSelectedPlanId(updated.id);
+      setNotice(
+        destinationPath.trim()
+          ? "Local destination saved. Preview checks it without copying media."
+          : "Destination cleared. This plan cannot export until you choose another local folder.",
+      );
+    });
+  }
+  async function saveDestinationReserve() {
+    if (!selectedPlan) return;
+    const requestedGiB = Number(destinationReserveGiB);
+    if (
+      !Number.isFinite(requestedGiB) ||
+      requestedGiB < minimumProductionReserveGiB
+    ) {
+      setNotice(
+        "Safety reserve must be at least 0.125 GiB. This is required local free-space headroom, not a delivery size limit.",
+      );
+      return;
+    }
+    const reserveBytes = Math.round(requestedGiB * gibibyte);
+    await run(async () => {
+      const updated = await invoke<{ id: string }>(
+        "set_production_plan_destination_reserve_command",
+        { projectId: project.id, planId: selectedPlan.id, reserveBytes },
+      );
+      await load();
+      setSelectedPlanId(updated.id);
+      setNotice(
+        "Safety reserve saved. Preview again to measure the current destination headroom before export.",
+      );
+    });
+  }
+  async function previewPlan() {
+    if (!selectedPlan) return;
+    await run(async () => {
+      const next = await invoke<ProductionPlanPreview>(
+        "production_plan_preview_command",
+        { projectId: project.id, planId: selectedPlan.id },
+      );
+      setPreview(next);
+      setManifest(null);
+      setPreflight(null);
+      setNotice(
+        next.blockers.length
+          ? "Preview found items that must be resolved before a frozen manifest can be created."
+          : "Dry run is ready. No media was copied or changed.",
+      );
+    });
+  }
+  async function applyPlanOverride(
+    assetId: string,
+    kind: "force_include" | "force_exclude" | null,
+  ) {
+    if (!selectedPlan) return;
+    await run(async () => {
+      await invoke("set_production_plan_override_command", {
+        projectId: project.id,
+        planId: selectedPlan.id,
+        assetId,
+        kind,
+      });
+      setPreview(null);
+      setManifest(null);
+      setPreflight(null);
+      await load();
+      setNotice(
+        kind === "force_include"
+          ? "Included for this Production Plan only. The human Smart Cull decision is unchanged. Preview again to validate it."
+          : kind === "force_exclude"
+            ? "Excluded from this Production Plan only. The human Smart Cull decision is unchanged. Preview again to validate it."
+            : "The plan-local exception was removed. Preview again to apply the plan rules.",
+      );
+    });
+  }
+  async function createManifest() {
+    if (!selectedPlan) return;
+    await run(async () => {
+      const next = await invoke<ExportManifestView>(
+        "create_production_manifest_command",
+        { projectId: project.id, planId: selectedPlan.id },
+      );
+      const nextPreflight = await invoke<ProductionPreflight>(
+        "production_manifest_preflight_command",
+        { projectId: project.id, manifestId: next.id },
+      );
+      setManifest(next);
+      setPreflight(nextPreflight);
+      await load();
+      setNotice(
+        nextPreflight.blockers.length
+          ? "The immutable manifest was saved, but export remains blocked until preflight is clear."
+          : "Immutable manifest saved. Review the final preflight, then start verified local copy.",
+      );
+    });
+  }
+  async function startExport() {
+    if (!manifest || preflight?.blockers.length) return;
+    await run(async () => {
+      const queued = await invoke<ProductionExportProgress>(
+        "start_production_export_command",
+        { projectId: project.id, manifestId: manifest.id },
+      );
+      setProgress(queued);
+      setNotice(queued.message);
+    });
+  }
+  async function resumeFrozenExport(manifestId: string) {
+    await run(async () => {
+      const nextPreflight = await invoke<ProductionPreflight>(
+        "production_manifest_preflight_command",
+        { projectId: project.id, manifestId },
+      );
+      setManifest(nextPreflight.manifest);
+      setPreflight(nextPreflight);
+      if (nextPreflight.blockers.length) {
+        setNotice(
+          "This frozen manifest remains intact, but its current local preflight is blocked. Reconnect the drive or resolve the reported condition before resuming.",
+        );
+        return;
+      }
+      const queued = await invoke<ProductionExportProgress>(
+        "start_production_export_command",
+        { projectId: project.id, manifestId },
+      );
+      setProgress(queued);
+      setNotice(
+        "Resume is queued from the same immutable manifest. Already verified identical files will be recognized rather than blindly recopied.",
+      );
+    });
+  }
+  async function cancelExport() {
+    if (!manifest || !exportActive) return;
+    try {
+      await invoke("cancel_production_export_command", {
+        manifestId: manifest.id,
+      });
+      setNotice(
+        "Cancellation requested. Any already verified destination files remain valid; incomplete partial files are not treated as completed exports.",
+      );
+    } catch (reason) {
+      setNotice(
+        "Export cancellation could not be requested. The current local export may already have finished.",
+      );
+      setDeveloperError(toMessage(reason));
+    }
+  }
+  async function createCollection(kind: "dynamic" | "static") {
+    await run(async () => {
+      const input: VirtualCollectionInput = {
+        name: kind === "dynamic" ? "Human Keeps" : "Static Collection",
+        kind,
+        rules:
+          kind === "dynamic"
+            ? { ...emptyProductionRules(), decisions: ["keep"] }
+            : emptyProductionRules(),
+      };
+      await invoke("create_virtual_collection_command", {
+        projectId: project.id,
+        input,
+      });
+      await load();
+      setNotice(
+        kind === "dynamic"
+          ? "Dynamic Human Keeps collection created from explicit culling decisions."
+          : "Empty static collection created. It stores only asset references and never duplicates media.",
+      );
+    });
+  }
+  async function setStaticCollectionMember(assetId: string, included: boolean) {
+    if (!staticCollectionId) return;
+    await run(async () => {
+      await invoke("set_static_virtual_collection_member_command", {
+        projectId: project.id,
+        collectionId: staticCollectionId,
+        assetId,
+        included,
+      });
+      await load();
+      setNotice(
+        included
+          ? "Asset reference added to the selected static collection. No media or Smart Cull decision changed."
+          : "Asset reference removed from the selected static collection. No media or Smart Cull decision changed.",
+      );
+    });
+  }
+
+  const disabled = isMutating || exportActive;
+  return (
+    <section
+      className="project-workspace production-workspace"
+      aria-label="Production workspace"
+    >
+      <header className="workspace-heading">
+        <div>
+          <p className="eyebrow">DELIVERY BRAIN</p>
+          <h2>Production plans</h2>
+          <p className="muted">
+            Organize explicit human selections into local worksets. Studio Brain
+            remains advisory; this workspace never changes Keep, Reject, Review,
+            ratings, notes, Moments, originals, or card media.
+          </p>
+        </div>
+        <button className="secondary" onClick={onReturn}>
+          Return to Project
+        </button>
+      </header>
+      {notice ? (
+        <p className="preparation" role="status">
+          {notice}
+        </p>
+      ) : null}
+      <section
+        className="intelligence-controls"
+        aria-label="Create Production Plan"
+      >
+        <div className="intelligence-controls-copy">
+          <p className="section-label">Plan templates</p>
+          <h2>Start from human decisions</h2>
+          <p className="muted">
+            Templates are editable. Client Delivery starts with Keep; Editor
+            Workset starts with Keep and Review. Nothing uses a Studio
+            recommendation as a final select.
+          </p>
+        </div>
+        <div className="intelligence-controls-actions">
+          <button
+            className="secondary"
+            disabled={disabled}
+            onClick={() => void createPlan("client_delivery")}
+          >
+            Client Delivery
+          </button>
+          <button
+            className="secondary"
+            disabled={disabled}
+            onClick={() => void createPlan("editor_workset")}
+          >
+            Editor Workset
+          </button>
+          <button
+            className="secondary"
+            disabled={disabled}
+            onClick={() => void createPlan("custom")}
+          >
+            Custom Plan
+          </button>
+        </div>
+      </section>
+      {workspace?.plans.length ? (
+        <section className="status-card" aria-label="Production Plan editor">
+          <div className="panel-heading">
+            <div>
+              <p className="section-label">Production Plan</p>
+              <h2>{selectedPlan?.name ?? "Select a plan"}</h2>
+              <p className="muted">
+                Plans, manifests, and export jobs are distinct durable records.
+                Changing a plan makes its prior manifest stale; a running export
+                keeps its original frozen snapshot.
+              </p>
+            </div>
+            <label>
+              Plan{" "}
+              <select
+                aria-label="Select Production Plan"
+                value={selectedPlanId ?? ""}
+                disabled={disabled}
+                onChange={(event) => setSelectedPlanId(event.target.value)}
+              >
+                {workspace.plans.map((plan) => (
+                  <option key={plan.id} value={plan.id}>
+                    {plan.name} · {displayLabel(plan.status)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {selectedPlan ? (
+            <>
+              <div className="visual-toolbar">
+                <label>
+                  Name{" "}
+                  <input
+                    aria-label="Production Plan name"
+                    value={planName}
+                    disabled={disabled}
+                    onChange={(event) => setPlanName(event.target.value)}
+                  />
+                </label>
+                <label>
+                  Type{" "}
+                  <select
+                    value={planType}
+                    disabled={disabled}
+                    onChange={(event) =>
+                      setPlanType(event.target.value as ProductionPlanType)
+                    }
+                  >
+                    {(
+                      [
+                        "client_delivery",
+                        "editor_workset",
+                        "portfolio_selects",
+                        "proof_gallery",
+                        "backup_archive",
+                        "custom",
+                      ] as ProductionPlanType[]
+                    ).map((type) => (
+                      <option key={type} value={type}>
+                        {displayLabel(type)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Organization{" "}
+                  <select
+                    value={organization}
+                    disabled={disabled}
+                    onChange={(event) =>
+                      setOrganization(
+                        event.target.value as "single_folder" | "by_moment",
+                      )
+                    }
+                  >
+                    <option value="by_moment">Moment folders</option>
+                    <option value="single_folder">Single folder</option>
+                  </select>
+                </label>
+                <label>
+                  Filename{" "}
+                  <select
+                    value={filenameKind}
+                    disabled={disabled}
+                    onChange={(event) => setFilenameKind(event.target.value)}
+                  >
+                    <option value="preserve_original">Preserve original</option>
+                    <option value="sequential">Sequential</option>
+                    <option value="project_sequence">Project sequence</option>
+                    <option value="moment_sequence">Moment sequence</option>
+                    <option value="custom_template">
+                      Custom safe template
+                    </option>
+                  </select>
+                </label>
+                {filenameKind === "custom_template" ? (
+                  <label>
+                    Template{" "}
+                    <input
+                      aria-label="Safe filename template"
+                      value={filenameTemplate}
+                      disabled={disabled}
+                      onChange={(event) =>
+                        setFilenameTemplate(event.target.value)
+                      }
+                      placeholder="{project}_{sequence}"
+                    />
+                  </label>
+                ) : null}
+                <button
+                  className="secondary"
+                  disabled={disabled || !planName.trim()}
+                  onClick={() => void saveConfiguration()}
+                >
+                  Save plan settings
+                </button>
+              </div>
+              <fieldset className="production-rule-set" disabled={disabled}>
+                <legend>Explicit human selection rules</legend>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={decisions.includes("keep")}
+                    onChange={(event) =>
+                      changeDecision("keep", event.target.checked)
+                    }
+                  />{" "}
+                  Keep
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={decisions.includes("review")}
+                    onChange={(event) =>
+                      changeDecision("review", event.target.checked)
+                    }
+                  />{" "}
+                  Review
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={decisions.includes("reject")}
+                    onChange={(event) =>
+                      changeDecision("reject", event.target.checked)
+                    }
+                  />{" "}
+                  Reject
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={starredOnly}
+                    onChange={(event) => setStarredOnly(event.target.checked)}
+                  />{" "}
+                  Starred only
+                </label>
+                <label>
+                  Minimum rating{" "}
+                  <select
+                    value={minimumRating ?? ""}
+                    onChange={(event) =>
+                      setMinimumRating(
+                        event.target.value ? Number(event.target.value) : null,
+                      )
+                    }
+                  >
+                    <option value="">Any</option>
+                    {[1, 2, 3, 4, 5].map((rating) => (
+                      <option key={rating} value={rating}>
+                        {rating} star{rating === 1 ? "" : "s"}+
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Virtual Collection{" "}
+                  <select
+                    aria-label="Production Virtual Collection"
+                    value={virtualCollectionId ?? ""}
+                    onChange={(event) =>
+                      setVirtualCollectionId(event.target.value || null)
+                    }
+                  >
+                    <option value="">No collection restriction</option>
+                    {(workspace?.collections ?? []).map((collection) => (
+                      <option key={collection.id} value={collection.id}>
+                        {collection.name} · {displayLabel(collection.kind)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="production-moment-rule">
+                  <button
+                    className="secondary"
+                    type="button"
+                    disabled={disabled || isLoadingPlanMoments}
+                    onClick={() => void loadPlanMoments()}
+                  >
+                    {isLoadingPlanMoments
+                      ? "Loading Moments…"
+                      : "Choose Moments"}
+                  </button>
+                  <span>
+                    {momentIds.length
+                      ? `${momentIds.length.toLocaleString()} Moment${
+                          momentIds.length === 1 ? "" : "s"
+                        } selected`
+                      : "All Moments"}
+                  </span>
+                </div>
+                {planMoments ? (
+                  <div
+                    className="production-moment-options"
+                    aria-label="Production Moment filters"
+                  >
+                    {planMoments.moments.length ? (
+                      planMoments.moments.map((moment) => (
+                        <label key={moment.id}>
+                          <input
+                            type="checkbox"
+                            checked={momentIds.includes(moment.id)}
+                            onChange={(event) =>
+                              changeMoment(moment.id, event.target.checked)
+                            }
+                          />{" "}
+                          {String(moment.ordinal).padStart(2, "0")} ·{" "}
+                          {moment.label.displayLabel} ({moment.assetCount} files)
+                        </label>
+                      ))
+                    ) : (
+                      <p className="muted">
+                        No local Moments are available. This rule remains
+                        optional; it never starts Moment analysis.
+                      </p>
+                    )}
+                    {planMoments.hasMore ? (
+                      <p className="muted">
+                        Showing the first 120 Moments. Use the Moments workspace
+                        to inspect the complete project timeline.
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+                <p className="muted">
+                  Collection and Moment references intersect the human rules
+                  above. They are separate from Smart Cull; a plan-local
+                  include/exclude exception never rewrites its human decision.
+                </p>
+              </fieldset>
+              <div className="visual-toolbar">
+                <label className="search">
+                  <span className="sr-only">Local delivery destination</span>
+                  <input
+                    aria-label="Local delivery destination"
+                    value={destinationPath}
+                    disabled={disabled}
+                    onChange={(event) => setDestinationPath(event.target.value)}
+                    placeholder="Choose a local destination folder"
+                  />
+                </label>
+                <button
+                  className="secondary"
+                  disabled={disabled}
+                  onClick={() => void chooseDestination()}
+                >
+                  Choose folder
+                </button>
+                <button
+                  className="secondary"
+                  disabled={disabled}
+                  onClick={() => void saveDestination()}
+                >
+                  Save destination
+                </button>
+                <label className="production-reserve">
+                  Safety reserve (GiB)
+                  <input
+                    aria-label="Production safety reserve in GiB"
+                    type="number"
+                    min={minimumProductionReserveGiB}
+                    step="0.125"
+                    value={destinationReserveGiB}
+                    disabled={disabled}
+                    onChange={(event) =>
+                      setDestinationReserveGiB(event.target.value)
+                    }
+                  />
+                </label>
+                <button
+                  className="secondary"
+                  disabled={disabled}
+                  onClick={() => void saveDestinationReserve()}
+                >
+                  Save reserve
+                </button>
+                <button
+                  className="primary"
+                  disabled={disabled}
+                  onClick={() => void previewPlan()}
+                >
+                  Preview dry run
+                </button>
+              </div>
+            </>
+          ) : null}
+        </section>
+      ) : (
+        <div className="empty">
+          Create a Client Delivery, Editor Workset, or Custom Plan. The new plan
+          contains no copy job until you explicitly create its manifest.
+        </div>
+      )}
+      {preview ? (
+        <section className="status-card" aria-label="Production Plan dry run">
+          <div className="panel-heading">
+            <div>
+              <p className="section-label">Dry run</p>
+              <h2>
+                {preview.manifestSummary.selectedFileCount.toLocaleString()}{" "}
+                files ·{" "}
+                {productionByteLabel(preview.manifestSummary.estimatedBytes)}
+              </h2>
+              <p className="muted">
+                Destination is{" "}
+                {preview.destinationWritable
+                  ? "locally writable"
+                  : "not writable"}
+                . {preview.availableSourceCount.toLocaleString()} sources
+                available · {preview.offlineSourceCount.toLocaleString()}{" "}
+                offline · {preview.existingIdenticalCount.toLocaleString()}{" "}
+                already identical at destination.
+              </p>
+            </div>
+            <button
+              className="primary"
+              disabled={disabled || preview.blockers.length > 0}
+              onClick={() => void createManifest()}
+            >
+              Freeze manifest
+            </button>
+          </div>
+          {preview.blockers.length ? (
+            <ul className="culling-reasons">
+              {preview.blockers.map((blocker) => (
+                <li key={blocker}>
+                  <strong>Blocked:</strong> {blocker}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="human-override">
+              Ready to freeze. This preview has not written any media.
+            </p>
+          )}
+          {preview.warnings.length ? (
+            <ul className="culling-reasons">
+              {preview.warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          ) : null}
+          <div className="production-path-examples">
+            <strong>Safe destination examples</strong>
+            {preview.namingExamples.length ? (
+              <ul>
+                {preview.namingExamples.map((entry) => (
+                  <li key={entry.destinationRelativePath}>
+                    <code>{entry.originalFilename}</code> →{" "}
+                    <code>{entry.destinationRelativePath}</code>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="muted">
+                No assets meet the current explicit human selection rules.
+              </p>
+            )}
+          </div>
+          <div className="production-inspection" aria-label="Production collection inspection">
+            <div>
+              <strong>Selection review</strong>
+              <p className="muted">
+                Included {preview.inspection.includedCount.toLocaleString()} · Excluded {preview.inspection.excludedCount.toLocaleString()} · Blocked {preview.inspection.blockedCount.toLocaleString()}. Review is bounded to the first {preview.inspection.items.length.toLocaleString()} local records; it never loads a whole large plan into the browser.
+              </p>
+            </div>
+            {preview.inspection.items.length ? (
+              <ul>
+                {preview.inspection.items.map((item) => (
+                  <li key={item.assetId} className={`production-inspection-${item.state}`}>
+                    <div>
+                      <strong>{item.originalFilename}</strong>
+                      <small>
+                        {displayLabel(item.state)} · {item.humanDecision ? `Human ${displayLabel(item.humanDecision)}` : "No human decision"}
+                        {item.destinationRelativePath ? ` · ${item.destinationRelativePath}` : ""}
+                      </small>
+                      {item.reason ? <small>{item.reason}</small> : null}
+                    </div>
+                    <button
+                      className="secondary"
+                      disabled={disabled}
+                      onClick={() => void applyPlanOverride(
+                        item.assetId,
+                        item.planOverride
+                          ? null
+                          : item.state === "included"
+                            ? "force_exclude"
+                            : "force_include",
+                      )}
+                    >
+                      {item.planOverride
+                        ? "Use plan rules"
+                        : item.state === "included"
+                          ? "Exclude from plan"
+                          : "Include in plan"}
+                    </button>
+                    {staticCollectionId ? (
+                      <span className="production-inspection-actions">
+                        <button
+                          className="secondary"
+                          disabled={disabled}
+                          onClick={() =>
+                            void setStaticCollectionMember(item.assetId, true)
+                          }
+                        >
+                          Add to static
+                        </button>
+                        <button
+                          className="secondary"
+                          disabled={disabled}
+                          onClick={() =>
+                            void setStaticCollectionMember(item.assetId, false)
+                          }
+                        >
+                          Remove static
+                        </button>
+                      </span>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            {preview.inspection.remainingCount ? (
+              <p className="muted">{preview.inspection.remainingCount.toLocaleString()} additional records are represented in the counts above.</p>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+      {manifest && preflight ? (
+        <section className="status-card" aria-label="Frozen Delivery Manifest">
+          <div className="panel-heading">
+            <div>
+              <p className="section-label">
+                Frozen manifest v{manifest.manifestVersion}
+              </p>
+              <h2>
+                {manifest.selectedFileCount.toLocaleString()} planned files ·{" "}
+                {productionByteLabel(manifest.estimatedBytes)}
+              </h2>
+              <p className="muted">
+                Checksum {manifest.checksum.slice(0, 16)}… · selection will not
+                be re-evaluated while copying.
+              </p>
+            </div>
+            {exportActive ? (
+              <button className="secondary" onClick={() => void cancelExport()}>
+                Cancel export
+              </button>
+            ) : (
+              <button
+                className="primary"
+                disabled={disabled || preflight.blockers.length > 0}
+                onClick={() => void startExport()}
+              >
+                Start verified export
+              </button>
+            )}
+          </div>
+          {preflight.blockers.length ? (
+            <ul className="culling-reasons">
+              {preflight.blockers.map((blocker) => (
+                <li key={blocker}>
+                  <strong>Blocked:</strong> {blocker}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="human-override">
+              Final preflight is clear. Copy uses streaming BLAKE3
+              source-to-destination verification and never overwrites a
+              different existing file.
+            </p>
+          )}
+          {preflight.warnings.length ? (
+            <ul className="culling-reasons">
+              {preflight.warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          ) : null}
+        </section>
+      ) : null}
+      {progress ? (
+        <section
+          className="intelligence-controls"
+          aria-label="Production export progress"
+        >
+          <div className="intelligence-controls-copy">
+            <p className="section-label">Verified local export</p>
+            <h2>{displayLabel(progress.state)}</h2>
+            <p className="muted">
+              {progress.itemsCompleted.toLocaleString()} /{" "}
+              {progress.itemsTotal.toLocaleString()} processed ·{" "}
+              {progress.verifiedCount.toLocaleString()} verified ·{" "}
+              {progress.skippedIdenticalCount.toLocaleString()} already
+              identical · {progress.failedCount.toLocaleString()} not verified
+            </p>
+          </div>
+          <div
+            className="intelligence-progress"
+            role="status"
+            aria-live="polite"
+          >
+            <strong>{displayLabel(progress.stage)}</strong>
+            <span>
+              {progress.currentFilename ??
+                progress.message ??
+                "Waiting for local worker"}
+            </span>
+            <small>
+              {productionByteLabel(progress.verifiedBytes)} verified
+            </small>
+          </div>
+        </section>
+      ) : null}
+      {workspace?.recentExports.length ? (
+        <section className="status-card" aria-label="Local Delivery history">
+          <div className="panel-heading">
+            <div>
+              <p className="section-label">Local history</p>
+              <h2>Verified delivery executions</h2>
+              <p className="muted">
+                This is local audit history only, not cloud delivery tracking.
+                Restarting an interrupted or partial frozen manifest safely
+                reuses already verified destination matches and never overwrites
+                a different file.
+              </p>
+            </div>
+          </div>
+          <ul className="culling-reasons">
+            {workspace.recentExports.map((job) => (
+              <li key={job.id}>
+                <strong>
+                  {workspace.plans.find((plan) => plan.id === job.planId)
+                    ?.name ?? "Production Plan"}
+                </strong>{" "}
+                · {displayLabel(job.state)} ·{" "}
+                {job.verifiedCount.toLocaleString()} verified ·{" "}
+                {productionByteLabel(job.verifiedBytes)}
+                {job.failedCount
+                  ? ` · ${job.failedCount.toLocaleString()} not verified`
+                  : ""}
+                {job.errorMessage ? <small> · {job.errorMessage}</small> : null}
+                {["interrupted", "failed", "partially_completed", "cancelled"].includes(job.state) ? (
+                  <button
+                    className="secondary"
+                    disabled={disabled}
+                    onClick={() => void resumeFrozenExport(job.manifestId)}
+                  >
+                    Resume frozen manifest
+                  </button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+      <section className="status-card" aria-label="Virtual Collections">
+        <div className="panel-heading">
+          <div>
+            <p className="section-label">Virtual Collections</p>
+            <h2>Logical media groups</h2>
+            <p className="muted">
+              Collections reference existing MediaAssets only. They do not copy,
+              move, rename, hide, or alter media. Dynamic rules use explicit
+              human state only.
+            </p>
+          </div>
+          <div>
+            <button
+              className="secondary"
+              disabled={disabled}
+              onClick={() => void createCollection("dynamic")}
+            >
+              Create Human Keeps
+            </button>
+            <button
+              className="secondary"
+              disabled={disabled}
+              onClick={() => void createCollection("static")}
+            >
+              Create static collection
+            </button>
+          </div>
+        </div>
+        {workspace?.collections.some((collection) => collection.kind === "static") ? (
+          <label className="production-static-target">
+            Active static collection{" "}
+            <select
+              aria-label="Active static Virtual Collection"
+              value={staticCollectionId ?? ""}
+              disabled={disabled}
+              onChange={(event) => setStaticCollectionId(event.target.value || null)}
+            >
+              {(workspace?.collections ?? [])
+                .filter((collection) => collection.kind === "static")
+                .map((collection) => (
+                  <option key={collection.id} value={collection.id}>
+                    {collection.name} · {collection.assetCount.toLocaleString()} references
+                  </option>
+                ))}
+            </select>
+            <small>Use the bounded plan review above to add or remove individual asset references.</small>
+          </label>
+        ) : null}
+        {workspace?.collections.length ? (
+          <ul className="culling-reasons">
+            {workspace.collections.map((collection) => (
+              <li key={collection.id}>
+                <strong>{collection.name}</strong> ·{" "}
+                {displayLabel(collection.kind)} ·{" "}
+                {collection.assetCount.toLocaleString()} asset reference
+                {collection.assetCount === 1 ? "" : "s"}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted">
+            No collections yet. They are optional organization, separate from
+            source media and human culling.
+          </p>
+        )}
+      </section>
+      {developerError ? (
+        <details className="advanced">
+          <summary>Developer Details</summary>
+          <pre>{developerError}</pre>
+        </details>
+      ) : null}
+    </section>
+  );
 }
 
 function MomentTimelineWorkspace({ project, initialMomentId, onReturn, onShowTimeline, onOpenMoment, onCullMoment, onError }: {
