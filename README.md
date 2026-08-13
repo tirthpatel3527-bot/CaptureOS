@@ -2,11 +2,11 @@
 
 CaptureOS is a local-first foundation for an intelligent operating system for professional camera media. Its long-term purpose is simple: **your entire shoot, alive, understood, protected.**
 
-Milestone 9 adds **Delivery Brain + Production Pipeline I**: editable local Production Plans,
-Virtual Collections, compact dry-run naming/preflight, immutable Export Manifests, and explicit
-background LocalFolder exports that reuse streaming BLAKE3 verification. It organizes explicit
-human decisions into worksets; it never replaces Smart Cull authority, Studio Brain's advisory
-boundary, source-media immutability, or local/offline operation.
+Milestone 10 adds an **Edit Session + Derived Output Foundation** on top of Delivery Brain:
+explicit local edit-workset handoff context, versioned observed-output provenance, conservative
+output matching, and photographer-only approval. It keeps Production Plan/delivery authority,
+external editor state, source-media immutability, and local/offline operation separate; CaptureOS
+does not become an image editor or a proprietary editor-catalog integration.
 
 ## Guarantees
 
@@ -243,9 +243,34 @@ It reports generated planning/collision/resume mechanics at 100, 1k, 10k, 50k, a
 plus a 2 MiB generated streaming-copy/reuse check. It contains no customer catalog or media and is
 not a filesystem-throughput or creative-quality claim.
 
-## Milestone 9 boundaries
+## Edit Sessions and derived-output foundation
 
-This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, client preference modeling, editing/style training, automatic culling/deletion, source write-back, color-critical RAW development, full proxy transcoding, NLE integration, video/audio intelligence, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or Milestone 10 work. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
+An **Edit Session** is a local record of a photographer-directed edit round, created from one
+frozen M9 Export Manifest. It is not a Production Plan, Export Job, final selection, or delivery
+decision. Changing an Edit Session does not rewrite culling decisions, ratings, stars, notes,
+representatives, Moments, Studio advice, or the underlying production records.
+
+Derived outputs are observed as separate local output versions with documented session/provenance
+and match state. CaptureOS records an exact or manual source link only when recorded local
+evidence is unambiguous; a `strong` or `possible` candidate remains review evidence rather than
+approval. A filename, timestamp, visual/semantic resemblance, or external-editor assumption alone
+stays **Unmatched** or **Ambiguous**; it never becomes a fabricated source link, edit recipe,
+quality judgment, or human approval. Approval is always an explicit photographer action on an
+individual output version.
+
+M10 uses only a generic local handoff/output-observation boundary. It does not open, create,
+modify, synchronize, or depend on a proprietary editor catalog/database; drive an external
+editor; write XMP/sidecars/source metadata; render or edit media; or upload session/output data.
+Output roots, paths, fingerprints, metadata, matching evidence, and approval history remain local
+and private. See [Edit Sessions architecture](docs/architecture/edit-sessions.md),
+[the security boundary](docs/security/edit-sessions.md), and ADRs
+[066](docs/adr/066-edit-session-and-production-plan-boundary.md),
+[067](docs/adr/067-derived-output-provenance-versioning-and-approval.md), and
+[068](docs/adr/068-local-editor-adapter-output-matching-and-privacy.md).
+
+## Milestone 10 boundaries
+
+This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, client preference modeling, editing/style training, automatic culling/deletion, source write-back, color-critical RAW development, full proxy transcoding, proprietary editor-catalog mutation, automated editor control, NLE integration, video/audio intelligence, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or Milestone 11 work. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
 
 ## Smart Culling Workspace behavior
 

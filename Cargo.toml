@@ -11,6 +11,7 @@ members = [
   "crates/moment-brain",
   "crates/studio-brain",
   "crates/delivery-brain",
+  "crates/edit-bridge",
   "crates/storage",
   "crates/ingest",
   "crates/integrity",
@@ -20,6 +21,7 @@ members = [
   "research/moment-brain-bench",
   "research/studio-brain-bench",
   "research/delivery-brain-bench",
+  "research/edit-bridge-bench",
 ]
 resolver = "2"
 

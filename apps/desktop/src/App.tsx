@@ -12,6 +12,13 @@ import type {
   CullingMode,
   CullingWorkspaceQuery,
   CullingWorkspaceView,
+  CreateEditSessionInput,
+  EditOutputView,
+  EditReviewState,
+  EditSessionPageView,
+  EditVersionView,
+  EditWorkItemView,
+  EditWorkspaceView,
   MomentAnalysisProgress,
   MomentChecklistView,
   MomentDetailView,
@@ -73,7 +80,7 @@ const filters: { id: MediaFilter; label: string }[] = [
   { id: "unknown", label: "Unknown" },
 ];
 
-type ProjectSurface = "media" | "ingest" | "cull" | "timeline" | "studio" | "production";
+type ProjectSurface = "media" | "ingest" | "cull" | "timeline" | "studio" | "production" | "edit";
 type AppRoute = { kind: "home" } | { kind: "project"; projectId: string; surface: ProjectSurface; momentId?: string };
 type ProjectScopedEvent<T> = { projectId: string; progress: T };
 type StudioProfileScopedEvent<T> = { projectId: string; profileId: string; progress: T };
@@ -92,6 +99,8 @@ function routeHash(route: AppRoute) {
           ? "/studio"
           : route.surface === "production"
             ? "/production"
+            : route.surface === "edit"
+              ? "/edit"
         : "";
   return `#/project/${encodeURIComponent(route.projectId)}${suffix}`;
 }
@@ -109,6 +118,8 @@ function readRoute(): AppRoute {
           ? "studio"
           : segments[2] === "production"
             ? "production"
+            : segments[2] === "edit"
+              ? "edit"
         : "media";
   return {
     kind: "project",
@@ -340,13 +351,14 @@ export function App() {
       {error ? <p className="error" role="alert">{error}</p> : null}
       {showCreateProject ? <ProjectCreation onCancel={() => setShowCreateProject(false)} name={newProjectName} onName={setNewProjectName} onSubmit={createProject} /> : null}
       {route.kind === "home" ? <ProjectLibrary projects={projects} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onCreate={() => setShowCreateProject(true)} /> : null}
-      {project && route.kind === "project" ? <ProjectHeader project={project} projects={projects} surface={route.surface} isIndexing={isIndexing} isIngesting={isIngesting} onHome={() => navigate({ kind: "home" })} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} onProduction={() => navigate({ kind: "project", projectId: project.id, surface: "production" })} /> : null}
-      {project && route.kind === "project" && route.surface === "media" && activeHome ? <ProjectWorkspace key={project.id} home={activeHome} cullingProgress={cullingProgress} job={liveJob} filter={filter} onFilter={changeFilter} hasMoreMedia={hasMoreMedia} isLoadingMore={isLoadingMore} onLoadMore={loadMoreMedia} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onMoments={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} onProduction={() => navigate({ kind: "project", projectId: project.id, surface: "production" })} /> : null}
+      {project && route.kind === "project" ? <ProjectHeader project={project} projects={projects} surface={route.surface} isIndexing={isIndexing} isIngesting={isIngesting} onHome={() => navigate({ kind: "home" })} onOpen={(projectId) => navigate({ kind: "project", projectId, surface: "media" })} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} onProduction={() => navigate({ kind: "project", projectId: project.id, surface: "production" })} onEdit={() => navigate({ kind: "project", projectId: project.id, surface: "edit" })} /> : null}
+      {project && route.kind === "project" && route.surface === "media" && activeHome ? <ProjectWorkspace key={project.id} home={activeHome} cullingProgress={cullingProgress} job={liveJob} filter={filter} onFilter={changeFilter} hasMoreMedia={hasMoreMedia} isLoadingMore={isLoadingMore} onLoadMore={loadMoreMedia} onIndex={() => void selectFolderAndIndex()} onIngest={() => navigate({ kind: "project", projectId: project.id, surface: "ingest" })} onCull={() => navigate({ kind: "project", projectId: project.id, surface: "cull" })} onMoments={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onStudio={() => navigate({ kind: "project", projectId: project.id, surface: "studio" })} onProduction={() => navigate({ kind: "project", projectId: project.id, surface: "production" })} onEdit={() => navigate({ kind: "project", projectId: project.id, surface: "edit" })} /> : null}
       {project && route.kind === "project" && route.surface === "ingest" ? <IngestWorkspace key={project.id} project={project} history={ingestHistory} report={ingestReport} isIngesting={isIngesting} onReport={setIngestReport} onHistory={setIngestHistory} onIngesting={setIsIngesting} onError={setError} /> : null}
       {project && route.kind === "project" && route.surface === "cull" ? <CullingWorkspace key={`${project.id}:${route.momentId ?? "all"}`} project={project} momentId={route.momentId} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: route.momentId ? "timeline" : "media", ...(route.momentId ? { momentId: route.momentId } : {}) })} onError={setError} /> : null}
       {project && route.kind === "project" && route.surface === "timeline" ? <MomentTimelineWorkspace key={`${project.id}:${route.momentId ?? "timeline"}`} project={project} initialMomentId={route.momentId} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} onShowTimeline={() => navigate({ kind: "project", projectId: project.id, surface: "timeline" })} onOpenMoment={(momentId) => navigate({ kind: "project", projectId: project.id, surface: "timeline", momentId })} onCullMoment={(momentId) => navigate({ kind: "project", projectId: project.id, surface: "cull", momentId })} onError={setError} /> : null}
       {project && route.kind === "project" && route.surface === "studio" ? <StudioBrainWorkspace key={project.id} project={project} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} /> : null}
       {project && route.kind === "project" && route.surface === "production" ? <ProductionWorkspace key={project.id} project={project} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} /> : null}
+      {project && route.kind === "project" && route.surface === "edit" ? <EditWorkspace key={project.id} project={project} onReturn={() => navigate({ kind: "project", projectId: project.id, surface: "media" })} /> : null}
     </main>
   );
 }
@@ -359,7 +371,7 @@ function ProjectLibrary({ projects, onOpen, onCreate }: { projects: ProjectLibra
   return <section className="project-library"><div className="library-hero"><div><p className="eyebrow">CAPTUREOS</p><h1>Your shoots</h1><p className="lede">A local library for every production. Choose a project, or start a clean one.</p></div><button className="primary library-create" onClick={onCreate}>New Project</button></div><div className="library-heading"><h2>Recent projects</h2><small>{projects.length === 1 ? "1 project" : `${projects.length} projects`}</small></div>{projects.length ? <div className="project-cards">{projects.map((item) => <button className="project-card" key={item.id} onClick={() => onOpen(item.id)} aria-label={`Open ${item.name}`}><span className="project-cover" aria-hidden="true">COS</span><strong>{item.name}</strong><span className="project-card-meta"><span>Media <b>{item.mediaAssetCount}</b></span><span>{item.storageVolumeCount ? `${item.storageVolumeCount} storage volume${item.storageVolumeCount === 1 ? "" : "s"}` : "No storage indexed"}</span><span>Protection {protectionLabel(item.protectionState)}</span></span><small>Last activity {formatProjectDate(item.lastActivityAt)}</small></button>)}</div> : <StatusCard><div className="project-empty"><p className="eyebrow">YOUR SHOOT STARTS HERE</p><h2>There are no projects yet.</h2><p className="muted">Index existing media or ingest camera cards after you create your first project.</p><button className="primary" onClick={onCreate}>New Project</button></div></StatusCard>}</section>;
 }
 
-function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, onHome, onOpen, onIndex, onIngest, onCull, onTimeline, onStudio, onProduction }: { project: ProjectView; projects: ProjectLibraryItem[]; surface: ProjectSurface; isIndexing: boolean; isIngesting: boolean; onHome: () => void; onOpen: (projectId: string) => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onTimeline: () => void; onStudio: () => void; onProduction: () => void }) {
+function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, onHome, onOpen, onIndex, onIngest, onCull, onTimeline, onStudio, onProduction, onEdit }: { project: ProjectView; projects: ProjectLibraryItem[]; surface: ProjectSurface; isIndexing: boolean; isIngesting: boolean; onHome: () => void; onOpen: (projectId: string) => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onTimeline: () => void; onStudio: () => void; onProduction: () => void; onEdit: () => void }) {
   const lede = surface === "ingest"
     ? "Safe ingest remains attached to this project."
     : surface === "cull"
@@ -368,8 +380,10 @@ function ProjectHeader({ project, projects, surface, isIndexing, isIngesting, on
       ? "A local structural timeline. Suggested labels are evidence-grounded; your edits remain authoritative."
       : surface === "studio"
         ? "Local, explainable preference modeling from your explicit human decisions."
+        : surface === "edit"
+          ? "A local, provenance-preserving bridge between a frozen workset and returned edits."
         : "Index and analyze local media in this selected project.";
-  return <section className="project-header"><div><button className="back-link" onClick={onHome}>← All Projects</button><p className="eyebrow">PROJECT WORKSPACE</p><h1>{project.name}</h1><p className="lede">{lede}</p></div><div className="project-actions"><select aria-label="Switch project" value={project.id} onChange={(event) => onOpen(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className={surface === "timeline" ? "primary" : "secondary"} onClick={onTimeline}>Moments</button><button className={surface === "cull" ? "primary" : "secondary"} onClick={onCull}>Smart Cull</button><button className={surface === "studio" ? "primary" : "secondary"} onClick={onStudio}>Studio Brain</button><button className={surface === "production" ? "primary" : "secondary"} onClick={onProduction}>Production</button><button className={surface === "ingest" ? "primary" : "secondary"} disabled={isIngesting} onClick={onIngest}>Ingest Shoot</button><button className={surface === "media" ? "primary" : "secondary"} disabled={isIndexing} onClick={onIndex}>{isIndexing ? "Indexing…" : "Index Folder"}</button></div></section>;
+  return <section className="project-header"><div><button className="back-link" onClick={onHome}>← All Projects</button><p className="eyebrow">PROJECT WORKSPACE</p><h1>{project.name}</h1><p className="lede">{lede}</p></div><div className="project-actions"><select aria-label="Switch project" value={project.id} onChange={(event) => onOpen(event.target.value)}>{projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><button className={surface === "timeline" ? "primary" : "secondary"} onClick={onTimeline}>Moments</button><button className={surface === "cull" ? "primary" : "secondary"} onClick={onCull}>Smart Cull</button><button className={surface === "studio" ? "primary" : "secondary"} onClick={onStudio}>Studio Brain</button><button className={surface === "production" ? "primary" : "secondary"} onClick={onProduction}>Production</button><button className={surface === "edit" ? "primary" : "secondary"} onClick={onEdit}>Edit</button><button className={surface === "ingest" ? "primary" : "secondary"} disabled={isIngesting} onClick={onIngest}>Ingest Shoot</button><button className={surface === "media" ? "primary" : "secondary"} disabled={isIndexing} onClick={onIndex}>{isIndexing ? "Indexing…" : "Index Folder"}</button></div></section>;
 }
 
 function formatProjectDate(value: string) {
@@ -383,7 +397,7 @@ function protectionLabel(value: string) {
   return "not recorded";
 }
 
-function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMoreMedia, isLoadingMore, onLoadMore, onIndex, onIngest, onCull, onMoments, onStudio, onProduction }: { home: ProjectHome; cullingProgress: CullingProgress | null; job: JobView | null; filter: MediaFilter; onFilter: (filter: MediaFilter) => void; hasMoreMedia: boolean; isLoadingMore: boolean; onLoadMore: () => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onMoments: () => void; onStudio: () => void; onProduction: () => void }) {
+function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMoreMedia, isLoadingMore, onLoadMore, onIndex, onIngest, onCull, onMoments, onStudio, onProduction, onEdit }: { home: ProjectHome; cullingProgress: CullingProgress | null; job: JobView | null; filter: MediaFilter; onFilter: (filter: MediaFilter) => void; hasMoreMedia: boolean; isLoadingMore: boolean; onLoadMore: () => void; onIndex: () => void; onIngest: () => void; onCull: () => void; onMoments: () => void; onStudio: () => void; onProduction: () => void; onEdit: () => void }) {
   const [visual, setVisual] = useState<VisualMediaPage | null>(null);
   const [visualFilter, setVisualFilter] = useState<VisualMediaFilter>("all");
   const [visualSort, setVisualSort] = useState<VisualMediaSort>("captureTime");
@@ -810,6 +824,7 @@ function ProjectWorkspace({ home, cullingProgress, job, filter, onFilter, hasMor
       <section className="culling-entry" aria-label="Culling workspace entry"><div><p className="section-label">Human review</p><h2>Smart Culling Workspace</h2><p className="muted">{cullingProgress ? `${cullingProgress.reviewed.toLocaleString()} / ${cullingProgress.total.toLocaleString()} reviewed · Keep ${cullingProgress.keep.toLocaleString()} · Review ${cullingProgress.review.toLocaleString()} · Reject ${cullingProgress.reject.toLocaleString()}. ` : ""}AI technical evidence can help you begin, but Keep, Reject, Review, stars, ratings, notes, and representatives remain your local decisions.</p></div><button className="primary" onClick={onCull}>{cullingProgress?.reviewed ? "Resume Culling" : "Cull Photos"}</button></section>
       <StudioBrainEntry projectId={home.project.id} onOpen={onStudio} />
       <section className="culling-entry" aria-label="Production entry"><div><p className="section-label">Delivery Brain</p><h2>Production plans</h2><p className="muted">Create local delivery or editor worksets from your explicit human decisions. Preview a frozen manifest before any verified copy; originals and culling decisions remain unchanged.</p></div><button className="secondary" onClick={onProduction}>Open Production</button></section>
+      <section className="culling-entry" aria-label="Edit workspace entry"><div><p className="section-label">Edit Bridge</p><h2>Edit sessions</h2><p className="muted">Coordinate a frozen Editor Workset with an external editor, returned outputs, version history, and your review state. CaptureOS does not edit originals, write into editor catalogs, or approve an edit for you.</p></div><button className="secondary" onClick={onEdit}>Open Edit</button></section>
       {intelligenceError ? <p className="error intelligence-error" role="alert">{intelligenceError}</p> : null}
 
       <section className="visual-toolbar" aria-label="Visual media controls">
@@ -999,6 +1014,240 @@ function StudioBrainWorkspace({ project, onReturn }: { project: ProjectView; onR
     <section className="metrics-strip" aria-label="Studio Brain training data"><Metric label="Keep" value={status?.keepCount ?? 0} /><Metric label="Review" value={status?.reviewCount ?? 0} /><Metric label="Reject" value={status?.rejectCount ?? 0} /><Metric label="Ratings" value={status?.ratingCount ?? 0} /><Metric label="Stars" value={status?.starredCount ?? 0} /><Metric label="Representatives" value={status?.representativeCount ?? 0} /></section>
     <details><summary>Developer Details</summary><p>Profile {status?.profileName ?? "unavailable"} · active model {status?.activeModelVersion ?? "none"} · contributing projects {status?.contributingProjectCount ?? 0}.</p>{status?.readiness.conditions?.length ? <ul>{status.readiness.conditions.map((condition) => <li key={condition.key}>{condition.met ? "Met" : "Not met"}: {condition.message}</li>)}</ul> : null}{developerError ? <pre>{developerError}</pre> : null}</details>
   </section>;
+}
+
+const editSessionPageSize = 80;
+
+function mergeEditRows<T extends { id: string }>(current: T[], next: T[]) {
+  return Array.from(new Map([...current, ...next].map((item) => [item.id, item])).values());
+}
+
+function EditWorkspace({ project, onReturn }: { project: ProjectView; onReturn: () => void }) {
+  const [workspace, setWorkspace] = useState<EditWorkspaceView | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [sessionPage, setSessionPage] = useState<EditSessionPageView | null>(null);
+  const [sessionName, setSessionName] = useState("");
+  const [sessionTemplate, setSessionTemplate] = useState("custom");
+  const [exportManifestId, setExportManifestId] = useState("");
+  const [expectedOutputPolicy, setExpectedOutputPolicy] = useState<"one_per_work_item" | "optional">("one_per_work_item");
+  const [handoffDestination, setHandoffDestination] = useState("");
+  const [outputRoot, setOutputRoot] = useState("");
+  const [manualMatchTargets, setManualMatchTargets] = useState<Record<string, string>>({});
+  const [compareWorkItemId, setCompareWorkItemId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingPage, setIsLoadingPage] = useState(false);
+  const [isMutating, setIsMutating] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [developerError, setDeveloperError] = useState<string | null>(null);
+  const actionRef = useRef(false);
+
+  const selectedSession = sessionPage?.session
+    ?? workspace?.sessions.find((session) => session.id === selectedSessionId)
+    ?? null;
+  const workItems = sessionPage?.workItems ?? [];
+  const outputs = sessionPage?.outputs ?? [];
+  const versions = sessionPage?.versions ?? [];
+  const compareWorkItem = workItems.find((item) => item.id === compareWorkItemId) ?? null;
+  const compareOutput = compareWorkItem
+    ? outputs.find((output) => output.id === compareWorkItem.latestOutputId)
+      ?? outputs.find((output) => output.matchedWorkItemId === compareWorkItem.id)
+      ?? null
+    : null;
+
+  const loadWorkspace = useCallback(async () => {
+    const next = await invoke<EditWorkspaceView>("edit_workspace_command", { projectId: project.id });
+    setWorkspace(next);
+    setSelectedSessionId((current) => current && next.sessions.some((session) => session.id === current)
+      ? current
+      : (next.sessions[0]?.id ?? null));
+    setExportManifestId((current) => current && next.eligibleManifests.some((manifest) => manifest.id === current)
+      ? current
+      : (next.eligibleManifests[0]?.id ?? ""));
+    return next;
+  }, [project.id]);
+
+  const loadSessionPage = useCallback(async (sessionId: string, offset = 0, append = false) => {
+    setIsLoadingPage(true);
+    try {
+      const next = await invoke<EditSessionPageView>("edit_session_page_command", {
+        projectId: project.id,
+        sessionId,
+        offset,
+        limit: editSessionPageSize,
+      });
+      setSessionPage((current) => append && current?.session.id === sessionId
+        ? {
+            ...next,
+            workItems: mergeEditRows(current.workItems, next.workItems),
+            outputs: mergeEditRows(current.outputs, next.outputs),
+            versions: mergeEditRows(current.versions ?? [], next.versions ?? []),
+          }
+        : next);
+      return next;
+    } finally {
+      setIsLoadingPage(false);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadWorkspace().catch((reason) => {
+      if (!cancelled) {
+        setNotice("Edit sessions could not be loaded. Project media, human decisions, and Production records remain available.");
+        setDeveloperError(toMessage(reason));
+      }
+    }).finally(() => {
+      if (!cancelled) setIsLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [loadWorkspace]);
+
+  useEffect(() => {
+    if (!selectedSessionId) {
+      setSessionPage(null);
+      setCompareWorkItemId(null);
+      return;
+    }
+    setCompareWorkItemId(null);
+    void loadSessionPage(selectedSessionId).catch((reason) => {
+      setNotice("This Edit Session could not be loaded. Its stored summary remains available.");
+      setDeveloperError(toMessage(reason));
+    });
+  }, [loadSessionPage, selectedSessionId]);
+
+  const refreshSession = useCallback(async (sessionId: string) => {
+    await Promise.all([loadWorkspace(), loadSessionPage(sessionId)]);
+  }, [loadSessionPage, loadWorkspace]);
+
+  const runMutation = useCallback(async (failure: string, action: () => Promise<void>) => {
+    if (actionRef.current || isMutating) return;
+    actionRef.current = true;
+    setIsMutating(true);
+    setNotice(null);
+    setDeveloperError(null);
+    try {
+      await action();
+    } catch (reason) {
+      setNotice(failure);
+      setDeveloperError(toMessage(reason));
+    } finally {
+      actionRef.current = false;
+      setIsMutating(false);
+    }
+  }, [isMutating]);
+
+  async function createSession() {
+    if (!sessionName.trim() || !exportManifestId) return;
+    await runMutation("The Edit Session could not be created. The frozen Production workset and all human decisions remain unchanged.", async () => {
+      const input: CreateEditSessionInput = {
+        name: sessionName.trim(),
+        template: sessionTemplate,
+        exportManifestId,
+        expectedOutputPolicy,
+      };
+      const created = await invoke<{ id: string }>("create_edit_session_command", { projectId: project.id, input });
+      setSelectedSessionId(created.id);
+      await refreshSession(created.id);
+      setSessionName("");
+      setNotice("Edit Session created from a frozen Production manifest. It does not recompute culling or change source media.");
+    });
+  }
+
+  async function chooseDirectory(assign: (path: string) => void, title: string) {
+    try {
+      const selected = await open({ directory: true, multiple: false, title });
+      if (typeof selected === "string") assign(selected);
+    } catch (reason) {
+      setNotice("A local folder could not be selected. No project data changed.");
+      setDeveloperError(toMessage(reason));
+    }
+  }
+
+  async function generateHandoff() {
+    if (!selectedSession || !handoffDestination.trim()) return;
+    await runMutation("The Edit Handoff could not be generated. The frozen source workset and existing session remain available.", async () => {
+      await invoke("generate_edit_handoff_command", {
+        projectId: project.id,
+        sessionId: selectedSession.id,
+        input: { mode: "reference", destinationPath: handoffDestination.trim() },
+      });
+      await refreshSession(selectedSession.id);
+      setNotice("Reference handoff generated locally. It contains coordination metadata only and does not create a second media copy or export private notes.");
+    });
+  }
+
+  async function registerOutputs() {
+    if (!selectedSession || !outputRoot.trim()) return;
+    await runMutation("Returned outputs could not be registered. Existing sources, prior outputs, and version history remain unchanged.", async () => {
+      await invoke("register_edit_outputs_command", {
+        projectId: project.id,
+        sessionId: selectedSession.id,
+        selectedPath: outputRoot.trim(),
+      });
+      await refreshSession(selectedSession.id);
+      setNotice("Local output discovery is complete. Files were registered as external derivatives; no source or returned output was moved, renamed, or modified.");
+    });
+  }
+
+  async function manuallyMatchOutput(output: EditOutputView) {
+    const workItemId = manualMatchTargets[output.id];
+    if (!selectedSession || !workItemId) return;
+    await runMutation("The manual output match could not be saved. This output remains unresolved until you explicitly match it.", async () => {
+      await invoke("manually_match_edit_output_command", {
+        projectId: project.id,
+        outputId: output.id,
+        workItemId,
+      });
+      await refreshSession(selectedSession.id);
+      setNotice("Manual source match saved. It is a local provenance decision and does not modify either file.");
+    });
+  }
+
+  async function reviewVersion(version: EditVersionView, reviewState: EditReviewState) {
+    if (!selectedSession) return;
+    await runMutation("The edit review state could not be saved. Culling and Production decisions remain unchanged.", async () => {
+      await invoke("review_edit_version_command", {
+        projectId: project.id,
+        versionId: version.id,
+        reviewState,
+      });
+      await refreshSession(selectedSession.id);
+      setNotice(reviewState === "approved"
+        ? "Approved edit version saved. Approval is local workflow metadata and does not alter the Smart Cull decision."
+        : "Needs Revision saved. The existing version remains in history and the Smart Cull decision is unchanged.");
+    });
+  }
+
+  const actionsBlocked = isLoading || isMutating;
+  const queueTotal = sessionPage?.totalWorkItems ?? selectedSession?.workItemCount ?? 0;
+  const selectedManifest = workspace?.eligibleManifests.find((manifest) => manifest.id === exportManifestId) ?? null;
+
+  return <section className="project-workspace edit-workspace" aria-label="Edit workspace">
+    <header className="workspace-heading"><div><p className="eyebrow">EDIT BRIDGE</p><h2>Edit sessions</h2><p className="muted">Workset → handoff → editing → return → review → approved. CaptureOS coordinates local editing work; it does not edit media, write proprietary editor catalogs, or approve creative work automatically.</p></div><button className="secondary" onClick={onReturn}>Return to Project</button></header>
+    {notice ? <p className="preparation" role="status">{notice}</p> : null}
+    <section className="intelligence-controls" aria-label="Edit workflow"><div className="intelligence-controls-copy"><p className="section-label">Local creative workflow</p><h2>Frozen workset to human review</h2><p className="muted">An Edit Session preserves the selected Production manifest as provenance. Returned files are derived outputs, never replacements for originals.</p></div><div className="intelligence-progress" role="status" aria-live="polite"><strong>{selectedSession ? displayLabel(selectedSession.state) : isLoading ? "Loading sessions" : "No session selected"}</strong><span>{selectedSession ? `${selectedSession.returnedOutputCount.toLocaleString()} returned · ${selectedSession.approvedCount.toLocaleString()} approved · ${selectedSession.needsRevisionCount.toLocaleString()} needs revision` : "No automatic output scan runs while this project opens."}</span><small>Approval remains human-controlled.</small></div></section>
+    <section className="status-card" aria-label="Create Edit Session"><div className="panel-heading"><div><p className="section-label">New Edit Session</p><h2>Start from a frozen workset</h2><p className="muted">Choose a completed exported Editor Workset or other eligible frozen Production manifest. CaptureOS uses that fixed selection rather than recalculating Smart Cull decisions.</p></div></div><div className="visual-toolbar"><label className="search"><span className="sr-only">Edit Session name</span><input aria-label="Edit Session name" value={sessionName} disabled={actionsBlocked} onChange={(event) => setSessionName(event.target.value)} placeholder="e.g. AI Test Main Edit" /></label><label>Template <select aria-label="Edit Session template" value={sessionTemplate} disabled={actionsBlocked} onChange={(event) => setSessionTemplate(event.target.value)}><option value="main_edit">Main Edit</option><option value="album_retouch">Album Select Retouch</option><option value="portfolio_retouch">Portfolio Retouch</option><option value="client_revision">Client Revision Round</option><option value="custom">Custom</option></select></label><label>Frozen workset <select aria-label="Frozen Editor Workset" value={exportManifestId} disabled={actionsBlocked || !(workspace?.eligibleManifests.length)} onChange={(event) => setExportManifestId(event.target.value)}><option value="">Choose a frozen workset</option>{(workspace?.eligibleManifests ?? []).map((manifest) => <option key={manifest.id} value={manifest.id}>{manifest.planName} · v{manifest.manifestVersion} · {manifest.selectedFileCount.toLocaleString()} files</option>)}</select></label><label>Expected output <select aria-label="Expected output policy" value={expectedOutputPolicy} disabled={actionsBlocked} onChange={(event) => setExpectedOutputPolicy(event.target.value as "one_per_work_item" | "optional")}><option value="one_per_work_item">One output per work item</option><option value="optional">Outputs optional</option></select></label><button className="primary" disabled={actionsBlocked || !sessionName.trim() || !exportManifestId} onClick={() => void createSession()}>{isMutating ? "Saving…" : "Create Edit Session"}</button></div>{selectedManifest ? <p className="muted">Selected frozen source: {selectedManifest.planName} · {selectedManifest.selectedFileCount.toLocaleString()} files · {productionByteLabel(selectedManifest.estimatedBytes)}. The manifest remains immutable.</p> : workspace && !workspace.eligibleManifests.length ? <p className="muted">No eligible completed frozen Production workset is available yet. Create and complete an Editor Workset in Production first.</p> : null}</section>
+    <section className="status-card" aria-label="Edit Sessions"><div className="panel-heading"><div><p className="section-label">Sessions</p><h2>{workspace?.sessions.length ? `${workspace.sessions.length.toLocaleString()} local Edit Session${workspace.sessions.length === 1 ? "" : "s"}` : "No Edit Sessions yet"}</h2><p className="muted">Session summaries are compact. The queue loads only a bounded page after you choose a session.</p></div></div>{workspace?.sessions.length ? <div className="filters" aria-label="Edit Session selector">{workspace.sessions.map((session) => <button key={session.id} className={session.id === selectedSessionId ? "active" : ""} disabled={actionsBlocked} onClick={() => setSelectedSessionId(session.id)}>{session.name} · {displayLabel(session.state)}</button>)}</div> : <p className="muted">Create a session when you are ready to coordinate an external edit from a frozen workset.</p>}</section>
+    {selectedSession ? <>
+      <section className="metrics-strip" aria-label="Edit Session summary"><Metric label="Work items" value={selectedSession.workItemCount} /><Metric label="Returned" value={selectedSession.returnedOutputCount} /><Metric label="Approved" value={selectedSession.approvedCount} /><Metric label="Needs revision" value={selectedSession.needsRevisionCount} /><Metric label="Missing" value={selectedSession.missingOutputCount} /><Metric label="Blocked" value={selectedSession.blockedCount} /></section>
+      <section className="status-card" aria-label="Edit Handoff"><div className="panel-heading"><div><p className="section-label">Reference handoff</p><h2>{selectedSession.handoffState ? displayLabel(selectedSession.handoffState) : "Ready to generate"}</h2><p className="muted">This M10 handoff creates local CaptureOS coordination metadata that references the verified workset. It does not copy media again, write into editor catalogs, or include private Smart Cull notes.</p></div></div><div className="visual-toolbar"><label className="search"><span className="sr-only">Local handoff destination</span><input aria-label="Local handoff destination" value={handoffDestination} disabled={actionsBlocked} onChange={(event) => setHandoffDestination(event.target.value)} placeholder="Choose a new local handoff folder" /></label><button className="secondary" disabled={actionsBlocked} onClick={() => void chooseDirectory(setHandoffDestination, "Choose local Edit Handoff destination")}>Choose folder</button><button className="primary" disabled={actionsBlocked || !handoffDestination.trim()} onClick={() => void generateHandoff()}>{isMutating ? "Generating…" : "Generate reference handoff"}</button></div></section>
+      <section className="status-card" aria-label="Register Edited Outputs"><div className="panel-heading"><div><p className="section-label">Returned outputs</p><h2>Register Edited Outputs</h2><p className="muted">Choose one explicit local output folder. CaptureOS discovers and tracks returned derivatives without moving, renaming, overwriting, or importing them destructively.</p></div></div><div className="visual-toolbar"><label className="search"><span className="sr-only">Local output folder</span><input aria-label="Local output folder" value={outputRoot} disabled={actionsBlocked} onChange={(event) => setOutputRoot(event.target.value)} placeholder="Choose a local returned-output folder" /></label><button className="secondary" disabled={actionsBlocked} onClick={() => void chooseDirectory(setOutputRoot, "Choose local returned Edit outputs")}>Choose folder</button><button className="primary" disabled={actionsBlocked || !outputRoot.trim()} onClick={() => void registerOutputs()}>{isMutating ? "Registering…" : "Register outputs"}</button></div></section>
+      <section className="status-card" aria-label="Edit queue"><div className="panel-heading"><div><p className="section-label">Bounded edit queue</p><h2>{queueTotal.toLocaleString()} work item{queueTotal === 1 ? "" : "s"}</h2><p className="muted">Showing {workItems.length.toLocaleString()} local work item{workItems.length === 1 ? "" : "s"} from this session. Source availability is informational; an offline source is not treated as deleted.</p></div></div>{isLoadingPage && !workItems.length ? <p className="muted">Loading the local edit queue…</p> : workItems.length ? <div className="media-grid medium" aria-label="Edit work items">{workItems.map((item) => <EditWorkItemCard key={item.id} item={item} selected={compareWorkItemId === item.id} onCompare={() => setCompareWorkItemId(item.id)} />)}</div> : <p className="muted">No work items are visible in this page yet. The frozen session remains available.</p>}{sessionPage?.hasMore ? <div className="load-more"><button className="secondary" disabled={isLoadingPage || actionsBlocked} onClick={() => void loadSessionPage(selectedSession.id, workItems.length, true)}>{isLoadingPage ? "Loading…" : "Load more work items"}</button></div> : null}</section>
+      <section className="status-card" aria-label="Registered edit outputs"><div className="panel-heading"><div><p className="section-label">Output matching</p><h2>{outputs.length ? `${outputs.length.toLocaleString()} returned output${outputs.length === 1 ? "" : "s"} in this page` : "No returned outputs in this page"}</h2><p className="muted">CaptureOS never silently assigns an ambiguous output. Unmatched and ambiguous files remain visible until you explicitly confirm a source match.</p></div></div>{outputs.length ? <ul className="culling-reasons">{outputs.map((output) => <EditOutputRow key={output.id} output={output} workItems={workItems} manualMatchTarget={manualMatchTargets[output.id] ?? ""} disabled={actionsBlocked} onTargetChange={(workItemId) => setManualMatchTargets((current) => ({ ...current, [output.id]: workItemId }))} onManualMatch={() => void manuallyMatchOutput(output)} />)}</ul> : <p className="muted">Register a local output folder when returned edits are ready. This is explicit; CaptureOS does not watch or scan folders during project startup.</p>}</section>
+      <section className="status-card" aria-label="Edit version review"><div className="panel-heading"><div><p className="section-label">Human version review</p><h2>{versions.length ? `${versions.length.toLocaleString()} visible version${versions.length === 1 ? "" : "s"}` : "No returned versions ready for review"}</h2><p className="muted">Only you can approve an edit or request a revision. Review state stays separate from Keep, Reject, Review, ratings, and Production history.</p></div></div>{versions.length ? <ul className="culling-reasons">{versions.map((version) => <li key={version.id}><strong>{version.filename} · Edit v{version.versionNumber}</strong><small> · {displayLabel(version.availability)} · {version.isCurrent ? "current" : "historical"}{version.width && version.height ? ` · ${version.width}×${version.height}` : ""}{version.byteSize !== null ? ` · ${formatSize(version.byteSize)}` : ""}{version.reviewState ? ` · ${displayLabel(version.reviewState)}` : ""}</small><div><button className="secondary" disabled={actionsBlocked || version.reviewState === "needs_revision"} onClick={() => void reviewVersion(version, "needs_revision")}>Needs Revision</button><button className="secondary" disabled={actionsBlocked || version.reviewState === "approved"} onClick={() => void reviewVersion(version, "approved")}>Approve</button></div></li>)}</ul> : <p className="muted">A discovered output becomes reviewable only after it is safely associated with a session work item.</p>}</section>
+      {compareWorkItem ? <section className="status-card" aria-label="Original and Edit comparison"><div className="panel-heading"><div><p className="section-label">Visual review</p><h2>Original vs latest edit</h2><p className="muted">A side-by-side local preview for human inspection only. CaptureOS does not assess creative quality, color, retouching, or client readiness.</p></div><button className="secondary" onClick={() => setCompareWorkItemId(null)}>Close comparison</button></div><div className="media-grid medium"><article className="media-card"><span className="media-thumbnail"><PreviewImage url={compareWorkItem.sourceThumbnailPreviewUrl} alt={`Original ${compareWorkItem.sourceFilename}`} fallback={<span className="media-placeholder">◫</span>} /></span><div className="card-caption"><strong>Original · {compareWorkItem.sourceFilename}</strong><small>{compareWorkItem.sourceAvailable ? "Source available" : "Source offline"}</small></div></article><article className="media-card"><span className="media-thumbnail"><PreviewImage url={compareOutput?.thumbnailPreviewUrl ?? compareWorkItem.latestOutputThumbnailPreviewUrl} alt={compareOutput?.filename ?? compareWorkItem.latestOutputFilename ?? "Latest edit"} fallback={<span className="media-placeholder">◫</span>} /></span><div className="card-caption"><strong>{compareOutput?.filename ?? compareWorkItem.latestOutputFilename ?? "No returned edit yet"}</strong><small>{compareWorkItem.latestVersionNumber ? `Edit v${compareWorkItem.latestVersionNumber}` : "Awaiting output"} · {compareWorkItem.reviewState ? displayLabel(compareWorkItem.reviewState) : "No human review state"}</small></div></article></div></section> : null}
+      <details className="advanced"><summary>Developer Details</summary><p>Session {selectedSession.id} · frozen manifest v{selectedSession.sourceManifestVersion ?? "unavailable"} · source checksum {selectedSession.sourceManifestChecksum ?? "unavailable"}.</p>{developerError ? <pre>{developerError}</pre> : null}</details>
+    </> : null}
+  </section>;
+}
+
+function EditWorkItemCard({ item, selected, onCompare }: { item: EditWorkItemView; selected: boolean; onCompare: () => void }) {
+  return <article className={`media-card ${selected ? "active" : ""}`}><span className="media-thumbnail"><PreviewImage url={item.sourceThumbnailPreviewUrl} alt={item.sourceFilename} fallback={<span className="media-placeholder">◫</span>} /></span><div className="card-caption"><strong>{item.sourceFilename}</strong><small>{displayLabel(item.state)} · {item.sourceAvailable ? "source available" : "source offline"}</small><small>{item.momentLabel ? `${item.momentLabel} · ` : ""}{item.rating ? `${item.rating} star${item.rating === 1 ? "" : "s"}` : "no rating"}{item.starred ? " · starred" : ""}</small><small>{item.latestOutputFilename ? `${item.latestOutputFilename} · Edit v${item.latestVersionNumber ?? "?"}` : "Awaiting output"}</small><button className="secondary" onClick={onCompare}>{selected ? "Comparing" : "Compare original and edit"}</button></div></article>;
+}
+
+function EditOutputRow({ output, workItems, manualMatchTarget, disabled, onTargetChange, onManualMatch }: { output: EditOutputView; workItems: EditWorkItemView[]; manualMatchTarget: string; disabled: boolean; onTargetChange: (workItemId: string) => void; onManualMatch: () => void }) {
+  const needsManualMatch = !output.matchedWorkItemId && ["ambiguous", "unmatched", "possible"].includes(output.matchState);
+  return <li><strong>{output.filename}</strong><small> · {displayLabel(output.state)} · {displayLabel(output.matchState)} · {displayLabel(output.availability)}</small>{output.matchEvidence.length ? <small> · {output.matchEvidence.join(" · ")}</small> : null}{needsManualMatch ? <div><label>Match to visible source <select aria-label={`Match ${output.filename} to source`} value={manualMatchTarget} disabled={disabled || !workItems.length} onChange={(event) => onTargetChange(event.target.value)}><option value="">Choose a source work item</option>{workItems.map((item) => <option key={item.id} value={item.id}>{item.sourceFilename}</option>)}</select></label><button className="secondary" disabled={disabled || !manualMatchTarget} onClick={onManualMatch}>Confirm manual match</button></div> : output.matchedWorkItemId ? <small> · Matched to a session work item</small> : <small> · Matching evidence is still being preserved without assignment.</small>}</li>;
 }
 
 const emptyProductionRules = () => ({

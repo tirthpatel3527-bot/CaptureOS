@@ -7,6 +7,10 @@ use delivery_brain::{
     OrganizationStrategy, PlanOverride, PlanOverrideKind, ProductionPlanStatus, ProductionPlanType,
     SelectionRules, VirtualCollectionKind,
 };
+use edit_bridge::{
+    EditSessionState, EditSessionTemplate, EditVersionReviewState, EditWorkItemState,
+    ExpectedOutputPolicy, HandoffMode, MatchConfidence, OutputMatchState, WorkItemMatchCandidate,
+};
 use media_model::*;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::{
@@ -17,7 +21,7 @@ use studio_brain::{decode_verified_model_artifact, VerifiedModelArtifact};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 // This is a query-page size, never a catalog/result limit. Moment semantic search continues
 // until its cursor is exhausted so it cannot silently omit a large project's later Moments.
 const MOMENT_SEARCH_ROW_PAGE_SIZE: u32 = 256;
@@ -1528,6 +1532,220 @@ impl ProductionPreflight {
     }
 }
 
+/// A durable M10 orchestration record. Its source is an immutable M9 Export Manifest, never a
+/// re-evaluated Smart Cull query. `source_stale` is deliberately separate from workflow state so
+/// a completed historical session can remain completed while honestly showing that its source
+/// plan later changed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSessionRecord {
+    pub id: String,
+    pub project_id: String,
+    pub source_production_plan_id: String,
+    pub source_export_manifest_id: String,
+    pub source_export_job_id: String,
+    pub source_manifest_checksum: String,
+    pub source_manifest_version: u64,
+    pub name: String,
+    pub template: EditSessionTemplate,
+    pub workflow_state: EditSessionState,
+    pub source_stale: bool,
+    pub expected_output_policy: ExpectedOutputPolicy,
+    pub work_item_count: u64,
+    pub estimated_bytes: u64,
+    pub handoff_count: u64,
+    pub output_count: u64,
+    pub approved_count: u64,
+    pub needs_revision_count: u64,
+    pub missing_output_count: u64,
+    pub blocked_count: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub archived_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateEditSessionInput {
+    pub name: String,
+    pub template: EditSessionTemplate,
+    pub export_manifest_id: String,
+    pub expected_output_policy: ExpectedOutputPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditHandoffInput {
+    pub mode: HandoffMode,
+    pub destination_path: String,
+}
+
+/// A verified frozen M9 manifest eligible to seed an M10 session. It deliberately contains no
+/// source absolute path; the original M9 export location remains catalog-private.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EligibleEditSource {
+    pub production_plan_id: String,
+    pub production_plan_name: String,
+    pub production_plan_type: ProductionPlanType,
+    pub export_manifest_id: String,
+    pub export_manifest_version: u64,
+    pub export_manifest_checksum: String,
+    pub selected_file_count: u64,
+    pub estimated_bytes: u64,
+    pub verified_export_job_id: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditWorkspaceView {
+    pub sessions: Vec<EditSessionRecord>,
+    pub eligible_sources: Vec<EligibleEditSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditWorkItemRecord {
+    pub id: String,
+    pub session_id: String,
+    pub source_export_manifest_entry_id: String,
+    pub source_media_asset_id: String,
+    pub ordinal: u64,
+    pub handoff_relative_path: String,
+    pub original_filename: String,
+    pub source_checksum: Option<String>,
+    pub captured_at: Option<String>,
+    pub camera: Option<String>,
+    pub moment_label: Option<String>,
+    pub human_decision: Option<String>,
+    pub rating: u8,
+    pub starred: bool,
+    pub expected_output_policy: ExpectedOutputPolicy,
+    pub state: EditWorkItemState,
+    pub current_edit_version_id: Option<String>,
+    pub source_available: bool,
+    /// This is an app-managed preview artifact identifier. Capture-core converts it to the
+    /// restricted preview protocol; it is never a source path or arbitrary local file URL.
+    pub source_preview_artifact_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditHandoffPackageRecord {
+    pub id: String,
+    pub session_id: String,
+    pub prior_handoff_id: Option<String>,
+    pub handoff_version: u64,
+    pub mode: HandoffMode,
+    pub adapter_key: String,
+    pub state: String,
+    /// Exposed only to the local app UI. It is never serialized into the external edit manifest.
+    pub destination_path: String,
+    pub source_manifest_checksum: String,
+    pub manifest_checksum: Option<String>,
+    pub created_at: String,
+    pub written_at: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditHandoffPreparation {
+    pub handoff: EditHandoffPackageRecord,
+    pub session: EditSessionRecord,
+    pub project_name: String,
+    pub work_items: Vec<EditWorkItemRecord>,
+    pub source_root_paths: Vec<String>,
+    pub already_prepared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditOutputRootRecord {
+    pub id: String,
+    pub session_id: String,
+    pub selected_path: String,
+    pub canonical_path: String,
+    pub availability: String,
+    pub last_checked_at: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditOutputRecord {
+    pub id: String,
+    pub session_id: String,
+    pub output_root_id: String,
+    pub relative_path: String,
+    pub display_filename: String,
+    pub normalized_basename: String,
+    pub byte_size: u64,
+    pub checksum: String,
+    pub media_type: String,
+    pub metadata: serde_json::Value,
+    pub availability: String,
+    pub discovery_state: OutputMatchState,
+    pub match_confidence: Option<MatchConfidence>,
+    pub match_evidence: Option<String>,
+    pub matched_work_item_id: Option<String>,
+    pub technical_status: String,
+    pub technical_issue: Option<String>,
+    pub registered_at: String,
+    pub last_seen_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditVersionRecord {
+    pub id: String,
+    pub work_item_id: String,
+    pub output_id: String,
+    pub version_number: u64,
+    pub review_state: EditVersionReviewState,
+    pub is_current: bool,
+    pub created_at: String,
+    pub reviewed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSessionPage {
+    pub session: EditSessionRecord,
+    pub handoffs: Vec<EditHandoffPackageRecord>,
+    pub work_items: Vec<EditWorkItemRecord>,
+    pub outputs: Vec<EditOutputRecord>,
+    pub versions: Vec<EditVersionRecord>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditOutputRegistration {
+    pub output_root: EditOutputRootRecord,
+    pub relative_path: String,
+    pub display_filename: String,
+    pub normalized_basename: String,
+    pub byte_size: u64,
+    pub checksum: String,
+    pub media_type: String,
+    pub metadata: serde_json::Value,
+    pub technical_status: String,
+    pub technical_issue: Option<String>,
+    pub match_state: OutputMatchState,
+    pub match_confidence: Option<MatchConfidence>,
+    pub match_evidence: Option<String>,
+    pub auto_match_work_item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditOutputRegistrationOutcome {
+    pub output: EditOutputRecord,
+    pub version: Option<EditVersionRecord>,
+    pub created: bool,
+}
+
 pub trait CatalogRepository {
     fn create_project(&self, name: &str) -> Result<Project>;
     fn projects(&self) -> Result<Vec<Project>>;
@@ -1941,6 +2159,95 @@ pub trait CatalogRepository {
     /// One immutable report is allowed per execution; retries must create a new Export Job.
     fn store_delivery_report(&self, report: &DeliveryReportRecord) -> Result<()>;
     fn recover_interrupted_production_exports(&self) -> Result<u64>;
+    /// Cheap M10 workspace projection. It never touches output folders, hashes returned files,
+    /// creates a session, or recalculates an M9 selection.
+    fn edit_workspace(&self, project_id: &ProjectId) -> Result<EditWorkspaceView>;
+    /// Creates one bounded session from a completed, fully verified frozen M9 Export Manifest.
+    /// Repeated identical requests return the already-created session rather than duplicating
+    /// work items.
+    fn create_edit_session(
+        &self,
+        project_id: &ProjectId,
+        input: &CreateEditSessionInput,
+    ) -> Result<EditSessionRecord>;
+    fn edit_session_page(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<EditSessionPage>;
+    /// Reserves or resumes an idempotent local reference-handoff record. The filesystem write is
+    /// intentionally performed by capture-core after this transaction; `finish_edit_handoff`
+    /// makes its entries visible atomically only after those safe files exist.
+    fn prepare_edit_handoff(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        input: &EditHandoffInput,
+    ) -> Result<EditHandoffPreparation>;
+    fn finish_edit_handoff(
+        &self,
+        project_id: &ProjectId,
+        handoff_id: &str,
+        manifest_checksum: &str,
+    ) -> Result<EditHandoffPackageRecord>;
+    fn record_edit_handoff_failure(
+        &self,
+        project_id: &ProjectId,
+        handoff_id: &str,
+        message: &str,
+    ) -> Result<()>;
+    fn edit_output_match_candidates(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+    ) -> Result<Vec<WorkItemMatchCandidate>>;
+    fn prepare_edit_output_root(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        selected_path: &str,
+        canonical_path: &str,
+    ) -> Result<EditOutputRootRecord>;
+    fn register_edit_output(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        registration: &EditOutputRegistration,
+    ) -> Result<EditOutputRegistrationOutcome>;
+    fn manually_match_edit_output(
+        &self,
+        project_id: &ProjectId,
+        output_id: &str,
+        work_item_id: &str,
+    ) -> Result<EditOutputRegistrationOutcome>;
+    fn set_edit_version_review_state(
+        &self,
+        project_id: &ProjectId,
+        version_id: &str,
+        review_state: EditVersionReviewState,
+    ) -> Result<EditVersionRecord>;
+    /// Explicitly refreshes availability for already registered output roots. It does not scan,
+    /// hash, or remove records and therefore never runs when a project opens.
+    fn update_edit_output_root_availability(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        root_id: &str,
+        availability: &str,
+    ) -> Result<()>;
+    /// After a successful, complete discovery scan of one output root, transitions previously
+    /// tracked outputs of the same session root that were not seen during the scan to the offline
+    /// state. It never deletes records, provenance, review decisions, versions, or history, and it
+    /// must only be called once the scan has fully and successfully completed.
+    fn mark_missing_edit_outputs_offline(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        root_id: &str,
+        seen_relative_paths: &[String],
+    ) -> Result<()>;
     fn latest_capture_intelligence_job(
         &self,
         project_id: &ProjectId,
@@ -2297,6 +2604,11 @@ impl SqliteRepository {
             self.connection.execute_batch(MIGRATION_020)?;
             self.connection
                 .pragma_update(None, "user_version", 20_i64)?;
+        }
+        if version < 21 {
+            self.connection.execute_batch(MIGRATION_021)?;
+            self.connection
+                .pragma_update(None, "user_version", 21_i64)?;
         }
         Ok(())
     }
@@ -7441,6 +7753,1036 @@ impl CatalogRepository for SqliteRepository {
         Ok(changed as u64)
     }
 
+    fn edit_workspace(&self, project_id: &ProjectId) -> Result<EditWorkspaceView> {
+        let sessions_sql = edit_session_summary_sql(
+            "session.project_id = ?1",
+            "ORDER BY session.updated_at DESC, session.id ASC",
+        );
+        let mut sessions_statement = self.connection.prepare(&sessions_sql)?;
+        let sessions = sessions_statement
+            .query_map(params![project_id.to_string()], edit_session_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // A manifest is eligible only after an M9 execution verified every entry. This reads
+        // durable historical executions rather than current Smart Cull state, so opening Edit
+        // never recalculates a workset or starts an export.
+        let mut sources_statement = self.connection.prepare(
+            "SELECT plan.id, plan.name, plan.plan_type, manifest.id, manifest.manifest_version,
+                    manifest.checksum, manifest.selected_file_count, manifest.estimated_bytes,
+                    job.id, job.finished_at
+             FROM export_jobs job
+             JOIN export_manifests manifest ON manifest.id = job.export_manifest_id
+             JOIN production_plans plan ON plan.id = manifest.production_plan_id
+             WHERE manifest.project_id = ?1
+               AND manifest.status = 'ready'
+               AND plan.current_manifest_id = manifest.id
+               AND job.state = 'completed'
+               AND job.items_total = manifest.selected_file_count
+               AND job.verified_count = manifest.selected_file_count
+               AND job.failed_count = 0
+               AND NOT EXISTS (
+                   SELECT 1 FROM export_jobs newer
+                   WHERE newer.export_manifest_id = job.export_manifest_id
+                     AND (newer.updated_at > job.updated_at
+                       OR (newer.updated_at = job.updated_at AND newer.id > job.id))
+               )
+             ORDER BY job.finished_at DESC, job.id DESC",
+        )?;
+        let eligible_sources = sources_statement
+            .query_map(params![project_id.to_string()], |row| {
+                let plan_type: String = row.get(2)?;
+                Ok(EligibleEditSource {
+                    production_plan_id: row.get(0)?,
+                    production_plan_name: row.get(1)?,
+                    production_plan_type: enum_from_text(&plan_type)?,
+                    export_manifest_id: row.get(3)?,
+                    export_manifest_version: row.get::<_, i64>(4)? as u64,
+                    export_manifest_checksum: row.get(5)?,
+                    selected_file_count: row.get::<_, i64>(6)? as u64,
+                    estimated_bytes: row.get::<_, i64>(7)? as u64,
+                    verified_export_job_id: row.get(8)?,
+                    completed_at: row.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(EditWorkspaceView {
+            sessions,
+            eligible_sources,
+        })
+    }
+
+    fn create_edit_session(
+        &self,
+        project_id: &ProjectId,
+        input: &CreateEditSessionInput,
+    ) -> Result<EditSessionRecord> {
+        let name = valid_edit_session_name(&input.name)?;
+        let transaction = moment_write_transaction(&self.connection)?;
+        let source = transaction
+            .query_row(
+                "SELECT plan.id, manifest.id, job.id, manifest.checksum, manifest.manifest_version,
+                        manifest.selected_file_count, manifest.estimated_bytes
+                 FROM export_jobs job
+                 JOIN export_manifests manifest ON manifest.id = job.export_manifest_id
+                 JOIN production_plans plan ON plan.id = manifest.production_plan_id
+                 WHERE manifest.id = ?1 AND manifest.project_id = ?2
+                   AND manifest.status = 'ready'
+                   AND plan.current_manifest_id = manifest.id
+                   AND job.state = 'completed'
+                   AND job.items_total = manifest.selected_file_count
+                   AND job.verified_count = manifest.selected_file_count
+                   AND job.failed_count = 0
+                 ORDER BY job.finished_at DESC, job.id DESC LIMIT 1",
+                params![input.export_manifest_id, project_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            plan_id,
+            manifest_id,
+            export_job_id,
+            checksum,
+            manifest_version,
+            item_count,
+            estimated_bytes,
+        )) = source
+        else {
+            return Err(PersistenceError::InvalidData(
+                "An Edit Session requires a completed, fully verified local Production export from this project".into(),
+            ));
+        };
+        let existing: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT id, template, expected_output_policy
+                 FROM edit_sessions
+                 WHERE project_id = ?1 AND source_export_manifest_id = ?2 AND name = ?3",
+                params![project_id.to_string(), manifest_id, name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((existing_id, template, policy)) = existing {
+            if template != edit_session_template_name(input.template)
+                || policy != expected_output_policy_name(input.expected_output_policy)
+            {
+                return Err(PersistenceError::InvalidData(
+                    "An Edit Session with this frozen source and name already exists with different settings".into(),
+                ));
+            }
+            transaction.commit()?;
+            return edit_session_record(&self.connection, project_id, &existing_id)?.ok_or_else(
+                || PersistenceError::InvalidData("existing Edit Session could not be read".into()),
+            );
+        }
+        let id = Uuid::new_v4().to_string();
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "INSERT INTO edit_sessions (id, project_id, source_production_plan_id, source_export_manifest_id, source_export_job_id, source_manifest_checksum, source_manifest_version, name, template, workflow_state, source_stale, expected_output_policy, work_item_count, estimated_bytes, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'ready', 0, ?10, ?11, ?12, ?13, ?13)",
+            params![id, project_id.to_string(), plan_id, manifest_id, export_job_id, checksum, manifest_version, name, edit_session_template_name(input.template), expected_output_policy_name(input.expected_output_policy), item_count, estimated_bytes, now],
+        )?;
+        let configuration = serde_json::json!({
+            "template": input.template,
+            "expectedOutputPolicy": input.expected_output_policy,
+            "sourceExportManifestId": input.export_manifest_id,
+            "sourceManifestChecksum": checksum,
+            "sourceManifestVersion": manifest_version,
+        });
+        transaction.execute(
+            "INSERT INTO edit_session_versions (id, edit_session_id, version, configuration_json, created_at)
+             VALUES (?1, ?2, 1, ?3, ?4)",
+            params![Uuid::new_v4().to_string(), id, json(&configuration)?, now],
+        )?;
+        let mut entries = transaction.prepare(
+            "SELECT entry.id, entry.media_asset_id, entry.ordinal, entry.destination_relative_path,
+                    entry.original_filename, entry.source_checksum, entry.moment_label,
+                    entry.human_decision, entry.rating, entry.starred,
+                    metadata.captured_at_local, metadata.camera_model
+             FROM export_manifest_entries entry
+             LEFT JOIN media_metadata metadata ON metadata.media_asset_id = entry.media_asset_id
+             WHERE entry.export_manifest_id = ?1
+             ORDER BY entry.ordinal ASC, entry.id ASC",
+        )?;
+        let rows = entries
+            .query_map(params![input.export_manifest_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, bool>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() as i64 != item_count {
+            return Err(PersistenceError::InvalidData(
+                "The frozen Production manifest changed while the Edit Session was being created; refresh Production before retrying".into(),
+            ));
+        }
+        for (
+            entry_id,
+            asset_id,
+            ordinal,
+            handoff_relative_path,
+            original_filename,
+            source_checksum,
+            moment_label,
+            human_decision,
+            rating,
+            starred,
+            captured_at,
+            camera,
+        ) in rows
+        {
+            if !edit_bridge::safe_relative_path(&handoff_relative_path) {
+                return Err(PersistenceError::InvalidData(
+                    "A frozen Production manifest contains an unsafe handoff relative path".into(),
+                ));
+            }
+            transaction.execute(
+                "INSERT INTO edit_work_items (id, edit_session_id, source_export_manifest_entry_id, media_asset_id, ordinal, handoff_relative_path, original_filename, source_checksum, captured_at, camera, moment_label, human_decision, rating, starred, expected_output_policy, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+                params![Uuid::new_v4().to_string(), id, entry_id, asset_id, ordinal, handoff_relative_path, original_filename, source_checksum, captured_at, camera, moment_label, human_decision, rating, starred, expected_output_policy_name(input.expected_output_policy), now],
+            )?;
+        }
+        drop(entries);
+        insert_edit_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(&id),
+            None,
+            None,
+            None,
+            None,
+            "EDIT_SESSION_CREATED",
+            &serde_json::json!({"sourceManifestChecksum": checksum, "workItemCount": item_count}),
+            &now,
+        )?;
+        transaction.commit()?;
+        edit_session_record(&self.connection, project_id, &id)?.ok_or_else(|| {
+            PersistenceError::InvalidData("created Edit Session could not be read".into())
+        })
+    }
+
+    fn edit_session_page(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<EditSessionPage> {
+        let session =
+            edit_session_record(&self.connection, project_id, session_id)?.ok_or_else(|| {
+                PersistenceError::InvalidData("Edit Session does not belong to this project".into())
+            })?;
+        let bounded_limit = limit.clamp(1, 250) as usize;
+        let mut statement = self.connection.prepare(
+            "SELECT item.id, item.edit_session_id, item.source_export_manifest_entry_id,
+                    item.media_asset_id, item.ordinal, item.handoff_relative_path,
+                    item.original_filename, item.source_checksum, item.captured_at, item.camera,
+                    item.moment_label, item.human_decision, item.rating, item.starred,
+                    item.expected_output_policy, item.current_edit_version_id,
+                    CASE
+                      WHEN version.review_state = 'approved' THEN 'approved'
+                      WHEN version.review_state = 'needs_revision' THEN 'needs_revision'
+                      WHEN version.id IS NOT NULL THEN 'ready_for_review'
+                      WHEN EXISTS (SELECT 1 FROM edit_outputs output WHERE output.matched_work_item_id = item.id) THEN 'output_received'
+                      WHEN EXISTS (SELECT 1 FROM edit_handoff_packages handoff WHERE handoff.edit_session_id = item.edit_session_id AND handoff.state = 'ready') AND item.expected_output_policy = 'required' THEN 'missing_output'
+                      WHEN EXISTS (SELECT 1 FROM edit_handoff_packages handoff WHERE handoff.edit_session_id = item.edit_session_id AND handoff.state = 'ready') THEN 'handed_off'
+                      ELSE 'queued'
+                    END,
+                    COALESCE((SELECT instance.is_available FROM file_instances instance WHERE instance.id = (SELECT entry.selected_file_instance_id FROM export_manifest_entries entry WHERE entry.id = item.source_export_manifest_entry_id)), 0),
+                    (SELECT artifact.id FROM preview_artifacts artifact
+                     WHERE artifact.media_asset_id = item.media_asset_id AND artifact.status = 'ready'
+                       AND artifact.size_class IN ('medium','small')
+                     ORDER BY CASE artifact.size_class WHEN 'medium' THEN 0 ELSE 1 END, artifact.created_at DESC, artifact.id ASC LIMIT 1)
+             FROM edit_work_items item
+             LEFT JOIN edit_output_versions version ON version.id = item.current_edit_version_id
+             WHERE item.edit_session_id = ?1
+             ORDER BY item.ordinal ASC, item.id ASC LIMIT ?2 OFFSET ?3",
+        )?;
+        let mut work_items = statement
+            .query_map(
+                params![session_id, (bounded_limit + 1) as i64, offset as i64],
+                edit_work_item_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_more = work_items.len() > bounded_limit;
+        work_items.truncate(bounded_limit);
+        let mut handoff_statement = self.connection.prepare(
+            "SELECT id, edit_session_id, prior_handoff_id, handoff_version, mode, adapter_key, state,
+                    destination_path, source_manifest_checksum, manifest_checksum, created_at, written_at, error_message
+             FROM edit_handoff_packages WHERE edit_session_id = ?1 ORDER BY handoff_version DESC, id DESC",
+        )?;
+        let handoffs = handoff_statement
+            .query_map(params![session_id], edit_handoff_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // Returned files are deliberately bounded independently from the queue. A page does not
+        // deserialize every derivative in a 100k-item session; registration can be repeated and
+        // later UI pagination can extend this same indexed query without a schema change.
+        let mut output_statement = self.connection.prepare(
+            "SELECT output.id, output.edit_session_id, output.edit_output_root_id, output.relative_path,
+                    output.display_filename, output.normalized_basename, output.byte_size, output.checksum,
+                    output.media_type, output.metadata_json, output.availability, output.discovery_state,
+                    output.match_confidence, output.match_evidence, output.matched_work_item_id,
+                    output.technical_status, output.technical_issue, output.registered_at, output.last_seen_at
+             FROM edit_outputs output WHERE output.edit_session_id = ?1
+             ORDER BY output.registered_at DESC, output.id DESC LIMIT ?2",
+        )?;
+        let outputs = output_statement
+            .query_map(
+                params![session_id, bounded_limit as i64],
+                edit_output_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut version_statement = self.connection.prepare(
+            "SELECT version.id, version.edit_work_item_id, version.edit_output_id, version.version_number,
+                    version.review_state, version.is_current, version.created_at, version.reviewed_at
+             FROM edit_output_versions version
+             JOIN edit_work_items item ON item.id = version.edit_work_item_id
+             WHERE item.edit_session_id = ?1
+             ORDER BY version.created_at DESC, version.id DESC LIMIT ?2",
+        )?;
+        let versions = version_statement
+            .query_map(
+                params![session_id, bounded_limit as i64],
+                edit_version_from_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(EditSessionPage {
+            session,
+            handoffs,
+            work_items,
+            outputs,
+            versions,
+            has_more,
+        })
+    }
+
+    fn prepare_edit_handoff(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        input: &EditHandoffInput,
+    ) -> Result<EditHandoffPreparation> {
+        if input.destination_path.trim().is_empty() {
+            return Err(PersistenceError::InvalidData(
+                "A separate local handoff destination is required".into(),
+            ));
+        }
+        if input.mode != HandoffMode::Reference {
+            return Err(PersistenceError::InvalidData(
+                "Package handoff is reserved for the frozen-manifest M9 export adapter; M10 currently supports safe Reference handoffs only".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let session = edit_session_record_transaction(&transaction, project_id, session_id)?
+            .ok_or_else(|| {
+                PersistenceError::InvalidData("Edit Session does not belong to this project".into())
+            })?;
+        if session.source_stale {
+            return Err(PersistenceError::InvalidData(
+                "This Edit Session's frozen Production source is stale. Create a new session from an updated manifest instead of mutating this historical handoff".into(),
+            ));
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT id, edit_session_id, prior_handoff_id, handoff_version, mode, adapter_key, state,
+                        destination_path, source_manifest_checksum, manifest_checksum, created_at, written_at, error_message
+                 FROM edit_handoff_packages
+                 WHERE edit_session_id = ?1 AND mode = ?2 AND destination_path = ?3",
+                params![session_id, handoff_mode_name(input.mode), input.destination_path.trim()],
+                edit_handoff_from_row,
+            )
+            .optional()?;
+        let (handoff, already_prepared) = if let Some(existing) = existing {
+            if existing.state == "ready" {
+                (existing, true)
+            } else if existing.state == "writing" {
+                return Err(PersistenceError::InvalidData(
+                    "This Edit Handoff is already being generated; wait for the local write to finish".into(),
+                ));
+            } else {
+                let now = timestamp(&Utc::now());
+                transaction.execute(
+                    "UPDATE edit_handoff_packages SET state = 'writing', error_message = NULL, created_at = ?2, written_at = NULL
+                     WHERE id = ?1",
+                    params![existing.id, now],
+                )?;
+                let updated = transaction.query_row(
+                    "SELECT id, edit_session_id, prior_handoff_id, handoff_version, mode, adapter_key, state,
+                            destination_path, source_manifest_checksum, manifest_checksum, created_at, written_at, error_message
+                     FROM edit_handoff_packages WHERE id = ?1",
+                    params![existing.id],
+                    edit_handoff_from_row,
+                )?;
+                (updated, false)
+            }
+        } else {
+            let next_version: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(handoff_version), 0) + 1 FROM edit_handoff_packages WHERE edit_session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            let prior: Option<String> = transaction.query_row(
+                "SELECT id FROM edit_handoff_packages WHERE edit_session_id = ?1 AND state = 'ready' ORDER BY handoff_version DESC, id DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            ).optional()?;
+            let id = Uuid::new_v4().to_string();
+            let now = timestamp(&Utc::now());
+            transaction.execute(
+                "INSERT INTO edit_handoff_packages (id, edit_session_id, prior_handoff_id, handoff_version, mode, adapter_key, state, destination_path, source_manifest_checksum, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'captureos_native_manifest', 'writing', ?6, ?7, ?8)",
+                params![id, session_id, prior, next_version, handoff_mode_name(input.mode), input.destination_path.trim(), session.source_manifest_checksum, now],
+            )?;
+            let created = transaction.query_row(
+                "SELECT id, edit_session_id, prior_handoff_id, handoff_version, mode, adapter_key, state,
+                        destination_path, source_manifest_checksum, manifest_checksum, created_at, written_at, error_message
+                 FROM edit_handoff_packages WHERE id = ?1",
+                params![id],
+                edit_handoff_from_row,
+            )?;
+            (created, false)
+        };
+        let project_name: String = transaction.query_row(
+            "SELECT name FROM projects WHERE id = ?1",
+            params![project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let work_items = edit_work_items_for_session_transaction(&transaction, session_id)?;
+        let mut source_root_paths = transaction
+            .prepare(
+                "SELECT DISTINCT root.selected_path
+                 FROM export_manifest_entries entry
+                 JOIN file_instances instance ON instance.id = entry.selected_file_instance_id
+                 JOIN index_roots root ON root.id = instance.index_root_id
+                 WHERE entry.export_manifest_id = ?1 AND root.selected_path IS NOT NULL",
+            )?
+            .query_map(params![session.source_export_manifest_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let workset_path: String = transaction.query_row(
+            "SELECT destination_path FROM export_jobs WHERE id = ?1",
+            params![session.source_export_job_id],
+            |row| row.get(0),
+        )?;
+        source_root_paths.push(workset_path);
+        transaction.commit()?;
+        Ok(EditHandoffPreparation {
+            handoff,
+            session,
+            project_name,
+            work_items,
+            source_root_paths,
+            already_prepared,
+        })
+    }
+
+    fn finish_edit_handoff(
+        &self,
+        project_id: &ProjectId,
+        handoff_id: &str,
+        manifest_checksum: &str,
+    ) -> Result<EditHandoffPackageRecord> {
+        if manifest_checksum.trim().is_empty() {
+            return Err(PersistenceError::InvalidData(
+                "A generated Edit Handoff manifest checksum is required".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let handoff = transaction
+            .query_row(
+                "SELECT handoff.id, handoff.edit_session_id, handoff.prior_handoff_id, handoff.handoff_version,
+                        handoff.mode, handoff.adapter_key, handoff.state, handoff.destination_path,
+                        handoff.source_manifest_checksum, handoff.manifest_checksum, handoff.created_at,
+                        handoff.written_at, handoff.error_message
+                 FROM edit_handoff_packages handoff
+                 JOIN edit_sessions session ON session.id = handoff.edit_session_id
+                 WHERE handoff.id = ?1 AND session.project_id = ?2",
+                params![handoff_id, project_id.to_string()],
+                edit_handoff_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| PersistenceError::InvalidData("Edit Handoff does not belong to this project".into()))?;
+        // `prepare_edit_handoff` deliberately commits before capture-core writes the three local
+        // metadata files. A Production plan/manifest can therefore become stale in that small
+        // interval. Do not publish a newly-written handoff as ready against a stale source:
+        // preserve the historical record, mark the reservation stale, and require a new session
+        // from a new frozen manifest instead.
+        let source_stale: bool = transaction.query_row(
+            "SELECT source_stale FROM edit_sessions WHERE id = ?1",
+            params![handoff.session_id],
+            |row| row.get(0),
+        )?;
+        if source_stale {
+            let now = timestamp(&Utc::now());
+            transaction.execute(
+                "UPDATE edit_handoff_packages SET state = 'stale', error_message = ?2
+                 WHERE id = ?1 AND state = 'writing'",
+                params![handoff.id, "Frozen Production provenance became stale before the handoff could be finalized"],
+            )?;
+            insert_edit_event(
+                &transaction,
+                &project_id.to_string(),
+                Some(&handoff.session_id),
+                Some(&handoff.id),
+                None,
+                None,
+                None,
+                "EDIT_HANDOFF_STALE",
+                &serde_json::json!({"phase": "finalize"}),
+                &now,
+            )?;
+            transaction.commit()?;
+            return Err(PersistenceError::InvalidData(
+                "This Edit Handoff's frozen Production source became stale while it was being generated. Its metadata was not published as a ready handoff; create a new session from an updated manifest instead.".into(),
+            ));
+        }
+        if handoff.state == "ready" {
+            if handoff.manifest_checksum.as_deref() == Some(manifest_checksum) {
+                transaction.commit()?;
+                return Ok(handoff);
+            }
+            return Err(PersistenceError::InvalidData(
+                "A ready Edit Handoff cannot be overwritten with different metadata".into(),
+            ));
+        }
+        if handoff.state != "writing" {
+            return Err(PersistenceError::InvalidData(
+                "Only a reserved local Edit Handoff can be finalized".into(),
+            ));
+        }
+        let items = edit_work_items_for_session_transaction(&transaction, &handoff.session_id)?;
+        let now = timestamp(&Utc::now());
+        for item in &items {
+            transaction.execute(
+                "INSERT INTO edit_handoff_entries (id, edit_handoff_package_id, edit_work_item_id, ordinal, handoff_relative_path, normalized_basename, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![Uuid::new_v4().to_string(), handoff.id, item.id, item.ordinal as i64, item.handoff_relative_path, normalize_edit_basename(&item.handoff_relative_path), now],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE edit_handoff_packages SET state = 'ready', manifest_checksum = ?2, written_at = ?3, error_message = NULL WHERE id = ?1",
+            params![handoff.id, manifest_checksum, now],
+        )?;
+        transaction.execute(
+            "UPDATE edit_sessions SET workflow_state = CASE WHEN source_stale = 1 THEN 'stale' ELSE 'awaiting_outputs' END, updated_at = ?2 WHERE id = ?1",
+            params![handoff.session_id, now],
+        )?;
+        insert_edit_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(&handoff.session_id),
+            Some(&handoff.id),
+            None,
+            None,
+            None,
+            "EDIT_HANDOFF_CREATED",
+            &serde_json::json!({"handoffVersion": handoff.handoff_version, "manifestChecksum": manifest_checksum}),
+            &now,
+        )?;
+        transaction.commit()?;
+        self.connection.query_row(
+            "SELECT id, edit_session_id, prior_handoff_id, handoff_version, mode, adapter_key, state,
+                    destination_path, source_manifest_checksum, manifest_checksum, created_at, written_at, error_message
+             FROM edit_handoff_packages WHERE id = ?1",
+            params![handoff_id],
+            edit_handoff_from_row,
+        ).map_err(Into::into)
+    }
+
+    fn record_edit_handoff_failure(
+        &self,
+        project_id: &ProjectId,
+        handoff_id: &str,
+        message: &str,
+    ) -> Result<()> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let session_id: String = transaction.query_row(
+            "SELECT handoff.edit_session_id FROM edit_handoff_packages handoff
+             JOIN edit_sessions session ON session.id = handoff.edit_session_id
+             WHERE handoff.id = ?1 AND session.project_id = ?2",
+            params![handoff_id, project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "UPDATE edit_handoff_packages SET state = 'failed', error_message = ?2 WHERE id = ?1 AND state = 'writing'",
+            params![handoff_id, truncate_edit_message(message),],
+        )?;
+        insert_edit_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(&session_id),
+            Some(handoff_id),
+            None,
+            None,
+            None,
+            "EDIT_HANDOFF_MARKED_FAILED",
+            &serde_json::json!({"recoverable": true}),
+            &now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn edit_output_match_candidates(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+    ) -> Result<Vec<WorkItemMatchCandidate>> {
+        let mut statement = self.connection.prepare(
+            "SELECT item.id, item.media_asset_id, item.handoff_relative_path, item.original_filename, item.source_checksum
+             FROM edit_work_items item
+             JOIN edit_sessions session ON session.id = item.edit_session_id
+             WHERE item.edit_session_id = ?1 AND session.project_id = ?2
+             ORDER BY item.ordinal ASC, item.id ASC",
+        )?;
+        let candidates = statement
+            .query_map(params![session_id, project_id.to_string()], |row| {
+                Ok(WorkItemMatchCandidate {
+                    work_item_id: row.get(0)?,
+                    source_media_asset_id: row.get(1)?,
+                    handoff_relative_path: row.get(2)?,
+                    original_filename: row.get(3)?,
+                    source_checksum: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(PersistenceError::from)?;
+        Ok(candidates)
+    }
+
+    fn prepare_edit_output_root(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        selected_path: &str,
+        canonical_path: &str,
+    ) -> Result<EditOutputRootRecord> {
+        if selected_path.trim().is_empty() || canonical_path.trim().is_empty() {
+            return Err(PersistenceError::InvalidData(
+                "A canonical local output root is required".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM edit_sessions WHERE id = ?1 AND project_id = ?2)",
+            params![session_id, project_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(PersistenceError::InvalidData(
+                "Edit Session does not belong to this project".into(),
+            ));
+        }
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "INSERT INTO edit_output_roots (id, edit_session_id, selected_path, canonical_path, availability, last_checked_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'available', ?5, ?5)
+             ON CONFLICT(edit_session_id, canonical_path) DO UPDATE SET selected_path = excluded.selected_path, availability = 'available', last_checked_at = excluded.last_checked_at",
+            params![Uuid::new_v4().to_string(), session_id, selected_path.trim(), canonical_path.trim(), now],
+        )?;
+        let root = transaction.query_row(
+            "SELECT id, edit_session_id, selected_path, canonical_path, availability, last_checked_at, created_at
+             FROM edit_output_roots WHERE edit_session_id = ?1 AND canonical_path = ?2",
+            params![session_id, canonical_path.trim()], edit_output_root_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(root)
+    }
+
+    fn register_edit_output(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        registration: &EditOutputRegistration,
+    ) -> Result<EditOutputRegistrationOutcome> {
+        if !edit_bridge::safe_relative_path(&registration.relative_path)
+            || registration.display_filename.trim().is_empty()
+            || registration.checksum.trim().is_empty()
+        {
+            return Err(PersistenceError::InvalidData(
+                "A returned output must have a safe relative path, filename, and local checksum"
+                    .into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let root_belongs: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM edit_output_roots root JOIN edit_sessions session ON session.id = root.edit_session_id WHERE root.id = ?1 AND root.edit_session_id = ?2 AND session.project_id = ?3)",
+            params![registration.output_root.id, session_id, project_id.to_string()], |row| row.get(0),
+        )?;
+        if !root_belongs {
+            return Err(PersistenceError::InvalidData(
+                "Output root does not belong to this Edit Session".into(),
+            ));
+        }
+        let existing = transaction.query_row(
+            "SELECT id, edit_session_id, edit_output_root_id, relative_path, display_filename,
+                    normalized_basename, byte_size, checksum, media_type, metadata_json, availability,
+                    discovery_state, match_confidence, match_evidence, matched_work_item_id,
+                    technical_status, technical_issue, registered_at, last_seen_at
+             FROM edit_outputs WHERE edit_output_root_id = ?1 AND relative_path = ?2 AND checksum = ?3",
+            params![registration.output_root.id, registration.relative_path, registration.checksum],
+            edit_output_from_row,
+        ).optional()?;
+        if let Some(output) = existing {
+            let version = latest_edit_version_for_output_transaction(&transaction, &output.id)?;
+            transaction.execute(
+                "UPDATE edit_outputs SET availability = 'available', last_seen_at = ?2 WHERE id = ?1",
+                params![output.id, timestamp(&Utc::now())],
+            )?;
+            transaction.commit()?;
+            return Ok(EditOutputRegistrationOutcome {
+                output,
+                version,
+                created: false,
+            });
+        }
+        let now = timestamp(&Utc::now());
+        let auto_match = registration.auto_match_work_item_id.as_deref();
+        // Core derives this from the deterministic matcher, but this repository boundary is
+        // authoritative: a future caller must never turn a possible/ambiguous/manual filename
+        // hint into a silent human-decision substitute.
+        match (
+            auto_match,
+            registration.match_confidence,
+            registration.match_state,
+        ) {
+            (Some(_), Some(MatchConfidence::Exact), OutputMatchState::Matched) => {}
+            (Some(_), _, _) => {
+                return Err(PersistenceError::InvalidData(
+                    "Only a unique Exact provenance/path/checksum match in Matched state may be linked automatically; filename candidates and ambiguous outputs require an explicit human match".into(),
+                ));
+            }
+            (None, _, _) => {}
+        }
+        if let Some(work_item_id) = auto_match {
+            let matches_session: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM edit_work_items WHERE id = ?1 AND edit_session_id = ?2)",
+                params![work_item_id, session_id], |row| row.get(0),
+            )?;
+            if !matches_session {
+                return Err(PersistenceError::InvalidData(
+                    "Automatic output match escaped this Edit Session".into(),
+                ));
+            }
+        }
+        let output_id = Uuid::new_v4().to_string();
+        let discovery_state = output_match_state_name(registration.match_state);
+        transaction.execute(
+            "INSERT INTO edit_outputs (id, edit_session_id, edit_output_root_id, relative_path, display_filename, normalized_basename, byte_size, checksum, media_type, metadata_json, availability, discovery_state, match_confidence, match_evidence, matched_work_item_id, technical_status, technical_issue, registered_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'available', ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)",
+            params![output_id, session_id, registration.output_root.id, registration.relative_path, registration.display_filename, registration.normalized_basename, registration.byte_size as i64, registration.checksum, registration.media_type, json(&registration.metadata)?, discovery_state, registration.match_confidence.map(match_confidence_name), registration.match_evidence, auto_match, registration.technical_status, registration.technical_issue, now],
+        )?;
+        let mut version = None;
+        if let (Some(work_item_id), Some(confidence)) = (auto_match, registration.match_confidence)
+        {
+            transaction.execute(
+                "INSERT INTO edit_output_matches (id, edit_output_id, edit_work_item_id, active, confidence, method, evidence_json, created_at, resolved_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, 'automatic', ?5, ?6, ?6)",
+                params![Uuid::new_v4().to_string(), output_id, work_item_id, match_confidence_name(confidence), json(&serde_json::json!({"evidence": registration.match_evidence}))?, now],
+            )?;
+            version =
+                create_edit_version_transaction(&transaction, work_item_id, &output_id, &now)?;
+        }
+        insert_edit_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(session_id),
+            None,
+            auto_match,
+            Some(&output_id),
+            version.as_ref().map(|item| item.id.as_str()),
+            "EDIT_OUTPUT_DISCOVERED",
+            &serde_json::json!({"state": discovery_state, "automatic": auto_match.is_some()}),
+            &now,
+        )?;
+        refresh_edit_session_workflow(&transaction, session_id, &now)?;
+        let output = transaction.query_row(
+            "SELECT id, edit_session_id, edit_output_root_id, relative_path, display_filename,
+                    normalized_basename, byte_size, checksum, media_type, metadata_json, availability,
+                    discovery_state, match_confidence, match_evidence, matched_work_item_id,
+                    technical_status, technical_issue, registered_at, last_seen_at
+             FROM edit_outputs WHERE id = ?1", params![output_id], edit_output_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(EditOutputRegistrationOutcome {
+            output,
+            version,
+            created: true,
+        })
+    }
+
+    fn mark_missing_edit_outputs_offline(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        root_id: &str,
+        seen_relative_paths: &[String],
+    ) -> Result<()> {
+        if seen_relative_paths
+            .iter()
+            .any(|path| !edit_bridge::safe_relative_path(path))
+        {
+            return Err(PersistenceError::InvalidData(
+                "A seen edit-output path escaped its selected local root".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let now = timestamp(&Utc::now());
+        let seen: std::collections::HashSet<&str> =
+            seen_relative_paths.iter().map(String::as_str).collect();
+        let rows = transaction
+            .prepare(
+                "SELECT id, relative_path FROM edit_outputs
+                 WHERE edit_session_id = ?1 AND edit_output_root_id = ?2 AND availability <> 'offline'",
+            )?
+            .query_map(params![session_id, root_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<(String, String)>, _>>()
+            .map_err(PersistenceError::from)?;
+        for (output_id, relative_path) in rows {
+            if seen.contains(relative_path.as_str()) {
+                continue;
+            }
+            transaction.execute(
+                "UPDATE edit_outputs SET availability = 'offline' WHERE id = ?1",
+                params![output_id],
+            )?;
+            insert_edit_event(
+                &transaction,
+                &project_id.to_string(),
+                Some(session_id),
+                None,
+                None,
+                Some(&output_id),
+                None,
+                "EDIT_OUTPUT_OFFLINE",
+                &serde_json::json!({ "relativePath": relative_path }),
+                &now,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn manually_match_edit_output(
+        &self,
+        project_id: &ProjectId,
+        output_id: &str,
+        work_item_id: &str,
+    ) -> Result<EditOutputRegistrationOutcome> {
+        let transaction = moment_write_transaction(&self.connection)?;
+        let output = transaction.query_row(
+            "SELECT output.id, output.edit_session_id, output.edit_output_root_id, output.relative_path,
+                    output.display_filename, output.normalized_basename, output.byte_size, output.checksum,
+                    output.media_type, output.metadata_json, output.availability, output.discovery_state,
+                    output.match_confidence, output.match_evidence, output.matched_work_item_id,
+                    output.technical_status, output.technical_issue, output.registered_at, output.last_seen_at
+             FROM edit_outputs output JOIN edit_sessions session ON session.id = output.edit_session_id
+             WHERE output.id = ?1 AND session.project_id = ?2",
+            params![output_id, project_id.to_string()], edit_output_from_row,
+        ).optional()?.ok_or_else(|| PersistenceError::InvalidData("Returned output does not belong to this project".into()))?;
+        let target_belongs: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM edit_work_items WHERE id = ?1 AND edit_session_id = ?2)",
+            params![work_item_id, output.session_id],
+            |row| row.get(0),
+        )?;
+        if !target_belongs {
+            return Err(PersistenceError::InvalidData(
+                "Manual source match must stay within the same Edit Session".into(),
+            ));
+        }
+        let now = timestamp(&Utc::now());
+        if output.matched_work_item_id.as_deref() == Some(work_item_id) {
+            let version = latest_edit_version_for_output_transaction(&transaction, output_id)?;
+            transaction.commit()?;
+            return Ok(EditOutputRegistrationOutcome {
+                output,
+                version,
+                created: false,
+            });
+        }
+        transaction.execute("UPDATE edit_output_matches SET active = 0, resolved_at = ?2 WHERE edit_output_id = ?1 AND active = 1", params![output_id, now])?;
+        transaction.execute(
+            "INSERT INTO edit_output_matches (id, edit_output_id, edit_work_item_id, active, confidence, method, evidence_json, created_at, resolved_at)
+             VALUES (?1, ?2, ?3, 1, 'manual', 'manual', ?4, ?5, ?5)",
+            params![Uuid::new_v4().to_string(), output_id, work_item_id, json(&serde_json::json!({"authority": "explicit_human_match"}))?, now],
+        )?;
+        // Manual assignment is a correction event. An output that had already been automatically
+        // assigned is moved transactionally, preserving its version row and the prior match audit
+        // as inactive evidence rather than deleting either record.
+        let prior_version = latest_edit_version_for_output_transaction(&transaction, output_id)?;
+        if let Some(prior) = &prior_version {
+            transaction.execute("UPDATE edit_work_items SET current_edit_version_id = NULL, updated_at = ?2 WHERE current_edit_version_id = ?1", params![prior.id, now])?;
+            let next_version: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(version_number), 0) + 1 FROM edit_output_versions WHERE edit_work_item_id = ?1",
+                params![work_item_id], |row| row.get(0),
+            )?;
+            // Clear the target's current pointer before moving this version into it. The partial
+            // unique index on current versions is the durable double-click/concurrency guard;
+            // setting the moved row current first would violate that invariant whenever the
+            // human corrects an automatic match onto a work item that already has a version.
+            transaction.execute("UPDATE edit_output_versions SET is_current = 0 WHERE edit_work_item_id = ?1 AND id <> ?2", params![work_item_id, prior.id])?;
+            transaction.execute("UPDATE edit_output_versions SET edit_work_item_id = ?2, version_number = ?3, review_state = 'ready_for_review', is_current = 1, reviewed_at = NULL WHERE id = ?1", params![prior.id, work_item_id, next_version])?;
+            transaction.execute("UPDATE edit_work_items SET current_edit_version_id = ?2, updated_at = ?3 WHERE id = ?1", params![work_item_id, prior.id, now])?;
+        }
+        transaction.execute(
+            "UPDATE edit_outputs SET discovery_state = 'matched', match_confidence = 'manual', match_evidence = 'Explicit human match', matched_work_item_id = ?2 WHERE id = ?1",
+            params![output_id, work_item_id],
+        )?;
+        let version = if prior_version.is_some() {
+            latest_edit_version_for_output_transaction(&transaction, output_id)?
+        } else {
+            create_edit_version_transaction(&transaction, work_item_id, output_id, &now)?
+        };
+        insert_edit_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(&output.session_id),
+            None,
+            Some(work_item_id),
+            Some(output_id),
+            version.as_ref().map(|item| item.id.as_str()),
+            "EDIT_OUTPUT_MANUALLY_MATCHED",
+            &serde_json::json!({}),
+            &now,
+        )?;
+        refresh_edit_session_workflow(&transaction, &output.session_id, &now)?;
+        let updated = transaction.query_row(
+            "SELECT id, edit_session_id, edit_output_root_id, relative_path, display_filename,
+                    normalized_basename, byte_size, checksum, media_type, metadata_json, availability,
+                    discovery_state, match_confidence, match_evidence, matched_work_item_id,
+                    technical_status, technical_issue, registered_at, last_seen_at
+             FROM edit_outputs WHERE id = ?1", params![output_id], edit_output_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(EditOutputRegistrationOutcome {
+            output: updated,
+            version,
+            created: false,
+        })
+    }
+
+    fn set_edit_version_review_state(
+        &self,
+        project_id: &ProjectId,
+        version_id: &str,
+        review_state: EditVersionReviewState,
+    ) -> Result<EditVersionRecord> {
+        if !matches!(
+            review_state,
+            EditVersionReviewState::Approved | EditVersionReviewState::NeedsRevision
+        ) {
+            return Err(PersistenceError::InvalidData(
+                "Only human Approved or Needs Revision states can be set on an Edit Version".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let (session_id, work_item_id, output_id, technical_status, availability): (String, String, String, String, String) = transaction.query_row(
+            "SELECT session.id, version.edit_work_item_id, version.edit_output_id, output.technical_status, output.availability
+             FROM edit_output_versions version
+             JOIN edit_work_items item ON item.id = version.edit_work_item_id
+             JOIN edit_sessions session ON session.id = item.edit_session_id
+             JOIN edit_outputs output ON output.id = version.edit_output_id
+             WHERE version.id = ?1 AND session.project_id = ?2",
+            params![version_id, project_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional()?.ok_or_else(|| PersistenceError::InvalidData("Edit Version does not belong to this project".into()))?;
+        if review_state == EditVersionReviewState::Approved
+            && (technical_status != "ready" || availability != "available")
+        {
+            return Err(PersistenceError::InvalidData("A corrupt, unavailable, or technically unreadable returned output cannot be approved until it is available and valid".into()));
+        }
+        let now = timestamp(&Utc::now());
+        transaction.execute(
+            "UPDATE edit_output_versions SET is_current = 0 WHERE edit_work_item_id = ?1",
+            params![work_item_id],
+        )?;
+        if review_state == EditVersionReviewState::Approved {
+            transaction.execute("UPDATE edit_output_versions SET review_state = 'superseded', is_current = 0, reviewed_at = ?2 WHERE edit_work_item_id = ?1 AND review_state = 'approved' AND id <> ?3", params![work_item_id, now, version_id])?;
+        }
+        transaction.execute(
+            "UPDATE edit_output_versions SET review_state = ?2, is_current = 1, reviewed_at = ?3 WHERE id = ?1",
+            params![version_id, edit_version_review_state_name(review_state), now],
+        )?;
+        transaction.execute("UPDATE edit_work_items SET current_edit_version_id = ?2, updated_at = ?3 WHERE id = ?1", params![work_item_id, version_id, now])?;
+        insert_edit_event(
+            &transaction,
+            &project_id.to_string(),
+            Some(&session_id),
+            None,
+            Some(&work_item_id),
+            Some(&output_id),
+            Some(version_id),
+            if review_state == EditVersionReviewState::Approved {
+                "EDIT_VERSION_APPROVED"
+            } else {
+                "EDIT_VERSION_REVISION_REQUESTED"
+            },
+            &serde_json::json!({}),
+            &now,
+        )?;
+        refresh_edit_session_workflow(&transaction, &session_id, &now)?;
+        let version = transaction.query_row(
+            "SELECT id, edit_work_item_id, edit_output_id, version_number, review_state, is_current, created_at, reviewed_at FROM edit_output_versions WHERE id = ?1",
+            params![version_id], edit_version_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(version)
+    }
+
+    fn update_edit_output_root_availability(
+        &self,
+        project_id: &ProjectId,
+        session_id: &str,
+        root_id: &str,
+        availability: &str,
+    ) -> Result<()> {
+        if !matches!(availability, "available" | "offline" | "unavailable") {
+            return Err(PersistenceError::InvalidData(
+                "Unsupported Edit output-root availability".into(),
+            ));
+        }
+        let transaction = moment_write_transaction(&self.connection)?;
+        let now = timestamp(&Utc::now());
+        let changed = transaction.execute(
+            "UPDATE edit_output_roots SET availability = ?4, last_checked_at = ?5
+             WHERE id = ?1 AND edit_session_id = ?2
+               AND EXISTS (SELECT 1 FROM edit_sessions session WHERE session.id = ?2 AND session.project_id = ?3)",
+            params![root_id, session_id, project_id.to_string(), availability, now],
+        )?;
+        if changed != 1 {
+            return Err(PersistenceError::InvalidData(
+                "Output root does not belong to this Edit Session".into(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE edit_outputs SET availability = ?2 WHERE edit_output_root_id = ?1",
+            params![root_id, availability],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn latest_capture_intelligence_job(
         &self,
         project_id: &ProjectId,
@@ -12381,6 +13723,431 @@ fn export_job_from_row(row: &Row<'_>) -> rusqlite::Result<ExportJobRecord> {
     })
 }
 
+const EDIT_SESSION_SUMMARY_SELECT: &str = r#"
+SELECT session.id, session.project_id, session.source_production_plan_id,
+       session.source_export_manifest_id, session.source_export_job_id,
+       session.source_manifest_checksum, session.source_manifest_version, session.name,
+       session.template, session.workflow_state, session.source_stale,
+       session.expected_output_policy, session.work_item_count, session.estimated_bytes,
+       session.created_at, session.updated_at, session.completed_at, session.archived_at,
+       (SELECT COUNT(*) FROM edit_handoff_packages handoff WHERE handoff.edit_session_id = session.id),
+       (SELECT COUNT(*) FROM edit_outputs output WHERE output.edit_session_id = session.id),
+       (SELECT COUNT(*) FROM edit_output_versions version
+          JOIN edit_work_items item ON item.id = version.edit_work_item_id
+        WHERE item.edit_session_id = session.id AND version.review_state = 'approved'),
+       (SELECT COUNT(*) FROM edit_output_versions version
+          JOIN edit_work_items item ON item.id = version.edit_work_item_id
+        WHERE item.edit_session_id = session.id AND version.review_state = 'needs_revision'),
+       (SELECT COUNT(*) FROM edit_work_items item
+        WHERE item.edit_session_id = session.id AND item.expected_output_policy = 'required'
+          AND NOT EXISTS (SELECT 1 FROM edit_output_versions version WHERE version.edit_work_item_id = item.id)),
+       (SELECT COUNT(*) FROM edit_outputs output
+        WHERE output.edit_session_id = session.id
+          AND (output.technical_status <> 'ready' OR output.availability <> 'available'))
+FROM edit_sessions session
+"#;
+
+fn edit_session_summary_sql(predicate: &str, order: &str) -> String {
+    // Both callers pass fixed SQL fragments declared in this module; user input is always bound
+    // as parameters and never interpolated into this projection.
+    format!("{EDIT_SESSION_SUMMARY_SELECT} WHERE {predicate} {order}")
+}
+
+fn edit_session_from_row(row: &Row<'_>) -> rusqlite::Result<EditSessionRecord> {
+    let template: String = row.get(8)?;
+    let workflow_state: String = row.get(9)?;
+    let expected_output_policy: String = row.get(11)?;
+    Ok(EditSessionRecord {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        source_production_plan_id: row.get(2)?,
+        source_export_manifest_id: row.get(3)?,
+        source_export_job_id: row.get(4)?,
+        source_manifest_checksum: row.get(5)?,
+        source_manifest_version: row.get::<_, i64>(6)? as u64,
+        name: row.get(7)?,
+        template: enum_from_text(&template)?,
+        workflow_state: enum_from_text(&workflow_state)?,
+        source_stale: row.get(10)?,
+        expected_output_policy: enum_from_text(&expected_output_policy)?,
+        work_item_count: row.get::<_, i64>(12)? as u64,
+        estimated_bytes: row.get::<_, i64>(13)? as u64,
+        handoff_count: row.get::<_, i64>(18)? as u64,
+        output_count: row.get::<_, i64>(19)? as u64,
+        approved_count: row.get::<_, i64>(20)? as u64,
+        needs_revision_count: row.get::<_, i64>(21)? as u64,
+        missing_output_count: row.get::<_, i64>(22)? as u64,
+        blocked_count: row.get::<_, i64>(23)? as u64,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        completed_at: row.get(16)?,
+        archived_at: row.get(17)?,
+    })
+}
+
+fn edit_session_record(
+    connection: &Connection,
+    project_id: &ProjectId,
+    session_id: &str,
+) -> Result<Option<EditSessionRecord>> {
+    let sql = edit_session_summary_sql("session.project_id = ?1 AND session.id = ?2", "");
+    connection
+        .query_row(
+            &sql,
+            params![project_id.to_string(), session_id],
+            edit_session_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn edit_session_record_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    session_id: &str,
+) -> Result<Option<EditSessionRecord>> {
+    let sql = edit_session_summary_sql("session.project_id = ?1 AND session.id = ?2", "");
+    transaction
+        .query_row(
+            &sql,
+            params![project_id.to_string(), session_id],
+            edit_session_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn edit_work_item_from_row(row: &Row<'_>) -> rusqlite::Result<EditWorkItemRecord> {
+    let expected_output_policy: String = row.get(14)?;
+    let state: String = row.get(16)?;
+    Ok(EditWorkItemRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        source_export_manifest_entry_id: row.get(2)?,
+        source_media_asset_id: row.get(3)?,
+        ordinal: row.get::<_, i64>(4)? as u64,
+        handoff_relative_path: row.get(5)?,
+        original_filename: row.get(6)?,
+        source_checksum: row.get(7)?,
+        captured_at: row.get(8)?,
+        camera: row.get(9)?,
+        moment_label: row.get(10)?,
+        human_decision: row.get(11)?,
+        rating: row.get::<_, i64>(12)? as u8,
+        starred: row.get(13)?,
+        expected_output_policy: enum_from_text(&expected_output_policy)?,
+        current_edit_version_id: row.get(15)?,
+        state: enum_from_text(&state)?,
+        source_available: row.get(17)?,
+        source_preview_artifact_id: row.get(18)?,
+    })
+}
+
+fn edit_work_items_for_session_transaction(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+) -> Result<Vec<EditWorkItemRecord>> {
+    let mut statement = transaction.prepare(
+        "SELECT item.id, item.edit_session_id, item.source_export_manifest_entry_id,
+                item.media_asset_id, item.ordinal, item.handoff_relative_path,
+                item.original_filename, item.source_checksum, item.captured_at, item.camera,
+                item.moment_label, item.human_decision, item.rating, item.starred,
+                item.expected_output_policy, item.current_edit_version_id, 'queued', 1, NULL
+         FROM edit_work_items item WHERE item.edit_session_id = ?1
+         ORDER BY item.ordinal ASC, item.id ASC",
+    )?;
+    let items = statement
+        .query_map(params![session_id], edit_work_item_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(PersistenceError::from)?;
+    Ok(items)
+}
+
+fn edit_handoff_from_row(row: &Row<'_>) -> rusqlite::Result<EditHandoffPackageRecord> {
+    let mode: String = row.get(4)?;
+    Ok(EditHandoffPackageRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        prior_handoff_id: row.get(2)?,
+        handoff_version: row.get::<_, i64>(3)? as u64,
+        mode: enum_from_text(&mode)?,
+        adapter_key: row.get(5)?,
+        state: row.get(6)?,
+        destination_path: row.get(7)?,
+        source_manifest_checksum: row.get(8)?,
+        manifest_checksum: row.get(9)?,
+        created_at: row.get(10)?,
+        written_at: row.get(11)?,
+        error_message: row.get(12)?,
+    })
+}
+
+fn edit_output_root_from_row(row: &Row<'_>) -> rusqlite::Result<EditOutputRootRecord> {
+    Ok(EditOutputRootRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        selected_path: row.get(2)?,
+        canonical_path: row.get(3)?,
+        availability: row.get(4)?,
+        last_checked_at: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn edit_output_from_row(row: &Row<'_>) -> rusqlite::Result<EditOutputRecord> {
+    let metadata: String = row.get(9)?;
+    let discovery_state: String = row.get(11)?;
+    let match_confidence: Option<String> = row.get(12)?;
+    Ok(EditOutputRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        output_root_id: row.get(2)?,
+        relative_path: row.get(3)?,
+        display_filename: row.get(4)?,
+        normalized_basename: row.get(5)?,
+        byte_size: row.get::<_, i64>(6)? as u64,
+        checksum: row.get(7)?,
+        media_type: row.get(8)?,
+        metadata: json_from_row(&metadata)?,
+        availability: row.get(10)?,
+        discovery_state: enum_from_text(&discovery_state)?,
+        match_confidence: match_confidence
+            .as_deref()
+            .map(enum_from_text)
+            .transpose()?,
+        match_evidence: row.get(13)?,
+        matched_work_item_id: row.get(14)?,
+        technical_status: row.get(15)?,
+        technical_issue: row.get(16)?,
+        registered_at: row.get(17)?,
+        last_seen_at: row.get(18)?,
+    })
+}
+
+fn edit_version_from_row(row: &Row<'_>) -> rusqlite::Result<EditVersionRecord> {
+    let review_state: String = row.get(4)?;
+    Ok(EditVersionRecord {
+        id: row.get(0)?,
+        work_item_id: row.get(1)?,
+        output_id: row.get(2)?,
+        version_number: row.get::<_, i64>(3)? as u64,
+        review_state: enum_from_text(&review_state)?,
+        is_current: row.get(5)?,
+        created_at: row.get(6)?,
+        reviewed_at: row.get(7)?,
+    })
+}
+
+fn latest_edit_version_for_output_transaction(
+    transaction: &Transaction<'_>,
+    output_id: &str,
+) -> Result<Option<EditVersionRecord>> {
+    transaction
+        .query_row(
+            "SELECT id, edit_work_item_id, edit_output_id, version_number, review_state,
+                    is_current, created_at, reviewed_at FROM edit_output_versions
+             WHERE edit_output_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![output_id],
+            edit_version_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn create_edit_version_transaction(
+    transaction: &Transaction<'_>,
+    work_item_id: &str,
+    output_id: &str,
+    now: &str,
+) -> Result<Option<EditVersionRecord>> {
+    let existing = latest_edit_version_for_output_transaction(transaction, output_id)?;
+    if existing.is_some() {
+        return Ok(existing);
+    }
+    let next_version: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(version_number), 0) + 1 FROM edit_output_versions WHERE edit_work_item_id = ?1",
+        params![work_item_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "UPDATE edit_output_versions SET is_current = 0 WHERE edit_work_item_id = ?1",
+        params![work_item_id],
+    )?;
+    let id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO edit_output_versions (id, edit_work_item_id, edit_output_id, version_number, review_state, is_current, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'ready_for_review', 1, ?5)",
+        params![id, work_item_id, output_id, next_version, now],
+    )?;
+    transaction.execute(
+        "UPDATE edit_work_items SET current_edit_version_id = ?2, updated_at = ?3 WHERE id = ?1",
+        params![work_item_id, id, now],
+    )?;
+    transaction
+        .query_row(
+            "SELECT id, edit_work_item_id, edit_output_id, version_number, review_state, is_current, created_at, reviewed_at
+             FROM edit_output_versions WHERE id = ?1",
+            params![id],
+            edit_version_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn refresh_edit_session_workflow(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    now: &str,
+) -> Result<()> {
+    let (source_stale, previous, total, required_total, required_done, outputs_total, outputs_approved, handoffs):
+        (bool, String, i64, i64, i64, i64, i64, i64) = transaction.query_row(
+        "SELECT session.source_stale, session.workflow_state,
+                (SELECT COUNT(*) FROM edit_work_items item WHERE item.edit_session_id = session.id),
+                (SELECT COUNT(*) FROM edit_work_items item WHERE item.edit_session_id = session.id AND item.expected_output_policy = 'required'),
+                (SELECT COUNT(*) FROM edit_work_items item WHERE item.edit_session_id = session.id AND item.expected_output_policy = 'required' AND EXISTS (SELECT 1 FROM edit_output_versions version WHERE version.edit_work_item_id = item.id AND version.review_state = 'approved')),
+                (SELECT COUNT(*) FROM edit_outputs output WHERE output.edit_session_id = session.id),
+                (SELECT COUNT(*) FROM edit_outputs output WHERE output.edit_session_id = session.id AND EXISTS (SELECT 1 FROM edit_output_versions version WHERE version.edit_output_id = output.id AND version.review_state = 'approved')),
+                (SELECT COUNT(*) FROM edit_handoff_packages handoff WHERE handoff.edit_session_id = session.id AND handoff.state = 'ready')
+         FROM edit_sessions session WHERE session.id = ?1",
+        params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+    )?;
+    // Completion requires every required work item to have an approved version and every
+    // registered output to be approved-linked. Optional work items that legitimately produced no
+    // output are excluded from both requirements, so they never block completion; an optional
+    // output that exists but is unmatched/awaiting review still prevents completion.
+    let completion_ready = total > 0
+        && required_total == required_done
+        && outputs_total == outputs_approved
+        && outputs_approved > 0;
+    let approved_any = outputs_approved > 0;
+    let next = if previous == "archived" {
+        "archived"
+    } else if source_stale {
+        "stale"
+    } else if completion_ready {
+        "completed"
+    } else if approved_any {
+        "partially_completed"
+    } else if outputs_total > 0 {
+        "review"
+    } else if handoffs > 0 {
+        "awaiting_outputs"
+    } else {
+        "ready"
+    };
+    transaction.execute(
+        "UPDATE edit_sessions SET workflow_state = ?2, completed_at = CASE WHEN ?2 = 'completed' THEN COALESCE(completed_at, ?3) ELSE completed_at END, updated_at = ?3 WHERE id = ?1",
+        params![session_id, next, now],
+    )?;
+    Ok(())
+}
+
+// The production function deliberately mirrors the append-only edit-event persistence
+// fields one-to-one. Preserving this exact signature avoids an unnecessary API/refactor
+// change during final M10 stabilization.
+#[allow(clippy::too_many_arguments)]
+fn insert_edit_event(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    session_id: Option<&str>,
+    handoff_id: Option<&str>,
+    work_item_id: Option<&str>,
+    output_id: Option<&str>,
+    version_id: Option<&str>,
+    event_type: &str,
+    details: &serde_json::Value,
+    created_at: &str,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO edit_events (id, project_id, edit_session_id, edit_handoff_package_id, edit_work_item_id, edit_output_id, edit_version_id, event_type, details_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![Uuid::new_v4().to_string(), project_id, session_id, handoff_id, work_item_id, output_id, version_id, event_type, json(details)?, created_at],
+    )?;
+    Ok(())
+}
+
+fn valid_edit_session_name(value: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err(PersistenceError::InvalidData(
+            "Edit Session names cannot be empty".into(),
+        ));
+    }
+    if name.chars().count() > 240 {
+        return Err(PersistenceError::InvalidData(
+            "Edit Session names must be 240 characters or fewer".into(),
+        ));
+    }
+    Ok(name.into())
+}
+
+fn truncate_edit_message(value: &str) -> String {
+    value.chars().take(1_000).collect()
+}
+
+fn normalize_edit_basename(value: &str) -> String {
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value)
+        .to_lowercase()
+}
+
+fn edit_session_template_name(value: EditSessionTemplate) -> &'static str {
+    match value {
+        EditSessionTemplate::WeddingMainEdit => "wedding_main_edit",
+        EditSessionTemplate::AlbumSelectRetouch => "album_select_retouch",
+        EditSessionTemplate::PortfolioRetouch => "portfolio_retouch",
+        EditSessionTemplate::ClientRevisionRound => "client_revision_round",
+        EditSessionTemplate::VideoRoughCut => "video_rough_cut",
+        EditSessionTemplate::Custom => "custom",
+    }
+}
+
+fn expected_output_policy_name(value: ExpectedOutputPolicy) -> &'static str {
+    match value {
+        ExpectedOutputPolicy::Required => "required",
+        ExpectedOutputPolicy::Optional => "optional",
+    }
+}
+
+fn handoff_mode_name(value: HandoffMode) -> &'static str {
+    match value {
+        HandoffMode::Reference => "reference",
+        HandoffMode::Package => "package",
+    }
+}
+
+fn output_match_state_name(value: OutputMatchState) -> &'static str {
+    match value {
+        OutputMatchState::Discovered => "discovered",
+        OutputMatchState::Matched => "matched",
+        OutputMatchState::Unmatched => "unmatched",
+        OutputMatchState::Ambiguous => "ambiguous",
+    }
+}
+
+fn match_confidence_name(value: MatchConfidence) -> &'static str {
+    match value {
+        MatchConfidence::Exact => "exact",
+        MatchConfidence::Strong => "strong",
+        MatchConfidence::Possible => "possible",
+        MatchConfidence::Ambiguous => "ambiguous",
+        MatchConfidence::Unmatched => "unmatched",
+        MatchConfidence::Manual => "manual",
+    }
+}
+
+fn edit_version_review_state_name(value: EditVersionReviewState) -> &'static str {
+    match value {
+        EditVersionReviewState::ReadyForReview => "ready_for_review",
+        EditVersionReviewState::Approved => "approved",
+        EditVersionReviewState::NeedsRevision => "needs_revision",
+        EditVersionReviewState::Superseded => "superseded",
+    }
+}
+
 fn valid_production_name(value: &str) -> Result<String> {
     let name = value.trim();
     if name.is_empty() {
@@ -14665,6 +16432,213 @@ BEGIN
   WHERE project_id = NEW.project_id
     AND source_revision < NEW.source_revision
     AND status = 'ready';
+END;
+COMMIT;
+"#;
+
+// M10 adds a local, editor-agnostic coordination layer. Every work item is copied from one
+// frozen M9 manifest inside the same immediate transaction that creates its session; no table
+// here reads current culling state to recreate a workset. Returned outputs are separate derived
+// records and never become MediaAssets or FileInstances.
+const MIGRATION_021: &str = r#"
+BEGIN;
+CREATE TABLE edit_sessions (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source_production_plan_id TEXT NOT NULL REFERENCES production_plans(id) ON DELETE RESTRICT,
+  source_export_manifest_id TEXT NOT NULL REFERENCES export_manifests(id) ON DELETE RESTRICT,
+  source_export_job_id TEXT NOT NULL REFERENCES export_jobs(id) ON DELETE RESTRICT,
+  source_manifest_checksum TEXT NOT NULL,
+  source_manifest_version INTEGER NOT NULL CHECK (source_manifest_version > 0),
+  name TEXT NOT NULL,
+  template TEXT NOT NULL CHECK (template IN ('wedding_main_edit','album_select_retouch','portfolio_retouch','client_revision_round','video_rough_cut','custom')),
+  workflow_state TEXT NOT NULL CHECK (workflow_state IN ('draft','ready','handed_off','in_progress','awaiting_outputs','review','completed','partially_completed','blocked','stale','archived')),
+  source_stale INTEGER NOT NULL DEFAULT 0 CHECK (source_stale IN (0, 1)),
+  expected_output_policy TEXT NOT NULL CHECK (expected_output_policy IN ('required','optional')),
+  work_item_count INTEGER NOT NULL CHECK (work_item_count >= 0),
+  estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  archived_at TEXT,
+  UNIQUE(project_id, source_export_manifest_id, name)
+);
+CREATE TABLE edit_session_versions (
+  id TEXT PRIMARY KEY,
+  edit_session_id TEXT NOT NULL REFERENCES edit_sessions(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL CHECK (version > 0),
+  configuration_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(edit_session_id, version)
+);
+CREATE TABLE edit_work_items (
+  id TEXT PRIMARY KEY,
+  edit_session_id TEXT NOT NULL REFERENCES edit_sessions(id) ON DELETE CASCADE,
+  source_export_manifest_entry_id TEXT NOT NULL REFERENCES export_manifest_entries(id) ON DELETE RESTRICT,
+  media_asset_id TEXT NOT NULL REFERENCES media_assets(id) ON DELETE RESTRICT,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  handoff_relative_path TEXT NOT NULL,
+  original_filename TEXT NOT NULL,
+  source_checksum TEXT,
+  captured_at TEXT,
+  camera TEXT,
+  moment_label TEXT,
+  human_decision TEXT,
+  rating INTEGER NOT NULL CHECK (rating >= 0 AND rating <= 5),
+  starred INTEGER NOT NULL CHECK (starred IN (0, 1)),
+  expected_output_policy TEXT NOT NULL CHECK (expected_output_policy IN ('required','optional')),
+  current_edit_version_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(edit_session_id, source_export_manifest_entry_id),
+  UNIQUE(edit_session_id, ordinal)
+);
+CREATE TABLE edit_handoff_packages (
+  id TEXT PRIMARY KEY,
+  edit_session_id TEXT NOT NULL REFERENCES edit_sessions(id) ON DELETE CASCADE,
+  prior_handoff_id TEXT REFERENCES edit_handoff_packages(id) ON DELETE SET NULL,
+  handoff_version INTEGER NOT NULL CHECK (handoff_version > 0),
+  mode TEXT NOT NULL CHECK (mode IN ('reference','package')),
+  adapter_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('writing','ready','failed','stale')),
+  destination_path TEXT NOT NULL,
+  source_manifest_checksum TEXT NOT NULL,
+  manifest_checksum TEXT,
+  created_at TEXT NOT NULL,
+  written_at TEXT,
+  error_message TEXT,
+  UNIQUE(edit_session_id, handoff_version),
+  UNIQUE(edit_session_id, mode, destination_path)
+);
+CREATE TABLE edit_handoff_entries (
+  id TEXT PRIMARY KEY,
+  edit_handoff_package_id TEXT NOT NULL REFERENCES edit_handoff_packages(id) ON DELETE CASCADE,
+  edit_work_item_id TEXT NOT NULL REFERENCES edit_work_items(id) ON DELETE RESTRICT,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  handoff_relative_path TEXT NOT NULL,
+  normalized_basename TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(edit_handoff_package_id, edit_work_item_id),
+  UNIQUE(edit_handoff_package_id, handoff_relative_path)
+);
+CREATE TABLE edit_output_roots (
+  id TEXT PRIMARY KEY,
+  edit_session_id TEXT NOT NULL REFERENCES edit_sessions(id) ON DELETE CASCADE,
+  selected_path TEXT NOT NULL,
+  canonical_path TEXT NOT NULL,
+  availability TEXT NOT NULL CHECK (availability IN ('available','offline','unavailable')),
+  last_checked_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(edit_session_id, canonical_path)
+);
+CREATE TABLE edit_outputs (
+  id TEXT PRIMARY KEY,
+  edit_session_id TEXT NOT NULL REFERENCES edit_sessions(id) ON DELETE CASCADE,
+  edit_output_root_id TEXT NOT NULL REFERENCES edit_output_roots(id) ON DELETE CASCADE,
+  relative_path TEXT NOT NULL,
+  display_filename TEXT NOT NULL,
+  normalized_basename TEXT NOT NULL,
+  byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+  checksum TEXT NOT NULL,
+  media_type TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  availability TEXT NOT NULL CHECK (availability IN ('available','offline','unavailable')),
+  discovery_state TEXT NOT NULL CHECK (discovery_state IN ('discovered','matched','unmatched','ambiguous')),
+  match_confidence TEXT,
+  match_evidence TEXT,
+  matched_work_item_id TEXT REFERENCES edit_work_items(id) ON DELETE SET NULL,
+  technical_status TEXT NOT NULL,
+  technical_issue TEXT,
+  registered_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(edit_output_root_id, relative_path, checksum)
+);
+CREATE TABLE edit_output_matches (
+  id TEXT PRIMARY KEY,
+  edit_output_id TEXT NOT NULL REFERENCES edit_outputs(id) ON DELETE CASCADE,
+  edit_work_item_id TEXT NOT NULL REFERENCES edit_work_items(id) ON DELETE RESTRICT,
+  active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+  confidence TEXT NOT NULL CHECK (confidence IN ('exact','strong','possible','ambiguous','unmatched','manual')),
+  method TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  resolved_at TEXT
+  -- Append-only provenance: a previously resolved match relationship may be recorded again.
+  -- Historical match rows are never overwritten or deleted; a prior active row is resolved
+  -- (deactivated) before a new row is inserted. Exactly one active match per edit output is
+  -- enforced by the partial unique index idx_edit_one_active_match below.
+);
+CREATE TABLE edit_output_versions (
+  id TEXT PRIMARY KEY,
+  edit_work_item_id TEXT NOT NULL REFERENCES edit_work_items(id) ON DELETE CASCADE,
+  edit_output_id TEXT NOT NULL REFERENCES edit_outputs(id) ON DELETE RESTRICT,
+  version_number INTEGER NOT NULL CHECK (version_number > 0),
+  review_state TEXT NOT NULL CHECK (review_state IN ('ready_for_review','approved','needs_revision','superseded')),
+  is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+  created_at TEXT NOT NULL,
+  reviewed_at TEXT,
+  UNIQUE(edit_work_item_id, version_number),
+  UNIQUE(edit_output_id)
+);
+CREATE TABLE edit_events (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  edit_session_id TEXT REFERENCES edit_sessions(id) ON DELETE SET NULL,
+  edit_handoff_package_id TEXT REFERENCES edit_handoff_packages(id) ON DELETE SET NULL,
+  edit_work_item_id TEXT REFERENCES edit_work_items(id) ON DELETE SET NULL,
+  edit_output_id TEXT REFERENCES edit_outputs(id) ON DELETE SET NULL,
+  edit_version_id TEXT REFERENCES edit_output_versions(id) ON DELETE SET NULL,
+  event_type TEXT NOT NULL,
+  details_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_edit_one_current_version
+  ON edit_output_versions(edit_work_item_id)
+  WHERE is_current = 1;
+CREATE UNIQUE INDEX idx_edit_one_approved_version
+  ON edit_output_versions(edit_work_item_id)
+  WHERE review_state = 'approved';
+CREATE UNIQUE INDEX idx_edit_one_active_match
+  ON edit_output_matches(edit_output_id)
+  WHERE active = 1;
+CREATE INDEX idx_edit_sessions_project ON edit_sessions(project_id, updated_at DESC, id ASC);
+CREATE INDEX idx_edit_work_items_page ON edit_work_items(edit_session_id, ordinal, id);
+CREATE INDEX idx_edit_handoff_entries_relative ON edit_handoff_entries(edit_handoff_package_id, handoff_relative_path);
+CREATE INDEX idx_edit_handoff_entries_basename ON edit_handoff_entries(edit_handoff_package_id, normalized_basename);
+CREATE INDEX idx_edit_outputs_session_basename ON edit_outputs(edit_session_id, normalized_basename);
+CREATE INDEX idx_edit_outputs_session_checksum ON edit_outputs(edit_session_id, checksum);
+CREATE INDEX idx_edit_output_matches_output ON edit_output_matches(edit_output_id, active);
+CREATE INDEX idx_edit_versions_work_item ON edit_output_versions(edit_work_item_id, version_number DESC);
+CREATE INDEX idx_edit_events_project ON edit_events(project_id, created_at DESC);
+CREATE TRIGGER edit_sessions_stale_after_plan_change
+AFTER UPDATE OF status, current_manifest_id ON production_plans
+WHEN NEW.status = 'stale' OR NEW.current_manifest_id IS NOT OLD.current_manifest_id
+BEGIN
+  UPDATE edit_sessions
+  SET source_stale = 1,
+      workflow_state = CASE WHEN workflow_state IN ('completed','partially_completed','archived') THEN workflow_state ELSE 'stale' END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE source_production_plan_id = NEW.id
+    AND source_stale = 0;
+  UPDATE edit_handoff_packages
+  SET state = 'stale'
+  WHERE edit_session_id IN (SELECT id FROM edit_sessions WHERE source_production_plan_id = NEW.id)
+    AND state = 'ready';
+END;
+CREATE TRIGGER edit_sessions_stale_after_manifest_change
+AFTER UPDATE OF status ON export_manifests
+WHEN NEW.status IN ('stale','superseded','blocked')
+BEGIN
+  UPDATE edit_sessions
+  SET source_stale = 1,
+      workflow_state = CASE WHEN workflow_state IN ('completed','partially_completed','archived') THEN workflow_state ELSE 'stale' END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  WHERE source_export_manifest_id = NEW.id
+    AND source_stale = 0;
+  UPDATE edit_handoff_packages
+  SET state = 'stale'
+  WHERE edit_session_id IN (SELECT id FROM edit_sessions WHERE source_export_manifest_id = NEW.id)
+    AND state = 'ready';
 END;
 COMMIT;
 "#;
@@ -20421,5 +22395,919 @@ mod tests {
             .get_project(&included_project.id)
             .unwrap()
             .is_some());
+    }
+
+    // Test/helper mirrors the same M10 edit-event persistence operation; the argument
+    // count intentionally matches the production shape above.
+    #[allow(clippy::too_many_arguments)]
+    fn m10_manifest_entry(
+        repository: &SqliteRepository,
+        asset: &MediaAsset,
+        handoff_relative_path: &str,
+        original_filename: &str,
+        source_checksum: &str,
+        human_decision: Option<&str>,
+        rating: u8,
+        starred: bool,
+    ) -> ManifestEntryDraft {
+        let instance = repository
+            .file_instances_for_asset(&asset.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        ManifestEntryDraft {
+            media_asset_id: asset.id.to_string(),
+            selected_file_instance_id: Some(instance.id.to_string()),
+            source_relative_path: Some(instance.relative_path),
+            original_filename: original_filename.into(),
+            destination_relative_path: handoff_relative_path.into(),
+            destination_filename: handoff_relative_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(original_filename)
+                .into(),
+            expected_byte_size: 10,
+            source_checksum: Some(source_checksum.into()),
+            human_decision: human_decision.map(str::to_owned),
+            rating,
+            starred,
+            moment_id: None,
+            moment_label: None,
+            status: delivery_brain::ManifestEntryStatus::Planned,
+            issue: None,
+        }
+    }
+
+    fn m10_editor_plan_and_manifest(
+        repository: &SqliteRepository,
+        project_id: &ProjectId,
+        entries: &[ManifestEntryDraft],
+    ) -> (ProductionPlanRecord, ExportManifestRecord) {
+        let plan = repository
+            .create_production_plan(
+                project_id,
+                &ProductionPlanInput {
+                    name: "M10 verified editor workset".into(),
+                    plan_type: ProductionPlanType::EditorWorkset,
+                    selection_rules: SelectionRules::editor_workset(),
+                    organization: OrganizationStrategy::SingleFolder,
+                    filename_strategy: FilenameStrategy::PreserveOriginal,
+                },
+            )
+            .unwrap();
+        let (_, _, _, _, source_revision, _) = repository
+            .production_manifest_build_input(project_id, &plan.id)
+            .unwrap();
+        let manifest = repository
+            .create_export_manifest(
+                &plan,
+                source_revision,
+                "/fixture/m10-editor-workset",
+                &serde_json::json!({
+                    "reserveBytes": delivery_brain::MIN_DESTINATION_RESERVE_BYTES,
+                }),
+                entries,
+                "m10-fixture-manifest-checksum",
+            )
+            .unwrap();
+        (plan, manifest)
+    }
+
+    fn m10_mark_export_completed(
+        repository: &SqliteRepository,
+        project_id: &ProjectId,
+        plan: &ProductionPlanRecord,
+        manifest: &ExportManifestRecord,
+    ) -> ExportJobRecord {
+        let at = now();
+        let total = manifest.selected_file_count;
+        let mut background_job = BackgroundJob {
+            id: JobId::new(),
+            state: WorkflowRunState::Running,
+            stage: JobStage::ProductionExport,
+            items_completed: 0,
+            items_total: Some(total),
+            files_discovered: total,
+            files_processed: 0,
+            error_count: 0,
+            project_id: Some(project_id.clone()),
+            index_root_id: None,
+            error_message: None,
+            resume_metadata: Some(serde_json::json!({ "pipeline": "production-export" })),
+            created_at: at,
+            updated_at: at,
+            finished_at: None,
+        };
+        let mut export = ExportJobRecord {
+            id: Uuid::new_v4().to_string(),
+            plan_id: plan.id.clone(),
+            manifest_id: manifest.id.clone(),
+            background_job_id: background_job.id.to_string(),
+            state: "running".into(),
+            destination_path: "/fixture/m10-editor-workset".into(),
+            items_total: total,
+            items_completed: 0,
+            verified_count: 0,
+            skipped_identical_count: 0,
+            failed_count: 0,
+            verified_bytes: 0,
+            created_at: timestamp(&at),
+            updated_at: timestamp(&at),
+            finished_at: None,
+            error_message: None,
+        };
+        repository
+            .create_export_job(&export, &background_job)
+            .unwrap();
+        for entry in repository
+            .export_manifest_entries(project_id, &manifest.id)
+            .unwrap()
+        {
+            repository
+                .update_export_job_entry(
+                    &export.id,
+                    &ExportJobEntryUpdate {
+                        manifest_entry_id: entry.id,
+                        state: "verified".into(),
+                        copied_bytes: entry.expected_byte_size,
+                        source_checksum: entry.source_checksum.clone(),
+                        destination_checksum: entry.source_checksum,
+                        error_message: None,
+                    },
+                )
+                .unwrap();
+        }
+        let completed_at = now();
+        background_job.state = WorkflowRunState::Completed;
+        background_job.stage = JobStage::Finalize;
+        background_job.items_completed = total;
+        background_job.files_processed = total;
+        background_job.updated_at = completed_at;
+        background_job.finished_at = Some(completed_at);
+        export.state = "completed".into();
+        export.items_completed = total;
+        export.verified_count = total;
+        export.verified_bytes = manifest.estimated_bytes;
+        export.updated_at = timestamp(&completed_at);
+        export.finished_at = Some(timestamp(&completed_at));
+        repository
+            .update_export_job(&export, &background_job)
+            .unwrap();
+        export
+    }
+
+    fn m10_output_registration(
+        output_root: &EditOutputRootRecord,
+        relative_path: &str,
+        checksum: &str,
+        match_state: OutputMatchState,
+        match_confidence: Option<MatchConfidence>,
+        auto_match_work_item_id: Option<&str>,
+        technical_status: &str,
+    ) -> EditOutputRegistration {
+        let filename = relative_path.rsplit('/').next().unwrap_or(relative_path);
+        EditOutputRegistration {
+            output_root: output_root.clone(),
+            relative_path: relative_path.into(),
+            display_filename: filename.into(),
+            normalized_basename: filename.to_ascii_lowercase(),
+            byte_size: 42,
+            checksum: checksum.into(),
+            media_type: "jpeg".into(),
+            metadata: serde_json::json!({"width": 100, "height": 50}),
+            technical_status: technical_status.into(),
+            technical_issue: (technical_status != "ready")
+                .then(|| "fixture technical issue".into()),
+            match_state,
+            match_confidence,
+            match_evidence: Some("fixture provenance evidence".into()),
+            auto_match_work_item_id: auto_match_work_item_id.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn m10_edit_session_requires_a_completed_verified_export_and_freezes_manifest_entries() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let source = culling_asset(&repository, &project.id, 1_001_001);
+        let source_instance = repository
+            .file_instances_for_asset(&source.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        repository
+            .upsert_media_metadata(&metadata(&source.id, &source_instance.id))
+            .unwrap();
+        repository
+            .update_culling_decision(
+                &project.id,
+                &source.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: Some(4),
+                    starred: Some(true),
+                    note: Some("private source-only note".into()),
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        let entries = vec![m10_manifest_entry(
+            &repository,
+            &source,
+            "selected/KEEP.JPG",
+            "KEEP.JPG",
+            "source-checksum-keep",
+            Some("keep"),
+            4,
+            true,
+        )];
+        let (plan, manifest) = m10_editor_plan_and_manifest(&repository, &project.id, &entries);
+        let input = CreateEditSessionInput {
+            name: "M10 frozen session".into(),
+            template: EditSessionTemplate::WeddingMainEdit,
+            export_manifest_id: manifest.id.clone(),
+            expected_output_policy: ExpectedOutputPolicy::Required,
+        };
+        let before_verification = repository
+            .create_edit_session(&project.id, &input)
+            .unwrap_err();
+        assert!(before_verification
+            .to_string()
+            .contains("completed, fully verified"));
+        assert!(repository
+            .edit_workspace(&project.id)
+            .unwrap()
+            .eligible_sources
+            .is_empty());
+
+        m10_mark_export_completed(&repository, &project.id, &plan, &manifest);
+        assert_eq!(
+            repository
+                .edit_workspace(&project.id)
+                .unwrap()
+                .eligible_sources
+                .len(),
+            1,
+            "only a terminal, fully verified M9 execution can become an Edit source"
+        );
+        let session = repository.create_edit_session(&project.id, &input).unwrap();
+        let repeated = repository.create_edit_session(&project.id, &input).unwrap();
+        assert_eq!(session.id, repeated.id, "double-clicks are idempotent");
+        let before_change = repository
+            .edit_session_page(&project.id, &session.id, 0, 50)
+            .unwrap();
+        assert_eq!(before_change.work_items.len(), 1);
+        let work_item = &before_change.work_items[0];
+        assert_eq!(work_item.human_decision.as_deref(), Some("keep"));
+        assert_eq!(work_item.rating, 4);
+        assert!(work_item.starred);
+        assert_eq!(work_item.camera.as_deref(), Some("A7 IV"));
+
+        repository
+            .update_culling_decision(
+                &project.id,
+                &source.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Reject),
+                    clear_decision: false,
+                    rating: Some(1),
+                    starred: Some(false),
+                    note: Some("later human change remains in culling only".into()),
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        let after_change = repository
+            .edit_session_page(&project.id, &session.id, 0, 50)
+            .unwrap();
+        assert!(after_change.session.source_stale);
+        let frozen = &after_change.work_items[0];
+        assert_eq!(frozen.human_decision.as_deref(), Some("keep"));
+        assert_eq!(frozen.rating, 4);
+        assert!(frozen.starred);
+        assert_eq!(
+            repository.culling_progress(&project.id).unwrap().reject,
+            1,
+            "an Edit Session snapshot never rewrites the later explicit human culling decision"
+        );
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM edit_work_items WHERE edit_session_id = ?1",
+                    params![session.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "idempotent session creation never duplicates frozen work items"
+        );
+    }
+
+    #[test]
+    fn m10_handoff_finalization_refuses_a_source_that_became_stale_after_reservation() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let source = culling_asset(&repository, &project.id, 1_001_100);
+        let entries = vec![m10_manifest_entry(
+            &repository,
+            &source,
+            "selected/HANDOFF.JPG",
+            "HANDOFF.JPG",
+            "source-checksum-handoff",
+            Some("keep"),
+            0,
+            false,
+        )];
+        let (plan, manifest) = m10_editor_plan_and_manifest(&repository, &project.id, &entries);
+        m10_mark_export_completed(&repository, &project.id, &plan, &manifest);
+        let session = repository
+            .create_edit_session(
+                &project.id,
+                &CreateEditSessionInput {
+                    name: "M10 handoff reservation race".into(),
+                    template: EditSessionTemplate::WeddingMainEdit,
+                    export_manifest_id: manifest.id.clone(),
+                    expected_output_policy: ExpectedOutputPolicy::Required,
+                },
+            )
+            .unwrap();
+        let preparation = repository
+            .prepare_edit_handoff(
+                &project.id,
+                &session.id,
+                &EditHandoffInput {
+                    mode: HandoffMode::Reference,
+                    destination_path: "/fixture/m10-reference-handoff".into(),
+                },
+            )
+            .unwrap();
+        assert!(!preparation.already_prepared);
+        assert_eq!(preparation.handoff.state, "writing");
+
+        // This is the deliberate interleaving: the reserved handoff is still writing while a
+        // photographer changes an authority source. The frozen session must become stale and
+        // its pending handoff must not be made ready afterward.
+        repository
+            .update_culling_decision(
+                &project.id,
+                &source.id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Reject),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            repository
+                .edit_session_page(&project.id, &session.id, 0, 1)
+                .unwrap()
+                .session
+                .source_stale
+        );
+        assert!(
+            repository
+                .finish_edit_handoff(
+                    &project.id,
+                    &preparation.handoff.id,
+                    "handoff-written-after-staleness",
+                )
+                .is_err(),
+            "a stale source cannot race a reserved handoff into ready state"
+        );
+        let handoff_state: String = repository
+            .connection
+            .query_row(
+                "SELECT state FROM edit_handoff_packages WHERE id = ?1",
+                params![preparation.handoff.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(handoff_state, "ready");
+    }
+
+    #[test]
+    fn m10_session_rejects_a_completed_job_when_it_did_not_verify_every_manifest_entry() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let source = culling_asset(&repository, &project.id, 1_001_200);
+        let entries = vec![m10_manifest_entry(
+            &repository,
+            &source,
+            "selected/VERIFY-ME.JPG",
+            "VERIFY-ME.JPG",
+            "source-checksum-verify-me",
+            Some("keep"),
+            0,
+            false,
+        )];
+        let (plan, manifest) = m10_editor_plan_and_manifest(&repository, &project.id, &entries);
+        let export = m10_mark_export_completed(&repository, &project.id, &plan, &manifest);
+        // Simulate a damaged historic catalog record that claims a completed zero-item job for a
+        // one-item manifest. M10 must not mistake `0 == 0` for full verification of the frozen
+        // workset.
+        repository
+            .connection
+            .execute(
+                "UPDATE export_jobs SET items_total = 0, verified_count = 0 WHERE id = ?1",
+                params![export.id],
+            )
+            .unwrap();
+        let input = CreateEditSessionInput {
+            name: "M10 reject partial verification".into(),
+            template: EditSessionTemplate::WeddingMainEdit,
+            export_manifest_id: manifest.id.clone(),
+            expected_output_policy: ExpectedOutputPolicy::Required,
+        };
+        assert!(repository
+            .edit_workspace(&project.id)
+            .unwrap()
+            .eligible_sources
+            .is_empty());
+        assert!(repository.create_edit_session(&project.id, &input).is_err());
+    }
+
+    #[test]
+    fn m10_outputs_require_conservative_matching_and_keep_version_approval_invariants() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let first = culling_asset(&repository, &project.id, 1_002_001);
+        let second = culling_asset(&repository, &project.id, 1_002_002);
+        let entries = vec![
+            m10_manifest_entry(
+                &repository,
+                &first,
+                "A/DSC0001.JPG",
+                "DSC0001.JPG",
+                "source-checksum-a",
+                None,
+                0,
+                false,
+            ),
+            m10_manifest_entry(
+                &repository,
+                &second,
+                "B/DSC0001.JPG",
+                "DSC0001.JPG",
+                "source-checksum-b",
+                None,
+                0,
+                false,
+            ),
+        ];
+        let (plan, manifest) = m10_editor_plan_and_manifest(&repository, &project.id, &entries);
+        m10_mark_export_completed(&repository, &project.id, &plan, &manifest);
+        let session = repository
+            .create_edit_session(
+                &project.id,
+                &CreateEditSessionInput {
+                    name: "M10 duplicate-basename session".into(),
+                    template: EditSessionTemplate::WeddingMainEdit,
+                    export_manifest_id: manifest.id.clone(),
+                    expected_output_policy: ExpectedOutputPolicy::Required,
+                },
+            )
+            .unwrap();
+        let work_items = repository
+            .edit_session_page(&project.id, &session.id, 0, 50)
+            .unwrap()
+            .work_items;
+        assert_eq!(work_items.len(), 2);
+        let first_item = &work_items[0];
+        let second_item = &work_items[1];
+        let root = repository
+            .prepare_edit_output_root(
+                &project.id,
+                &session.id,
+                "/fixture/m10-returned-outputs",
+                "/fixture/m10-returned-outputs",
+            )
+            .unwrap();
+
+        let unsafe_possible = m10_output_registration(
+            &root,
+            "returned/DSC0001_EDIT.JPG",
+            "unsafe-possible-checksum",
+            OutputMatchState::Matched,
+            Some(MatchConfidence::Possible),
+            Some(&first_item.id),
+            "ready",
+        );
+        assert!(
+            repository
+                .register_edit_output(&project.id, &session.id, &unsafe_possible)
+                .is_err(),
+            "possible filename evidence must not silently become an automatic source match"
+        );
+
+        let unsafe_strong = m10_output_registration(
+            &root,
+            "returned/DSC0001.JPG",
+            "unsafe-strong-filename-only-checksum",
+            OutputMatchState::Matched,
+            Some(MatchConfidence::Strong),
+            Some(&first_item.id),
+            "ready",
+        );
+        assert!(
+            repository
+                .register_edit_output(&project.id, &session.id, &unsafe_strong)
+                .is_err(),
+            "a filename-only strong suggestion must not silently become a final source link"
+        );
+
+        let exact_second = m10_output_registration(
+            &root,
+            "B/DSC0001.JPG",
+            "returned-exact-b",
+            OutputMatchState::Matched,
+            Some(MatchConfidence::Exact),
+            Some(&second_item.id),
+            "ready",
+        );
+        let automatic_second = repository
+            .register_edit_output(&project.id, &session.id, &exact_second)
+            .unwrap();
+        let old_second_version = automatic_second.version.unwrap();
+        let duplicate_registration = repository
+            .register_edit_output(&project.id, &session.id, &exact_second)
+            .unwrap();
+        assert!(!duplicate_registration.created);
+        assert_eq!(duplicate_registration.output.id, automatic_second.output.id);
+
+        let ambiguous = repository
+            .register_edit_output(
+                &project.id,
+                &session.id,
+                &m10_output_registration(
+                    &root,
+                    "returned/DSC0001_EDIT.JPG",
+                    "returned-ambiguous",
+                    OutputMatchState::Ambiguous,
+                    Some(MatchConfidence::Ambiguous),
+                    None,
+                    "ready",
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            ambiguous.output.discovery_state,
+            OutputMatchState::Ambiguous
+        );
+        assert!(ambiguous.output.matched_work_item_id.is_none());
+        assert!(ambiguous.version.is_none());
+
+        let first_manual = repository
+            .manually_match_edit_output(&project.id, &ambiguous.output.id, &first_item.id)
+            .unwrap();
+        assert_eq!(
+            first_manual.output.matched_work_item_id.as_deref(),
+            Some(first_item.id.as_str())
+        );
+        let moved_to_second = repository
+            .manually_match_edit_output(&project.id, &ambiguous.output.id, &second_item.id)
+            .unwrap();
+        let moved_version = moved_to_second.version.unwrap();
+        assert_eq!(moved_version.work_item_id, second_item.id);
+        assert_eq!(moved_version.version_number, 2);
+        assert!(moved_version.is_current);
+        assert_eq!(
+            moved_to_second.output.match_confidence,
+            Some(MatchConfidence::Manual)
+        );
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM edit_output_versions WHERE edit_work_item_id = ?1 AND is_current = 1",
+                    params![second_item.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "a manual correction must not leave two current output versions"
+        );
+        let old_second_is_current: bool = repository
+            .connection
+            .query_row(
+                "SELECT is_current FROM edit_output_versions WHERE id = ?1",
+                params![old_second_version.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!old_second_is_current);
+        let manual_match_audit = repository
+            .connection
+            .prepare(
+                "SELECT edit_work_item_id, active FROM edit_output_matches
+                 WHERE edit_output_id = ?1 AND method = 'manual'
+                 ORDER BY created_at ASC, id ASC",
+            )
+            .unwrap()
+            .query_map(params![ambiguous.output.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(manual_match_audit.len(), 2);
+        assert!(manual_match_audit
+            .iter()
+            .any(|(id, active)| id == &first_item.id && !active));
+        assert!(manual_match_audit
+            .iter()
+            .any(|(id, active)| id == &second_item.id && *active));
+
+        let corrected_back_to_first = repository
+            .manually_match_edit_output(&project.id, &ambiguous.output.id, &first_item.id)
+            .unwrap();
+        assert_eq!(
+            corrected_back_to_first
+                .output
+                .matched_work_item_id
+                .as_deref(),
+            Some(first_item.id.as_str()),
+            "manual matching must permit a later correction back to an earlier candidate"
+        );
+        let moved_back_to_second = repository
+            .manually_match_edit_output(&project.id, &ambiguous.output.id, &second_item.id)
+            .unwrap();
+        let moved_version = moved_back_to_second.version.unwrap();
+        assert_eq!(moved_version.work_item_id, second_item.id);
+
+        repository
+            .set_edit_version_review_state(
+                &project.id,
+                &moved_version.id,
+                EditVersionReviewState::Approved,
+            )
+            .unwrap();
+        let replacement = repository
+            .register_edit_output(
+                &project.id,
+                &session.id,
+                &m10_output_registration(
+                    &root,
+                    "B/DSC0001_FINAL.JPG",
+                    "returned-final-b",
+                    OutputMatchState::Matched,
+                    Some(MatchConfidence::Exact),
+                    Some(&second_item.id),
+                    "ready",
+                ),
+            )
+            .unwrap();
+        let replacement_version = replacement.version.unwrap();
+        let approved_replacement = repository
+            .set_edit_version_review_state(
+                &project.id,
+                &replacement_version.id,
+                EditVersionReviewState::Approved,
+            )
+            .unwrap();
+        assert!(approved_replacement.is_current);
+        assert_eq!(
+            approved_replacement.review_state,
+            EditVersionReviewState::Approved
+        );
+        let moved_state: String = repository
+            .connection
+            .query_row(
+                "SELECT review_state FROM edit_output_versions WHERE id = ?1",
+                params![moved_version.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved_state, "superseded");
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM edit_output_versions WHERE edit_work_item_id = ?1 AND review_state = 'approved'",
+                    params![second_item.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "only one human-approved version can remain for a work item"
+        );
+
+        let unreadable = repository
+            .register_edit_output(
+                &project.id,
+                &session.id,
+                &m10_output_registration(
+                    &root,
+                    "B/DSC0001_CORRUPT.JPG",
+                    "returned-corrupt-b",
+                    OutputMatchState::Matched,
+                    Some(MatchConfidence::Exact),
+                    Some(&second_item.id),
+                    "failed",
+                ),
+            )
+            .unwrap();
+        let unreadable_version = unreadable.version.unwrap();
+        assert!(repository
+            .set_edit_version_review_state(
+                &project.id,
+                &unreadable_version.id,
+                EditVersionReviewState::Approved,
+            )
+            .is_err());
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT review_state FROM edit_output_versions WHERE id = ?1",
+                    params![unreadable_version.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ready_for_review",
+            "an observed output is never promoted to approval when technical evidence is unavailable"
+        );
+    }
+
+    #[test]
+    fn m10_append_only_match_provenance_permits_rematch_after_resolution() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = project();
+        repository.insert_project(&project).unwrap();
+        repository.insert_storage_volume(&volume()).unwrap();
+        let first = culling_asset(&repository, &project.id, 1_003_001);
+        let second = culling_asset(&repository, &project.id, 1_003_002);
+        let entries = vec![
+            m10_manifest_entry(
+                &repository,
+                &first,
+                "A/DSC0001.JPG",
+                "DSC0001.JPG",
+                "source-checksum-a",
+                None,
+                0,
+                false,
+            ),
+            m10_manifest_entry(
+                &repository,
+                &second,
+                "B/DSC0001.JPG",
+                "DSC0001.JPG",
+                "source-checksum-b",
+                None,
+                0,
+                false,
+            ),
+        ];
+        let (plan, manifest) = m10_editor_plan_and_manifest(&repository, &project.id, &entries);
+        m10_mark_export_completed(&repository, &project.id, &plan, &manifest);
+        let session = repository
+            .create_edit_session(
+                &project.id,
+                &CreateEditSessionInput {
+                    name: "M10 append-only rematch session".into(),
+                    template: EditSessionTemplate::WeddingMainEdit,
+                    export_manifest_id: manifest.id.clone(),
+                    expected_output_policy: ExpectedOutputPolicy::Required,
+                },
+            )
+            .unwrap();
+        let work_items = repository
+            .edit_session_page(&project.id, &session.id, 0, 50)
+            .unwrap()
+            .work_items;
+        let first_item = &work_items[0];
+        let second_item = &work_items[1];
+        let root = repository
+            .prepare_edit_output_root(
+                &project.id,
+                &session.id,
+                "/fixture/m10-rematch",
+                "/fixture/m10-rematch",
+            )
+            .unwrap();
+
+        let output = repository
+            .register_edit_output(
+                &project.id,
+                &session.id,
+                &m10_output_registration(
+                    &root,
+                    "returned/DSC0001_EDIT.JPG",
+                    "returned-rematch",
+                    OutputMatchState::Ambiguous,
+                    Some(MatchConfidence::Ambiguous),
+                    None,
+                    "ready",
+                ),
+            )
+            .unwrap();
+        let output_id = output.output.id.clone();
+
+        let match_rows = |repository: &SqliteRepository, output_id: &str| -> Vec<(String, bool)> {
+            repository
+                .connection
+                .prepare(
+                    "SELECT edit_work_item_id, active FROM edit_output_matches
+                     WHERE edit_output_id = ?1 AND method = 'manual'
+                     ORDER BY created_at ASC, id ASC",
+                )
+                .unwrap()
+                .query_map(params![output_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        // First match: inserted and active.
+        let first_match = repository
+            .manually_match_edit_output(&project.id, &output_id, &first_item.id)
+            .unwrap();
+        assert_eq!(
+            first_match.output.matched_work_item_id.as_deref(),
+            Some(first_item.id.as_str())
+        );
+        let after_first = match_rows(&repository, &output_id);
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0], (first_item.id.clone(), true));
+
+        // Resolve/deactivate the first match by matching a different work item.
+        let second_match = repository
+            .manually_match_edit_output(&project.id, &output_id, &second_item.id)
+            .unwrap();
+        assert_eq!(
+            second_match.output.matched_work_item_id.as_deref(),
+            Some(second_item.id.as_str())
+        );
+        let after_second = match_rows(&repository, &output_id);
+        assert_eq!(after_second.len(), 2);
+        assert_eq!(after_second[0], (first_item.id.clone(), false));
+        assert_eq!(after_second[1], (second_item.id.clone(), true));
+
+        // The same output/work-item/method relationship is matched again. Before this fix the
+        // UNIQUE(edit_output_id, edit_work_item_id, method) constraint aborted the insert.
+        let rematch = repository
+            .manually_match_edit_output(&project.id, &output_id, &first_item.id)
+            .unwrap();
+        assert_eq!(
+            rematch.output.matched_work_item_id.as_deref(),
+            Some(first_item.id.as_str())
+        );
+
+        // Both historical rows remain; only the newest row is active.
+        let after_rematch = match_rows(&repository, &output_id);
+        assert_eq!(
+            after_rematch.len(),
+            3,
+            "append-only history must retain every prior match row"
+        );
+        assert_eq!(
+            after_rematch[0],
+            (first_item.id.clone(), false),
+            "first match row preserved, resolved"
+        );
+        assert_eq!(
+            after_rematch[1],
+            (second_item.id.clone(), false),
+            "intermediate match row preserved, resolved"
+        );
+        assert_eq!(
+            after_rematch[2],
+            (first_item.id.clone(), true),
+            "newest same-relationship row is active"
+        );
+
+        let active_count: i64 = repository
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM edit_output_matches WHERE edit_output_id = ?1 AND active = 1",
+                params![output_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_count, 1,
+            "only one active match per edit output may exist"
+        );
     }
 }

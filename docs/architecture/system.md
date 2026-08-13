@@ -1,11 +1,11 @@
 # System architecture
 
-CaptureOS uses a desktop-first, local-only architecture. React uses Tauri commands and events; the Rust core owns the domain model, migrations, repositories, read-only Index Mode, verified Ingest Mode, visual preparation, Capture Intelligence, Milestone 6 Magic Search, Milestone 7 Moment Brain, Milestone 8 Studio Brain, and Milestone 9 Delivery Brain orchestration. SQLite stores catalog information locally; it never stores original media bytes. The persistent app shell separates global Project Library navigation from the selected project workspace.
+CaptureOS uses a desktop-first, local-only architecture. React uses Tauri commands and events; the Rust core owns the domain model, migrations, repositories, read-only Index Mode, verified Ingest Mode, visual preparation, Capture Intelligence, Milestone 6 Magic Search, Milestone 7 Moment Brain, Milestone 8 Studio Brain, Milestone 9 Delivery Brain, and Milestone 10 Edit Session/derived-output orchestration. SQLite stores catalog information locally; it never stores original media bytes. The persistent app shell separates global Project Library navigation from the selected project workspace.
 
 ```mermaid
 flowchart LR
   Shell["Global shell: Home / Project Library\nNew Project"] --> Route["Stable ProjectId route"]
-  Route --> UI["React media grid + Index / Ingest / Culling / Magic Search / Moments / Studio Brain / Production"]
+  Route --> UI["React media grid + Index / Ingest / Culling / Magic Search / Moments / Studio Brain / Production / Edit Sessions"]
   UI --> Bridge["Tauri command bridge"]
   Bridge --> Core["capture-core"]
   Core --> Ingest["ingest: pre-flight → copy → BLAKE3 verify"]
@@ -15,6 +15,7 @@ flowchart LR
   Core --> Timeline["Moment Brain: bounded local timeline → structural Moments"]
   Core --> Studio["Studio Brain: explicit human history → compact local candidate → advisory recommendation"]
   Core --> Delivery["Delivery Brain: human plan → dry run → immutable manifest → verified LocalFolder job"]
+  Core --> Editing["M10 Edit Sessions: explicit handoff → observed derived output → human approval"]
   Core --> Graph["capture-graph"]
   Core --> Model["media-model"]
   Core --> Repo["persistence repository"]
@@ -42,9 +43,12 @@ flowchart LR
   Studio --> UI
   Delivery --> Repo
   Delivery --> Export["User-selected local folder\npartial → BLAKE3 verified final + private report"]
+  Delivery -. "frozen M9 manifest required" .-> Editing
+  Editing --> Repo
+  OutputRoot["User-selected local output root"] -. "read-only observation" .-> Editing
   Picker["Native folder picker"] --> Bridge
   Fixture["Golden Shoot + index/ingest fixtures"] --> Core
-  Adapters["Local adapters: SIPS, Quick Look, WAV, optional Apple Vision\nFuture: approved local model providers, RAW, FFmpeg, proxy, NLE"] -. boundaries .-> Core
+  Adapters["Local adapters: SIPS, Quick Look, WAV, optional Apple Vision\nM10 generic local output observer; future approved providers only"] -. boundaries .-> Core
   Source["User-owned source media\n(cards, disks, NAS)"] -. read only .-> Ingest
   Source -. read only .-> Visual
   Ingest --> Destination["User-selected master + backup folders\npartial → verified final copies"]
@@ -66,6 +70,7 @@ flowchart LR
 | Moment Brain           | Current-project still-photo structural timeline, bounded evidence-based segments/Moments, conservative label candidates, human override projection, factual coverage and advisory clock diagnostics | Event/identity recognition, captioning, missing-shot claims, automatic culling, timestamp write-back, cloud processing, Similar Set mutation |
 | Studio Brain           | Explicit local human-source materialization, compact versioned preference model, leakage-aware evaluation, calibration/abstention, atomic candidate activation, separate advisory recommendations   | Passive/AI self-training, notes/raw embeddings/identity inference, automatic culling, human-decision mutation, cloud/telemetry               |
 | Delivery Brain         | Human-rule Production Plans, Virtual Collections, safe naming, compact dry-run/preflight, immutable manifests, background LocalFolder verified-copy jobs, local reports                             | Studio-as-selection authority, source mutation, cloud/editor adapters, rendering, overwrite, automatic delivery                              |
+| Edit Sessions / derived outputs | Explicit local edit-workset handoff, versioned output provenance, conservative matching, and human approval records | Rendering/editing, source/metadata write-back, proprietary catalog mutation, automatic matching/approval/delivery, cloud or telemetry |
 | desktop                | Global Project Library routing, selected-project commands, folder selection, pre-flight, progress, status, history                                                                                  | Product dashboard or creative workspace                                                                                                      |
 
 ## Culling and review boundary
@@ -95,6 +100,27 @@ unfinished job interrupted while retaining verified destination files. Normal UI
 compact (summary/history/naming examples); manifest entries stay in core/SQLite rather than being
 loaded wholesale into React. See [Delivery Brain architecture](delivery-brain.md).
 
+## Edit Sessions and derived-output boundary
+
+M10 is a distinct local handoff and review layer. Edit Session records are created from one frozen
+M9 manifest, but never become a Production Plan, export job, final selection, or delivery
+decision. A derived-output record retains a separate observed-output identity,
+version/provenance, and matching state; a source `MediaAsset` and its physical `FileInstance`
+remain separate and immutable. A successful link is not an edit recipe, quality claim, or
+approval.
+
+Only an explicit photographer action can approve one output version. Observation, file presence,
+source Keep state, Studio advice, or external-editor state never grants approval, and approval
+does not alter M5/M7/M8 authority or create an export. Output matching is conservative: an exact
+or manual link needs documented local evidence, `strong` or `possible` candidates remain review
+evidence, and a filename, timestamp, or visual/semantic resemblance alone cannot authoritatively
+link an output; uncertain results remain unmatched or ambiguous.
+
+M10 has a generic local adapter boundary only. It can use an explicitly selected local output root
+and bounded handoff data, but it does not open, read, create, mutate, synchronize, or rely on a
+proprietary editor catalog/database, drive an external application, write XMP/sidecars, or change
+source metadata. See [Edit Sessions architecture](edit-sessions.md) and [its security boundary](../security/edit-sessions.md).
+
 ## Magic Search boundary
 
 Milestone 6 uses a local `SearchService` with replaceable query-planner, metadata-search, image/text embedding-provider, vector-index, hybrid-ranking, and explanation boundaries. The only candidate semantic family is a manually installed static SigLIP ONNX pack admitted through the model registry; no model is bundled or auto-downloaded. A pack is unavailable unless canonical containment, per-file checksums, tokenizer self-test, fixed RGB24 reference raster, and image/text reference-vector checks pass. When unavailable, Magic Search retains deterministic metadata/technical filters and reports the unavailable semantic capability rather than manufacturing results.
@@ -121,6 +147,12 @@ client-facing report files exclude it along with source paths, internal IDs, not
 Studio advice, embeddings, and model data. No M9 request is sent to a network service. Planning
 and export do not open a project automatically; the photographer explicitly requests the dry run
 or job.
+
+Edit Sessions retain only local handoff context, output observations, matching evidence,
+version/provenance links, and explicit approval history. Output roots, paths, fingerprints,
+metadata, match explanations, and approval events are sensitive local data. They are not
+telemetry or automatic export material. Project opening reads compact status/history only; it does
+not scan an output root, inspect a proprietary editor catalog, or start an external application.
 
 ## Capture Intelligence evidence flow
 
@@ -152,7 +184,7 @@ flowchart LR
 
 `AnalysisArtifact` records provider, provider/model/settings versions, input fingerprint, timestamp, confidence, status, and error. When an input or analyzer changes, older records become `STALE`; they remain provenance rather than being relabeled as current. Terminal outcomes are `READY`, `UNSUPPORTED`, `CORRUPT`, `NEEDS_ORIGINAL`, `FAILED`, and `NOT_APPLICABLE`, so one unusable asset cannot block the durable background queue. Group membership is modelled directly to avoid an unnecessary quadratic number of `SIMILAR_TO` graph edges; `CaptureGraph` reserves typed relationships for future consumers.
 
-The M4 deterministic baseline remains deliberately conservative. Milestone 6 adds optional current-project still-photo semantic retrieval through an admitted local model pack. Milestone 7 adds structural local Moment organization from bounded persisted evidence. Milestone 8 adds explicit local preference modeling that remains advisory and separate from generic evidence. Milestone 9 adds human-controlled local verified delivery organization. None adds facial identity, demographic classification, artistic ranking, automatic deletion, video/audio semantics, cloud analysis, automatic culling, or editing/rendering. Detailed strategy and operating limits are in [Capture Intelligence](capture-intelligence.md), [Magic Search](magic-search.md), [Moment Brain](moment-brain.md), [Studio Brain](studio-brain.md), and [Delivery Brain](delivery-brain.md).
+The M4 deterministic baseline remains deliberately conservative. Milestone 6 adds optional current-project still-photo semantic retrieval through an admitted local model pack. Milestone 7 adds structural local Moment organization from bounded persisted evidence. Milestone 8 adds explicit local preference modeling that remains advisory and separate from generic evidence. Milestone 9 adds human-controlled local verified delivery organization. Milestone 10 adds only local Edit Session and derived-output provenance/approval foundations; it does not render, edit, write back, mutate proprietary editor catalogs, or automate another application. None adds facial identity, demographic classification, artistic ranking, automatic deletion, video/audio semantics, cloud analysis, or automatic culling. Detailed strategy and operating limits are in [Capture Intelligence](capture-intelligence.md), [Magic Search](magic-search.md), [Moment Brain](moment-brain.md), [Studio Brain](studio-brain.md), [Delivery Brain](delivery-brain.md), and [Edit Sessions](edit-sessions.md).
 
 ## Ingest evidence flow
 

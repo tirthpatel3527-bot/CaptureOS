@@ -9,6 +9,7 @@ blake3.workspace = true
 capture-graph = { path = "../capture-graph" }
 capture-intelligence = { path = "../capture-intelligence" }
 delivery-brain = { path = "../delivery-brain" }
+edit-bridge = { path = "../edit-bridge" }
 chrono.workspace = true
 ingest = { path = "../ingest" }
 media-model = { path = "../media-model" }

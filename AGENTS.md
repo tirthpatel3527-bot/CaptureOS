@@ -105,4 +105,39 @@ CaptureOS is local-first software for professional camera media. Preserve these 
 - An Export Job is complete only after streaming BLAKE3 source-to-destination verification. A partial or interrupted run must be labeled honestly and be resumable without trusting an unverified file.
 - M9 remains local/offline and has no artificial project, media, file-count, or storage limit. Do not add cloud delivery, telemetry, hosted storage, Adobe/NLE integrations, rendering/editing, write-back, automatic delivery, or deletion.
 - Client-facing delivery reports must exclude private notes, source paths, internal IDs, AI technical scores, Studio recommendations, raw embeddings, and model data by default.
-- Stop at the requested milestone. Do not begin Milestone 10 without explicit approval.
+- Milestone 10 is separately approved below. Do not begin Milestone 11 without explicit approval.
+
+## Milestone 10 Edit Sessions and Derived Output Foundation rules
+
+- An `EditSession` is created only from a frozen M9 `ExportManifest`. It is neither a
+  `ProductionPlan`, an `ExportManifest`, an `ExportJob`, a final delivery decision, nor a
+  replacement for any of them. Never re-evaluate a frozen manifest while using it for a session.
+- Keep source `MediaAsset` and physical `FileInstance` copies distinct from an externally
+  observed derived output and its versions. Never replace, rename, delete, move, or mutate a
+  source because an output was observed, matched, reviewed, approved, missing, or superseded.
+- Derived-output provenance must retain real local session/source-match/version evidence and its
+  uncertainty. Never invent an editor recipe, output version, source relationship, quality claim,
+  or integration state. Preserve `unmatched`, `ambiguous`, and unavailable states honestly.
+- A match is not approval. Approval/revision state must come from an explicit human action and
+  must never alter Keep/Reject/Review, ratings, stars, notes, Similar Set representatives, Moment
+  organization, Studio Brain evidence, Production Plans, or Export Manifests.
+- Maintain a generic adapter boundary. Do not hard-code a particular editor or automate an
+  external application. Never open, create, modify, migrate, synchronize, or depend on a
+  proprietary editor catalog/database, and never write its metadata, XMP, sidecars, labels,
+  ratings, flags, collections, or source files.
+- Any handoff/output path, filename, extension, metadata, editor-generated value, fingerprint,
+  or file content is untrusted. Use explicitly selected local roots, canonical containment, safe
+  relative paths, and bounded pagination. Never shell out with untrusted values or scan arbitrary
+  filesystem locations.
+- Output matching must remain evidence-based and conservative. Filename, capture time,
+  visual/semantic resemblance, face information, private notes, or proprietary catalog state
+  alone cannot confer a final source link or human approval. Do not use matching for identity,
+  demographic, emotion, aesthetic, client, or creative inference.
+- Edit Sessions, handoff manifests, output roots/paths, fingerprints, versions, matching evidence,
+  reviews, and output metadata are sensitive local data. Never upload, telemeter, automatically
+  export, or expose them in client-facing reports by default.
+- M10 permits local handoff, observed-output provenance, bounded review, and explicit approval
+  only. Do not add image editing/rendering, color grading, retouching, transcoding, source
+  write-back, automatic import, automatic approval/delivery/culling, deletion, cloud editing,
+  accounts, collaboration, billing, proprietary editor integration, or video/audio edit
+  intelligence.

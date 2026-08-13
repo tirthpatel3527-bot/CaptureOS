@@ -1083,6 +1083,87 @@ describe("CaptureOS application shell and local media engine", () => {
     }));
   });
 
+  it("keeps Edit Bridge bounded and requires explicit local handoff, output, match, and review actions", async () => {
+    const session = {
+      id: "edit-session-1", projectId: "project-1", name: "AI Test Main Edit", template: "main_edit", state: "awaiting_outputs",
+      exportManifestId: "edit-manifest-1", sourcePlanName: "Editor Workset", sourceManifestVersion: 1, sourceManifestChecksum: "b".repeat(64),
+      expectedOutputPolicy: "one_per_work_item", workItemCount: 2, estimatedBytes: 2_048, handoffState: null,
+      returnedOutputCount: 1, approvedCount: 0, needsRevisionCount: 0, missingOutputCount: 1, blockedCount: 0,
+      createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z",
+    };
+    const eligibleManifest = {
+      id: "edit-manifest-1", planId: "plan-editor-1", planName: "Editor Workset", manifestVersion: 1, checksum: "b".repeat(64),
+      selectedFileCount: 2, estimatedBytes: 2_048, destinationPath: "/Volumes/Editor Workset", exportState: "completed",
+    };
+    const page = {
+      session,
+      workItems: [{
+        id: "edit-item-1", sessionId: "edit-session-1", sourceAssetId: "asset-1", sourceFilename: "IMG_0001.JPG",
+        sourceThumbnailPreviewUrl: "captureos-preview://localhost/artifact-small", sourceAvailable: true, momentLabel: "Outdoor portraits",
+        rating: 5, starred: true, state: "ready_for_review", handoffRelativePath: "01/IMG_0001.JPG",
+        latestOutputId: "edit-output-1", latestOutputFilename: "IMG_0001_EDIT.JPG", latestOutputThumbnailPreviewUrl: "captureos-preview://localhost/edit-small",
+        latestVersionNumber: 1, reviewState: null,
+      }],
+      outputs: [{
+        id: "edit-output-1", sessionId: "edit-session-1", filename: "IMG_0001_EDIT.JPG", thumbnailPreviewUrl: "captureos-preview://localhost/edit-small",
+        availability: "available", state: "ambiguous", matchState: "ambiguous", matchEvidence: ["Duplicate filename stem across workset."],
+        matchedWorkItemId: null, suggestedWorkItemId: null, latestVersionId: "edit-version-1", latestVersionNumber: 1, registeredAt: "2026-01-01T00:00:01Z",
+      }],
+      versions: [{
+        id: "edit-version-1", sessionId: "edit-session-1", outputId: "edit-output-1", workItemId: null, versionNumber: 1,
+        filename: "IMG_0001_EDIT.JPG", thumbnailPreviewUrl: "captureos-preview://localhost/edit-small", availability: "available",
+        reviewState: null, isCurrent: true, byteSize: 1_024, width: 1200, height: 800, mediaType: "jpeg", registeredAt: "2026-01-01T00:00:01Z",
+      }],
+      hasMore: false,
+      totalWorkItems: 2,
+    };
+    setCommandOverrides({
+      edit_workspace_command: { sessions: [session], eligibleManifests: [eligibleManifest] },
+      edit_session_page_command: page,
+      create_edit_session_command: { id: "edit-session-2" },
+      generate_edit_handoff_command: undefined,
+      register_edit_outputs_command: undefined,
+      manually_match_edit_output_command: undefined,
+      review_edit_version_command: undefined,
+    });
+    await renderProject();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(await screen.findByRole("heading", { name: "Edit sessions" })).toBeTruthy();
+    expect(await screen.findByText("IMG_0001_EDIT.JPG")).toBeTruthy();
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => ["create_edit_session_command", "generate_edit_handoff_command", "register_edit_outputs_command", "manually_match_edit_output_command", "review_edit_version_command"].includes(command as string))).toHaveLength(0);
+
+    fireEvent.change(screen.getByLabelText("Local handoff destination"), { target: { value: "/Volumes/Edit Handoff" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate reference handoff" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("generate_edit_handoff_command", {
+      projectId: "project-1", sessionId: "edit-session-1", input: { mode: "reference", destinationPath: "/Volumes/Edit Handoff" },
+    }));
+
+    fireEvent.change(screen.getByLabelText("Local output folder"), { target: { value: "/Volumes/Returned Edits" } });
+    fireEvent.click(screen.getByRole("button", { name: "Register outputs" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("register_edit_outputs_command", {
+      projectId: "project-1", sessionId: "edit-session-1", selectedPath: "/Volumes/Returned Edits",
+    }));
+
+    fireEvent.change(screen.getByLabelText("Match IMG_0001_EDIT.JPG to source"), { target: { value: "edit-item-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm manual match" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("manually_match_edit_output_command", {
+      projectId: "project-1", outputId: "edit-output-1", workItemId: "edit-item-1",
+    }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("review_edit_version_command", {
+      projectId: "project-1", versionId: "edit-version-1", reviewState: "approved",
+    }));
+
+    fireEvent.change(screen.getByLabelText("Edit Session name"), { target: { value: "AI Test Revision Round" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create Edit Session" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("create_edit_session_command", {
+      projectId: "project-1",
+      input: { name: "AI Test Revision Round", template: "custom", exportManifestId: "edit-manifest-1", expectedOutputPolicy: "one_per_work_item" },
+    }));
+    expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "update_culling_decision_command")).toHaveLength(0);
+  });
+
   it("queues one explicit Studio Brain train action and never turns it into a culling decision", async () => {
     setCommandOverrides({
       start_studio_brain_training_command: {

@@ -441,6 +441,180 @@ export interface ProductionWorkspaceView {
   recentExports: ProductionExportJobView[];
 }
 
+/**
+ * Milestone 10 keeps editing coordination separate from Production. A session is
+ * created only from a frozen export manifest; it never recomputes culling
+ * selections or represents a creative edit itself.
+ */
+export type EditSessionState =
+  | "draft"
+  | "ready"
+  | "handed_off"
+  | "in_progress"
+  | "awaiting_outputs"
+  | "review"
+  | "completed"
+  | "partially_completed"
+  | "blocked"
+  | "stale"
+  | "archived"
+  | string;
+export type EditWorkItemState =
+  | "queued"
+  | "handed_off"
+  | "editing"
+  | "output_received"
+  | "ready_for_review"
+  | "approved"
+  | "needs_revision"
+  | "done"
+  | "missing_output"
+  | "blocked"
+  | string;
+export type EditOutputState =
+  | "discovered"
+  | "matched"
+  | "unmatched"
+  | "ambiguous"
+  | "ready_for_review"
+  | "approved"
+  | "needs_revision"
+  | "superseded"
+  | "offline"
+  | "blocked"
+  | string;
+export type EditMatchState =
+  | "exact"
+  | "strong"
+  | "possible"
+  | "ambiguous"
+  | "unmatched"
+  | "manual"
+  | string;
+export type EditReviewState = "needs_revision" | "approved" | string;
+export type EditHandoffMode = "reference" | "package" | string;
+export type ExpectedOutputPolicy = "one_per_work_item" | "optional" | string;
+
+/** An immutable M9 manifest eligible to seed a new EditSession. */
+export interface EligibleEditManifestView {
+  id: string;
+  planId: string;
+  planName: string;
+  manifestVersion: number;
+  checksum: string;
+  selectedFileCount: number;
+  estimatedBytes: number;
+  destinationPath: string | null;
+  exportState: string;
+}
+
+/** Bounded summary only; EditWorkItems are loaded from EditSessionPageView. */
+export interface EditSessionSummaryView {
+  id: string;
+  projectId: string;
+  name: string;
+  template: string;
+  state: EditSessionState;
+  exportManifestId: string;
+  sourcePlanName: string | null;
+  sourceManifestVersion: number | null;
+  sourceManifestChecksum: string | null;
+  expectedOutputPolicy: ExpectedOutputPolicy;
+  workItemCount: number;
+  estimatedBytes: number;
+  handoffState: string | null;
+  returnedOutputCount: number;
+  approvedCount: number;
+  needsRevisionCount: number;
+  missingOutputCount: number;
+  blockedCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EditWorkspaceView {
+  sessions: EditSessionSummaryView[];
+  eligibleManifests: EligibleEditManifestView[];
+}
+
+/** A source reference in a paged session queue; it does not duplicate original media. */
+export interface EditWorkItemView {
+  id: string;
+  sessionId: string;
+  sourceAssetId: string;
+  sourceFilename: string;
+  sourceThumbnailPreviewUrl: string | null;
+  sourceAvailable: boolean;
+  momentLabel: string | null;
+  rating: number | null;
+  starred: boolean;
+  state: EditWorkItemState;
+  handoffRelativePath: string | null;
+  latestOutputId: string | null;
+  latestOutputFilename: string | null;
+  latestOutputThumbnailPreviewUrl: string | null;
+  latestVersionNumber: number | null;
+  reviewState: EditReviewState | null;
+}
+
+/** A registered external derivative. Its source mapping is explicit or remains unresolved. */
+export interface EditOutputView {
+  id: string;
+  sessionId: string;
+  filename: string;
+  thumbnailPreviewUrl: string | null;
+  availability: "available" | "offline" | string;
+  state: EditOutputState;
+  matchState: EditMatchState;
+  matchEvidence: string[];
+  matchedWorkItemId: string | null;
+  suggestedWorkItemId: string | null;
+  latestVersionId: string | null;
+  latestVersionNumber: number | null;
+  registeredAt: string;
+}
+
+/** Historical derived version. Human review state is deliberately separate from culling. */
+export interface EditVersionView {
+  id: string;
+  sessionId: string;
+  outputId: string;
+  workItemId: string | null;
+  versionNumber: number;
+  filename: string;
+  thumbnailPreviewUrl: string | null;
+  availability: "available" | "offline" | string;
+  reviewState: EditReviewState | null;
+  isCurrent: boolean;
+  byteSize: number | null;
+  width: number | null;
+  height: number | null;
+  mediaType: string | null;
+  registeredAt: string;
+}
+
+/** Bounded page for a selected EditSession; never embeds every work item in the workspace summary. */
+export interface EditSessionPageView {
+  session: EditSessionSummaryView;
+  workItems: EditWorkItemView[];
+  outputs: EditOutputView[];
+  versions?: EditVersionView[];
+  hasMore: boolean;
+  totalWorkItems?: number;
+}
+
+export interface CreateEditSessionInput {
+  name: string;
+  template: string;
+  exportManifestId: string;
+  expectedOutputPolicy: ExpectedOutputPolicy;
+}
+
+export interface GenerateEditHandoffInput {
+  mode: EditHandoffMode;
+  destinationPath: string;
+}
+
 export interface ProductionExportJobView {
   id: string;
   planId: string;

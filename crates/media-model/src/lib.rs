@@ -103,6 +103,13 @@ id_type!(VirtualCollectionId, "virtual collection");
 id_type!(ExportManifestId, "export manifest");
 id_type!(ExportJobId, "export job");
 id_type!(DeliveryReportId, "delivery report");
+id_type!(EditSessionId, "edit session");
+id_type!(EditWorkItemId, "edit work item");
+id_type!(EditHandoffPackageId, "edit handoff package");
+id_type!(EditOutputRootId, "edit output root");
+id_type!(EditOutputId, "edit output");
+id_type!(EditVersionId, "edit version");
+id_type!(EditEventId, "edit event");
 
 pub type Timestamp = DateTime<Utc>;
 

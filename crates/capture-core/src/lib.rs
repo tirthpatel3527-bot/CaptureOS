@@ -13,6 +13,12 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use delivery_brain::{
     build_manifest, ManifestBuildInput, ManifestDraft, PlanOverride, PlanOverrideKind,
 };
+use edit_bridge::{
+    CanonicalEditManifest, EditAdapter, EditAdapterIdentity, EditManifestPrivacy,
+    EditManifestProject, EditManifestSource, EditManifestWorkItem, ExpectedOutputPolicy,
+    HandoffMode, MatchConfidence, NativeManifestAdapter, OutputCandidateIndex, OutputMatchInput,
+    OutputMatchState, EDIT_MANIFEST_SCHEMA_VERSION,
+};
 use ingest::{
     copy_and_verify, hash_file, preflight, CopyVerificationOutcome, DefaultDestinationLayout,
     DestinationLayout, IngestRequest, LocalAvailableSpace, PreflightIssue, PreflightReport,
@@ -24,7 +30,7 @@ use magic_search::{
     PersistentVectorIndex, SemanticEmbeddingProvider, SemanticProviderIdentity, SiglipOnnxProvider,
     SUPPORTED_SIGLIP_PACK_DIRECTORY,
 };
-use media_index::{scan_read_only, IndexCandidate, IndexEvent};
+use media_index::{classify_extension, scan_read_only, IndexCandidate, IndexEvent};
 use media_model::*;
 use media_visual::{
     capture_time_priority, clear_cache, extract_metadata, prepare_analysis_preview,
@@ -42,10 +48,12 @@ use moment_brain::{
 use persistence::{
     AnalysisInputCandidate, CameraClockOffsetDiagnosticRecord, CaptureIntelligenceTerminalCounts,
     CaptureTimeObservationRecord, CatalogCounts, CatalogRepository, CoverageChecklistItemRecord,
-    CoverageChecklistItemView as PersistedCoverageChecklistItemView, CullingDecisionUpdate,
-    CullingDecisionView, CullingProgress, CullingQuery, CullingReportRow, CullingWorkspaceView,
-    DeliveryReportRecord, ExportJobEntryUpdate, ExportJobRecord, ExportManifestRecord,
-    FaceAnalysisProviderConfig, IndexedMediaRow, IngestAuditEvent, IngestItemRecord, IngestReport,
+    CoverageChecklistItemView as PersistedCoverageChecklistItemView, CreateEditSessionInput,
+    CullingDecisionUpdate, CullingDecisionView, CullingProgress, CullingQuery, CullingReportRow,
+    CullingWorkspaceView, DeliveryReportRecord, EditHandoffInput, EditOutputRegistration,
+    EditSessionPage, EditSessionRecord, EditVersionRecord, EligibleEditSource,
+    ExportJobEntryUpdate, ExportJobRecord, ExportManifestRecord, FaceAnalysisProviderConfig,
+    IndexedMediaRow, IngestAuditEvent, IngestItemRecord, IngestReport,
     MagicSearchHistoryEntry as PersistedMagicSearchHistoryEntry, MediaAssetDetail,
     MediaBrowserFilter, MediaMetadataRecord, MomentAnalysisInput, MomentAnalysisRunRecord,
     MomentBoundaryEvidenceRecord, MomentIncrementalAnalysisWindow, MomentMembershipRecord,
@@ -5067,10 +5075,23 @@ pub fn preflight_production_export(
     let entries = repository.export_manifest_entries(project_id, manifest_id)?;
     let execution_entries =
         repository.export_manifest_execution_entries(project_id, manifest_id)?;
+    // An Export Manifest is an immutable safety snapshot. Export-time preflight must use the
+    // reserve that was explicitly validated when this frozen manifest was created, not a mutable
+    // plan setting or the generic default. This closes an M9 under/over-enforcement race.
+    let reserve_bytes = manifest
+        .validation
+        .get("reserveBytes")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value >= delivery_brain::MIN_DESTINATION_RESERVE_BYTES)
+        .ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "This frozen Export Manifest is missing its validated destination reserve; refresh the Production Plan before exporting".into(),
+            )
+        })?;
     let preflight = production_preflight_from_entries(
         &manifest.destination_path,
         manifest.estimated_bytes,
-        delivery_brain::DEFAULT_DESTINATION_RESERVE_BYTES,
+        reserve_bytes,
         &entries,
         &execution_entries,
     )?;
@@ -5443,6 +5464,955 @@ pub fn recover_interrupted_production_exports(
     repository: &impl CatalogRepository,
 ) -> PersistenceResult<u64> {
     repository.recover_interrupted_production_exports()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone 10 — Edit Bridge presentation and local orchestration
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditWorkspace {
+    pub sessions: Vec<EditSessionView>,
+    pub eligible_manifests: Vec<EligibleEditManifestView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EligibleEditManifestView {
+    pub id: String,
+    pub plan_id: String,
+    pub plan_name: String,
+    pub manifest_version: u64,
+    pub checksum: String,
+    pub selected_file_count: u64,
+    pub estimated_bytes: u64,
+    /// A local workspace location is app UI metadata only. It is intentionally not copied into
+    /// the external canonical edit manifest.
+    pub destination_path: Option<String>,
+    pub export_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSessionView {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub template: String,
+    pub state: String,
+    pub export_manifest_id: String,
+    pub source_plan_name: Option<String>,
+    pub source_manifest_version: Option<u64>,
+    pub source_manifest_checksum: Option<String>,
+    pub expected_output_policy: String,
+    pub work_item_count: u64,
+    pub estimated_bytes: u64,
+    pub handoff_state: Option<String>,
+    pub returned_output_count: u64,
+    pub approved_count: u64,
+    pub needs_revision_count: u64,
+    pub missing_output_count: u64,
+    pub blocked_count: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditWorkItemView {
+    pub id: String,
+    pub session_id: String,
+    pub source_asset_id: String,
+    pub source_filename: String,
+    pub source_thumbnail_preview_url: Option<String>,
+    pub source_available: bool,
+    pub moment_label: Option<String>,
+    pub rating: Option<u8>,
+    pub starred: bool,
+    pub state: String,
+    pub handoff_relative_path: Option<String>,
+    pub latest_output_id: Option<String>,
+    pub latest_output_filename: Option<String>,
+    pub latest_output_thumbnail_preview_url: Option<String>,
+    pub latest_version_number: Option<u64>,
+    pub review_state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditOutputView {
+    pub id: String,
+    pub session_id: String,
+    pub filename: String,
+    pub thumbnail_preview_url: Option<String>,
+    pub availability: String,
+    pub state: String,
+    pub match_state: String,
+    pub match_evidence: Vec<String>,
+    pub matched_work_item_id: Option<String>,
+    pub suggested_work_item_id: Option<String>,
+    pub latest_version_id: Option<String>,
+    pub latest_version_number: Option<u64>,
+    pub registered_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditVersionView {
+    pub id: String,
+    pub session_id: String,
+    pub output_id: String,
+    pub work_item_id: Option<String>,
+    pub version_number: u64,
+    pub filename: String,
+    pub thumbnail_preview_url: Option<String>,
+    pub availability: String,
+    pub review_state: Option<String>,
+    pub is_current: bool,
+    pub byte_size: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub media_type: Option<String>,
+    pub registered_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSessionPageView {
+    pub session: EditSessionView,
+    pub work_items: Vec<EditWorkItemView>,
+    pub outputs: Vec<EditOutputView>,
+    pub versions: Vec<EditVersionView>,
+    pub has_more: bool,
+    pub total_work_items: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditHandoffView {
+    pub id: String,
+    pub session_id: String,
+    pub handoff_version: u64,
+    pub state: String,
+    pub manifest_checksum: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EditOutputRegistrationSummary {
+    pub discovered_count: u64,
+    pub created_count: u64,
+    pub matched_count: u64,
+    pub ambiguous_count: u64,
+    pub unmatched_count: u64,
+    pub technically_unreadable_count: u64,
+    pub skipped_symlink_count: u64,
+}
+
+/// Project opening calls only this compact projection; it never touches external output folders,
+/// hashes edits, builds a handoff, generates previews, or re-runs culling.
+pub fn edit_workspace(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+) -> PersistenceResult<EditWorkspace> {
+    let persisted = repository.edit_workspace(project_id)?;
+    let sessions = persisted
+        .sessions
+        .iter()
+        .map(|session| edit_session_view(repository, project_id, session, None))
+        .collect::<PersistenceResult<Vec<_>>>()?;
+    let eligible_manifests = persisted
+        .eligible_sources
+        .iter()
+        .map(eligible_edit_manifest_view)
+        .collect();
+    Ok(EditWorkspace {
+        sessions,
+        eligible_manifests,
+    })
+}
+
+pub fn create_edit_session(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    input: &CreateEditSessionInput,
+) -> PersistenceResult<EditSessionView> {
+    let session = repository.create_edit_session(project_id, input)?;
+    edit_session_view(repository, project_id, &session, None)
+}
+
+pub fn edit_session_page(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    session_id: &str,
+    offset: u64,
+    limit: u32,
+) -> PersistenceResult<EditSessionPageView> {
+    let page = repository.edit_session_page(project_id, session_id, offset, limit)?;
+    edit_session_page_view(repository, project_id, page)
+}
+
+/// Creates the M10 native JSON/CSV/HTML coordination bundle in an explicit, separate local
+/// folder. It never copies media, writes beside a source/workset, modifies returned files, or
+/// changes a production manifest. A Package handoff is deliberately rejected until a future
+/// frozen-manifest adapter can delegate the exact M9 verified-copy execution without recomputing
+/// selection.
+pub fn generate_edit_handoff(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    session_id: &str,
+    input: &EditHandoffInput,
+) -> PersistenceResult<EditHandoffView> {
+    let destination = canonical_edit_handoff_destination(&input.destination_path)?;
+    let canonical_input = EditHandoffInput {
+        mode: input.mode,
+        destination_path: destination.to_string_lossy().into_owned(),
+    };
+    let preparation = repository.prepare_edit_handoff(project_id, session_id, &canonical_input)?;
+    if let Err(error) =
+        ensure_edit_handoff_destination_separate(&destination, &preparation.source_root_paths)
+    {
+        // The reservation is intentionally durable so duplicate clicks cannot race a handoff
+        // write. If this post-reservation filesystem safety check fails, release it into a
+        // recoverable failed state instead of leaving a permanent `writing` record.
+        let _ = repository.record_edit_handoff_failure(
+            project_id,
+            &preparation.handoff.id,
+            &error.to_string(),
+        );
+        return Err(error);
+    }
+    if preparation.already_prepared {
+        return Ok(EditHandoffView {
+            id: preparation.handoff.id,
+            session_id: preparation.session.id,
+            handoff_version: preparation.handoff.handoff_version,
+            state: preparation.handoff.state,
+            manifest_checksum: preparation.handoff.manifest_checksum,
+        });
+    }
+    let canonical = canonical_edit_manifest(&preparation, input.mode)?;
+    let adapter = NativeManifestAdapter;
+    let files = match adapter.render(&canonical) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = repository.record_edit_handoff_failure(
+                project_id,
+                &preparation.handoff.id,
+                &error.to_string(),
+            );
+            return Err(PersistenceError::InvalidData(error.to_string()));
+        }
+    };
+    let write = write_edit_handoff_files(&destination, &files);
+    if let Err(error) = write {
+        let _ = repository.record_edit_handoff_failure(
+            project_id,
+            &preparation.handoff.id,
+            &error.to_string(),
+        );
+        return Err(error);
+    }
+    let checksum = canonical
+        .checksum()
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    let handoff = repository.finish_edit_handoff(project_id, &preparation.handoff.id, &checksum)?;
+    Ok(EditHandoffView {
+        id: handoff.id,
+        session_id: handoff.session_id,
+        handoff_version: handoff.handoff_version,
+        state: handoff.state,
+        manifest_checksum: handoff.manifest_checksum,
+    })
+}
+
+/// Explicitly scans one selected local root for supported returned-media files. Traversal is
+/// iterative, does not follow symlinks, stays beneath the canonical root, streams BLAKE3 hashes,
+/// and persists each discovery independently so a corrupt/unreadable file does not block other
+/// outputs. It never runs during project startup.
+pub fn register_edit_outputs(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    session_id: &str,
+    selected_path: &str,
+) -> PersistenceResult<EditOutputRegistrationSummary> {
+    let root = canonical_edit_output_root(selected_path)?;
+    let root_record = repository.prepare_edit_output_root(
+        project_id,
+        session_id,
+        selected_path,
+        &root.to_string_lossy(),
+    )?;
+    let candidates = repository.edit_output_match_candidates(project_id, session_id)?;
+    let matcher = OutputCandidateIndex::build(candidates);
+    let mut summary = EditOutputRegistrationSummary::default();
+    let mut seen_relative_paths = std::collections::HashSet::new();
+    for discovery in discover_edit_output_files(&root)? {
+        if discovery.symlink_skipped {
+            summary.skipped_symlink_count += 1;
+            continue;
+        }
+        let Some(path) = discovery.path else { continue };
+        let relative = discovery.relative_path.ok_or_else(|| {
+            PersistenceError::InvalidData(
+                "A returned output path escaped its selected local root".into(),
+            )
+        })?;
+        seen_relative_paths.insert(relative.clone());
+        let extension = path.extension().and_then(|value| value.to_str());
+        let media_type = classify_extension(extension);
+        if !is_edit_output_media_type(&media_type) {
+            continue;
+        }
+        let checksum = match hash_file(&path) {
+            Ok(value) => value,
+            Err(_) => {
+                // A disappearing file is not deleted from catalog history; it simply cannot be
+                // registered in this scan. The explicit root remains available for a later retry.
+                continue;
+            }
+        };
+        let extracted = extract_metadata(&path, &media_type);
+        let technical_status = artifact_status_name(extracted.status.clone()).to_owned();
+        let technical_issue = extracted.failure_reason.clone();
+        let resolution = matcher.resolve(&OutputMatchInput {
+            relative_path: relative.clone(),
+            filename: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned(),
+            checksum: Some(checksum.clone()),
+        });
+        // A real automatic match only exists when the deterministic matcher returned a
+        // provenance-preserving work-item link. A unique filename/stem candidate (Strong/Possible)
+        // is useful evidence but must never be reported as a matched output until a human confirms
+        // it, so the persisted state and the registration summary follow `auto_match_work_item_id`.
+        let match_state = if resolution.auto_match_work_item_id.is_some() {
+            OutputMatchState::Matched
+        } else {
+            output_match_state_from_resolution(resolution.confidence)
+        };
+        let created = repository.register_edit_output(
+            project_id,
+            session_id,
+            &EditOutputRegistration {
+                output_root: root_record.clone(),
+                relative_path: relative,
+                display_filename: path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| {
+                        PersistenceError::InvalidData(
+                            "Returned output filename is not valid Unicode".into(),
+                        )
+                    })?
+                    .to_owned(),
+                normalized_basename: normalize_edit_output_basename(&path),
+                byte_size: production_io(fs::metadata(&path))?.len(),
+                checksum,
+                media_type: media_type_name(&media_type).to_owned(),
+                metadata: edit_output_metadata_json(&extracted),
+                technical_status: technical_status.clone(),
+                technical_issue,
+                match_state,
+                match_confidence: Some(resolution.confidence),
+                match_evidence: Some(resolution.evidence),
+                auto_match_work_item_id: resolution.auto_match_work_item_id,
+            },
+        )?;
+        summary.discovered_count += 1;
+        if created.created {
+            summary.created_count += 1;
+        }
+        match created.output.discovery_state {
+            OutputMatchState::Matched => summary.matched_count += 1,
+            OutputMatchState::Ambiguous => summary.ambiguous_count += 1,
+            OutputMatchState::Unmatched | OutputMatchState::Discovered => {
+                summary.unmatched_count += 1
+            }
+        }
+        if technical_status != "ready" {
+            summary.technically_unreadable_count += 1;
+        }
+    }
+    // The scan completed successfully, so any previously tracked output of this same session root
+    // that was not seen on disk during this scan is transitioned to the offline state. A failed,
+    // incomplete, or inaccessible scan never reaches this point, so it can never mass-mark outputs
+    // offline. This is idempotent: outputs already offline are left unchanged.
+    let seen: Vec<String> = seen_relative_paths.into_iter().collect();
+    repository.mark_missing_edit_outputs_offline(project_id, session_id, &root_record.id, &seen)?;
+    Ok(summary)
+}
+
+pub fn manually_match_edit_output(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    output_id: &str,
+    work_item_id: &str,
+) -> PersistenceResult<EditOutputView> {
+    let outcome = repository.manually_match_edit_output(project_id, output_id, work_item_id)?;
+    Ok(edit_output_view(&outcome.output, outcome.version.as_ref()))
+}
+
+pub fn review_edit_version(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    version_id: &str,
+    state: edit_bridge::EditVersionReviewState,
+) -> PersistenceResult<EditVersionRecord> {
+    repository.set_edit_version_review_state(project_id, version_id, state)
+}
+
+fn edit_session_page_view(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    page: EditSessionPage,
+) -> PersistenceResult<EditSessionPageView> {
+    let latest_handoff_state = page.handoffs.first().map(|handoff| handoff.state.as_str());
+    let session = edit_session_view(repository, project_id, &page.session, latest_handoff_state)?;
+    let outputs_by_id = page
+        .outputs
+        .iter()
+        .map(|output| (output.id.as_str(), output))
+        .collect::<BTreeMap<_, _>>();
+    let versions_by_id = page
+        .versions
+        .iter()
+        .map(|version| (version.id.as_str(), version))
+        .collect::<BTreeMap<_, _>>();
+    let versions_by_output = page
+        .versions
+        .iter()
+        .map(|version| (version.output_id.as_str(), version))
+        .collect::<BTreeMap<_, _>>();
+    let work_items = page
+        .work_items
+        .iter()
+        .map(|item| {
+            let version = item
+                .current_edit_version_id
+                .as_deref()
+                .and_then(|id| versions_by_id.get(id).copied());
+            let output =
+                version.and_then(|value| outputs_by_id.get(value.output_id.as_str()).copied());
+            EditWorkItemView {
+                id: item.id.clone(),
+                session_id: item.session_id.clone(),
+                source_asset_id: item.source_media_asset_id.clone(),
+                source_filename: item.original_filename.clone(),
+                source_thumbnail_preview_url: preview_url(item.source_preview_artifact_id.clone()),
+                source_available: item.source_available,
+                moment_label: item.moment_label.clone(),
+                rating: Some(item.rating),
+                starred: item.starred,
+                state: serializable_enum_name(&item.state),
+                handoff_relative_path: Some(item.handoff_relative_path.clone()),
+                latest_output_id: output.map(|value| value.id.clone()),
+                latest_output_filename: output.map(|value| value.display_filename.clone()),
+                latest_output_thumbnail_preview_url: None,
+                latest_version_number: version.map(|value| value.version_number),
+                review_state: version.and_then(edit_review_state_for_view),
+            }
+        })
+        .collect();
+    let outputs = page
+        .outputs
+        .iter()
+        .map(|output| edit_output_view(output, versions_by_output.get(output.id.as_str()).copied()))
+        .collect();
+    let versions = page
+        .versions
+        .iter()
+        .filter_map(|version| {
+            let output = outputs_by_id.get(version.output_id.as_str())?;
+            Some(edit_version_view(&page.session.id, version, output))
+        })
+        .collect();
+    Ok(EditSessionPageView {
+        total_work_items: session.work_item_count,
+        session,
+        work_items,
+        outputs,
+        versions,
+        has_more: page.has_more,
+    })
+}
+
+fn edit_session_view(
+    repository: &impl CatalogRepository,
+    project_id: &ProjectId,
+    session: &EditSessionRecord,
+    latest_handoff_state: Option<&str>,
+) -> PersistenceResult<EditSessionView> {
+    let source_plan_name = repository
+        .production_plan(project_id, &session.source_production_plan_id)?
+        .map(|plan| plan.name);
+    Ok(EditSessionView {
+        id: session.id.clone(),
+        project_id: session.project_id.clone(),
+        name: session.name.clone(),
+        template: serializable_enum_name(&session.template),
+        state: if session.source_stale {
+            "stale".into()
+        } else {
+            serializable_enum_name(&session.workflow_state)
+        },
+        export_manifest_id: session.source_export_manifest_id.clone(),
+        source_plan_name,
+        source_manifest_version: Some(session.source_manifest_version),
+        source_manifest_checksum: Some(session.source_manifest_checksum.clone()),
+        expected_output_policy: match session.expected_output_policy {
+            ExpectedOutputPolicy::Required => "one_per_work_item".into(),
+            ExpectedOutputPolicy::Optional => "optional".into(),
+        },
+        work_item_count: session.work_item_count,
+        estimated_bytes: session.estimated_bytes,
+        handoff_state: latest_handoff_state
+            .map(str::to_owned)
+            .or_else(|| (session.handoff_count > 0).then(|| "recorded".into())),
+        returned_output_count: session.output_count,
+        approved_count: session.approved_count,
+        needs_revision_count: session.needs_revision_count,
+        missing_output_count: session.missing_output_count,
+        blocked_count: session.blocked_count,
+        created_at: session.created_at.clone(),
+        updated_at: session.updated_at.clone(),
+    })
+}
+
+fn eligible_edit_manifest_view(source: &EligibleEditSource) -> EligibleEditManifestView {
+    EligibleEditManifestView {
+        id: source.export_manifest_id.clone(),
+        plan_id: source.production_plan_id.clone(),
+        plan_name: source.production_plan_name.clone(),
+        manifest_version: source.export_manifest_version,
+        checksum: source.export_manifest_checksum.clone(),
+        selected_file_count: source.selected_file_count,
+        estimated_bytes: source.estimated_bytes,
+        destination_path: None,
+        export_state: "completed".into(),
+    }
+}
+
+fn edit_output_view(
+    output: &persistence::EditOutputRecord,
+    version: Option<&EditVersionRecord>,
+) -> EditOutputView {
+    let state = if output.availability != "available" {
+        "offline".into()
+    } else if let Some(version) = version {
+        match version.review_state {
+            edit_bridge::EditVersionReviewState::Approved => "approved".into(),
+            edit_bridge::EditVersionReviewState::NeedsRevision => "needs_revision".into(),
+            edit_bridge::EditVersionReviewState::Superseded => "superseded".into(),
+            edit_bridge::EditVersionReviewState::ReadyForReview => "ready_for_review".into(),
+        }
+    } else {
+        serializable_enum_name(&output.discovery_state)
+    };
+    EditOutputView {
+        id: output.id.clone(),
+        session_id: output.session_id.clone(),
+        filename: output.display_filename.clone(),
+        thumbnail_preview_url: None,
+        availability: output.availability.clone(),
+        state,
+        match_state: output
+            .match_confidence
+            .as_ref()
+            .map(serializable_enum_name)
+            .unwrap_or_else(|| serializable_enum_name(&output.discovery_state)),
+        match_evidence: output
+            .match_evidence
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|value| vec![value.into()])
+            .unwrap_or_default(),
+        matched_work_item_id: output.matched_work_item_id.clone(),
+        suggested_work_item_id: None,
+        latest_version_id: version.map(|value| value.id.clone()),
+        latest_version_number: version.map(|value| value.version_number),
+        registered_at: output.registered_at.clone(),
+    }
+}
+
+fn edit_version_view(
+    session_id: &str,
+    version: &EditVersionRecord,
+    output: &persistence::EditOutputRecord,
+) -> EditVersionView {
+    let width = output
+        .metadata
+        .get("width")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let height = output
+        .metadata
+        .get("height")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    EditVersionView {
+        id: version.id.clone(),
+        session_id: session_id.into(),
+        output_id: output.id.clone(),
+        work_item_id: Some(version.work_item_id.clone()),
+        version_number: version.version_number,
+        filename: output.display_filename.clone(),
+        thumbnail_preview_url: None,
+        availability: output.availability.clone(),
+        review_state: edit_review_state_for_view(version),
+        is_current: version.is_current,
+        byte_size: Some(output.byte_size),
+        width,
+        height,
+        media_type: Some(output.media_type.clone()),
+        registered_at: output.registered_at.clone(),
+    }
+}
+
+fn edit_review_state_for_view(version: &EditVersionRecord) -> Option<String> {
+    match version.review_state {
+        edit_bridge::EditVersionReviewState::Approved
+        | edit_bridge::EditVersionReviewState::NeedsRevision => {
+            Some(serializable_enum_name(&version.review_state))
+        }
+        edit_bridge::EditVersionReviewState::ReadyForReview
+        | edit_bridge::EditVersionReviewState::Superseded => None,
+    }
+}
+
+fn serializable_enum_name(value: &impl Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unavailable".into())
+}
+
+fn canonical_edit_manifest(
+    preparation: &persistence::EditHandoffPreparation,
+    mode: HandoffMode,
+) -> PersistenceResult<CanonicalEditManifest> {
+    let work_items = preparation
+        .work_items
+        .iter()
+        .map(|item| EditManifestWorkItem {
+            work_item_id: item.id.clone(),
+            source_media_asset_id: item.source_media_asset_id.clone(),
+            source_manifest_entry_id: item.source_export_manifest_entry_id.clone(),
+            handoff_relative_path: item.handoff_relative_path.clone(),
+            original_filename: item.original_filename.clone(),
+            source_checksum: item.source_checksum.clone(),
+            captured_at: item.captured_at.clone(),
+            camera: item.camera.clone(),
+            moment_label: item.moment_label.clone(),
+            human_decision: item.human_decision.clone(),
+            rating: item.rating,
+            starred: item.starred,
+            expected_output_policy: item.expected_output_policy,
+        })
+        .collect();
+    let manifest = CanonicalEditManifest {
+        schema_version: EDIT_MANIFEST_SCHEMA_VERSION,
+        session_id: preparation.session.id.clone(),
+        handoff_id: preparation.handoff.id.clone(),
+        created_at: preparation.handoff.created_at.clone(),
+        project: EditManifestProject {
+            id: preparation.session.project_id.clone(),
+            name: preparation.project_name.clone(),
+        },
+        source: EditManifestSource {
+            production_plan_id: preparation.session.source_production_plan_id.clone(),
+            export_manifest_id: preparation.session.source_export_manifest_id.clone(),
+            export_manifest_checksum: preparation.session.source_manifest_checksum.clone(),
+            export_manifest_version: preparation.session.source_manifest_version,
+            handoff_mode: mode,
+        },
+        expected_output_policy: preparation.session.expected_output_policy,
+        privacy: EditManifestPrivacy::default(),
+        adapter: EditAdapterIdentity::native_manifest(),
+        work_items,
+    };
+    manifest
+        .validate()
+        .map_err(|error| PersistenceError::InvalidData(error.to_string()))?;
+    Ok(manifest)
+}
+
+fn canonical_edit_handoff_destination(value: &str) -> PersistenceResult<PathBuf> {
+    let selected = Path::new(value);
+    let metadata = fs::symlink_metadata(selected).map_err(|error| {
+        PersistenceError::InvalidData(format!("Edit Handoff destination is unavailable: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(PersistenceError::InvalidData(
+            "Edit Handoff destination must be an existing, non-symlink local folder".into(),
+        ));
+    }
+    selected.canonicalize().map_err(|error| {
+        PersistenceError::InvalidData(format!("Edit Handoff destination is unavailable: {error}"))
+    })
+}
+
+fn canonical_edit_output_root(value: &str) -> PersistenceResult<PathBuf> {
+    let selected = Path::new(value);
+    let metadata = fs::symlink_metadata(selected).map_err(|error| {
+        PersistenceError::InvalidData(format!("Returned-output folder is unavailable: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(PersistenceError::InvalidData(
+            "Returned-output folder must be an existing, non-symlink local folder".into(),
+        ));
+    }
+    selected.canonicalize().map_err(|error| {
+        PersistenceError::InvalidData(format!("Returned-output folder is unavailable: {error}"))
+    })
+}
+
+fn ensure_edit_handoff_destination_separate(
+    destination: &Path,
+    source_roots: &[String],
+) -> PersistenceResult<()> {
+    for raw_root in source_roots {
+        let root = match Path::new(raw_root).canonicalize() {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if destination.starts_with(&root) || root.starts_with(destination) {
+            return Err(PersistenceError::InvalidData(
+                "Edit Handoff metadata must be written to a separate local folder, never inside an original source or verified workset".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_edit_handoff_files(
+    destination: &Path,
+    files: &edit_bridge::EditHandoffFiles,
+) -> PersistenceResult<()> {
+    let entries = [
+        (
+            "captureos-edit-manifest.json",
+            files.manifest_json.as_bytes(),
+        ),
+        ("editor-handoff.csv", files.csv.as_bytes()),
+        ("captureos-edit-handoff.html", files.html.as_bytes()),
+    ];
+    for (name, contents) in entries {
+        write_new_or_identical_handoff_file(destination, name, contents)?;
+    }
+    Ok(())
+}
+
+fn write_new_or_identical_handoff_file(
+    destination: &Path,
+    filename: &str,
+    contents: &[u8],
+) -> PersistenceResult<()> {
+    let target = destination.join(filename);
+    if target.exists() {
+        let metadata = production_io(fs::symlink_metadata(&target))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(PersistenceError::InvalidData(
+                "Edit Handoff target conflicts with an unsafe existing path".into(),
+            ));
+        }
+        let existing = production_io(fs::read(&target))?;
+        if existing == contents {
+            return Ok(());
+        }
+        return Err(PersistenceError::InvalidData(
+            "Edit Handoff target already exists with different content; CaptureOS will not overwrite it".into(),
+        ));
+    }
+    let temporary = destination.join(format!(".{filename}.captureos-{}.partial", Uuid::new_v4()));
+    let mut file = production_io(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary),
+    )?;
+    production_io(file.write_all(contents))?;
+    production_io(file.sync_all())?;
+    match fs::hard_link(&temporary, &target) {
+        Ok(()) => {
+            production_io(fs::remove_file(&temporary))?;
+            Ok(())
+        }
+        Err(error) if target.exists() => {
+            let _ = fs::remove_file(&temporary);
+            let metadata = production_io(fs::symlink_metadata(&target))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(PersistenceError::InvalidData(
+                    "Edit Handoff target conflicts with an unsafe existing path".into(),
+                ));
+            }
+            let existing = production_io(fs::read(&target))?;
+            if existing == contents {
+                Ok(())
+            } else {
+                Err(PersistenceError::InvalidData(format!(
+                    "Edit Handoff target already exists with different content: {error}"
+                )))
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(PersistenceError::InvalidData(format!(
+                "Edit Handoff could not be finalized without overwrite: {error}"
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EditOutputDiscovery {
+    path: Option<PathBuf>,
+    relative_path: Option<String>,
+    symlink_skipped: bool,
+}
+
+fn discover_edit_output_files(root: &Path) -> PersistenceResult<Vec<EditOutputDiscovery>> {
+    const MAX_SAFE_OUTPUT_DEPTH: usize = 64;
+    let mut directories = vec![(root.to_path_buf(), 0_usize)];
+    let mut discoveries = Vec::new();
+    while let Some((directory, depth)) = directories.pop() {
+        let entries = production_io(fs::read_dir(&directory))?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if metadata.file_type().is_symlink() {
+                discoveries.push(EditOutputDiscovery {
+                    path: None,
+                    relative_path: None,
+                    symlink_skipped: true,
+                });
+                continue;
+            }
+            if metadata.is_dir() {
+                if depth >= MAX_SAFE_OUTPUT_DEPTH {
+                    return Err(PersistenceError::InvalidData(
+                        "Returned-output traversal exceeded the safe directory depth; choose a narrower output root".into(),
+                    ));
+                }
+                let canonical = match path.canonicalize() {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                if canonical.starts_with(root) {
+                    directories.push((canonical, depth + 1));
+                }
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let canonical = match path.canonicalize() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if !canonical.starts_with(root) {
+                continue;
+            }
+            let relative = canonical
+                .strip_prefix(root)
+                .ok()
+                .and_then(|value| value.to_str())
+                .map(|value| value.replace('\\', "/"));
+            if relative
+                .as_deref()
+                .is_none_or(|value| !edit_bridge::safe_relative_path(value))
+            {
+                continue;
+            }
+            discoveries.push(EditOutputDiscovery {
+                path: Some(canonical),
+                relative_path: relative,
+                symlink_skipped: false,
+            });
+        }
+    }
+    discoveries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(discoveries)
+}
+
+fn is_edit_output_media_type(media_type: &MediaType) -> bool {
+    matches!(
+        media_type,
+        MediaType::Jpeg | MediaType::Heif | MediaType::Png | MediaType::Tiff | MediaType::Video
+    )
+}
+
+fn media_type_name(media_type: &MediaType) -> &'static str {
+    match media_type {
+        MediaType::RawPhoto => "raw_photo",
+        MediaType::Jpeg => "jpeg",
+        MediaType::Heif => "heif",
+        MediaType::Png => "png",
+        MediaType::Tiff => "tiff",
+        MediaType::Video => "video",
+        MediaType::Audio => "audio",
+        MediaType::Sidecar => "sidecar",
+        MediaType::Proxy => "proxy",
+        MediaType::Thumbnail => "thumbnail",
+        MediaType::ProjectDocument => "project_document",
+        MediaType::Unknown => "unknown",
+    }
+}
+
+fn artifact_status_name(status: ArtifactStatus) -> &'static str {
+    match status {
+        ArtifactStatus::Pending => "pending",
+        ArtifactStatus::Ready => "ready",
+        ArtifactStatus::Unsupported => "unsupported",
+        ArtifactStatus::Offline => "offline",
+        ArtifactStatus::Corrupt => "corrupt",
+        ArtifactStatus::Failed => "failed",
+        ArtifactStatus::Timeout => "timeout",
+        ArtifactStatus::Cancelled => "cancelled",
+        ArtifactStatus::Stale => "stale",
+    }
+}
+
+fn normalize_edit_output_basename(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+fn edit_output_metadata_json(metadata: &media_visual::ExtractedMetadata) -> serde_json::Value {
+    serde_json::json!({
+        "mimeType": metadata.mime_type,
+        "byteSize": metadata.byte_size,
+        "capturedAtLocal": metadata.captured_at_local,
+        "width": metadata.width,
+        "height": metadata.height,
+        "orientation": metadata.orientation,
+        "cameraModel": metadata.camera_model,
+        "colorSpace": metadata.color_space,
+        "status": artifact_status_name(metadata.status.clone()),
+    })
+}
+
+fn output_match_state_from_resolution(confidence: MatchConfidence) -> OutputMatchState {
+    match confidence {
+        MatchConfidence::Exact => OutputMatchState::Matched,
+        MatchConfidence::Strong => OutputMatchState::Unmatched,
+        MatchConfidence::Ambiguous => OutputMatchState::Ambiguous,
+        MatchConfidence::Possible | MatchConfidence::Unmatched | MatchConfidence::Manual => {
+            OutputMatchState::Unmatched
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -11341,6 +12311,80 @@ mod tests {
     }
 
     #[test]
+    fn production_preflight_uses_the_frozen_manifest_reserve_and_refuses_missing_evidence() {
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("delivery");
+        fs::create_dir_all(&destination).unwrap();
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = create_local_project(&repository, "Frozen reserve fixture").unwrap();
+        let project_id = ProjectId::try_from(project.id.as_str()).unwrap();
+
+        let missing_reserve_plan = create_production_plan(
+            &repository,
+            &project_id,
+            &ProductionPlanInput {
+                name: "Missing frozen reserve".into(),
+                plan_type: delivery_brain::ProductionPlanType::ClientDelivery,
+                selection_rules: delivery_brain::SelectionRules::client_delivery(),
+                organization: delivery_brain::OrganizationStrategy::SingleFolder,
+                filename_strategy: delivery_brain::FilenameStrategy::PreserveOriginal,
+            },
+        )
+        .unwrap();
+        let (_, _, _, _, missing_revision, _) = repository
+            .production_manifest_build_input(&project_id, &missing_reserve_plan.id)
+            .unwrap();
+        let missing_reserve_manifest = repository
+            .create_export_manifest(
+                &missing_reserve_plan,
+                missing_revision,
+                destination.to_str().unwrap(),
+                &serde_json::json!({}),
+                &[],
+                "missing-frozen-reserve",
+            )
+            .unwrap();
+        assert!(preflight_production_export(
+            &repository,
+            &project_id,
+            &missing_reserve_manifest.id,
+        )
+        .is_err());
+
+        let configured_reserve = delivery_brain::MIN_DESTINATION_RESERVE_BYTES + 4_096;
+        let explicit_reserve_plan = create_production_plan(
+            &repository,
+            &project_id,
+            &ProductionPlanInput {
+                name: "Explicit frozen reserve".into(),
+                plan_type: delivery_brain::ProductionPlanType::ClientDelivery,
+                selection_rules: delivery_brain::SelectionRules::client_delivery(),
+                organization: delivery_brain::OrganizationStrategy::SingleFolder,
+                filename_strategy: delivery_brain::FilenameStrategy::PreserveOriginal,
+            },
+        )
+        .unwrap();
+        let (_, _, _, _, explicit_revision, _) = repository
+            .production_manifest_build_input(&project_id, &explicit_reserve_plan.id)
+            .unwrap();
+        let explicit_reserve_manifest = repository
+            .create_export_manifest(
+                &explicit_reserve_plan,
+                explicit_revision,
+                destination.to_str().unwrap(),
+                &serde_json::json!({ "reserveBytes": configured_reserve }),
+                &[],
+                "explicit-frozen-reserve",
+            )
+            .unwrap();
+        let preflight =
+            preflight_production_export(&repository, &project_id, &explicit_reserve_manifest.id)
+                .unwrap();
+        assert_eq!(preflight.reserve_bytes, configured_reserve);
+        assert_eq!(preflight.required_bytes, configured_reserve);
+    }
+
+    #[test]
     fn production_preview_blocks_a_different_destination_collision_without_writing() {
         let directory = tempdir().unwrap();
         let source = directory.path().join("source");
@@ -14700,6 +15744,765 @@ mod tests {
         assert_eq!(
             studio_candidate_rejection_reason(&incomparable, &previous, 8).as_deref(),
             Some("New Studio Brain could not be compared safely with the active model. Previous model remains active.")
+        );
+    }
+
+    #[test]
+    fn m10_only_exact_provenance_is_persisted_as_a_matched_output_before_human_review() {
+        assert_eq!(
+            output_match_state_from_resolution(MatchConfidence::Exact),
+            OutputMatchState::Matched
+        );
+        // A unique filename-derived candidate is useful evidence, but AGENTS' M10 contract
+        // forbids it from becoming a final source association until a human confirms it.
+        assert_eq!(
+            output_match_state_from_resolution(MatchConfidence::Strong),
+            OutputMatchState::Unmatched
+        );
+        assert_eq!(
+            output_match_state_from_resolution(MatchConfidence::Possible),
+            OutputMatchState::Unmatched
+        );
+        assert_eq!(
+            output_match_state_from_resolution(MatchConfidence::Ambiguous),
+            OutputMatchState::Ambiguous
+        );
+    }
+
+    #[test]
+    fn m10_register_edit_outputs_counts_only_automatic_matches_as_matched() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("KEEP.JPG"),
+            b"first photographer-owned source bytes",
+        )
+        .unwrap();
+        fs::write(
+            source.join("REVIEW.JPG"),
+            b"second photographer-owned source bytes",
+        )
+        .unwrap();
+
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project =
+            create_local_project(&repository, "Edit output registration fixture").unwrap();
+        let project_id = ProjectId::try_from(project.id.as_str()).unwrap();
+        index_local_folder(&repository, &project_id, source.to_str().unwrap(), |_| {}).unwrap();
+        let indexed =
+            load_project_home(&repository, &project_id, MediaBrowserFilter::All, 0, 20).unwrap();
+        let keep_id = MediaAssetId::try_from(
+            indexed
+                .media
+                .iter()
+                .find(|item| item.filename == "KEEP.JPG")
+                .unwrap()
+                .asset_id
+                .as_str(),
+        )
+        .unwrap();
+        let review_id = MediaAssetId::try_from(
+            indexed
+                .media
+                .iter()
+                .find(|item| item.filename == "REVIEW.JPG")
+                .unwrap()
+                .asset_id
+                .as_str(),
+        )
+        .unwrap();
+        repository
+            .update_culling_decision(
+                &project_id,
+                &keep_id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        repository
+            .update_culling_decision(
+                &project_id,
+                &review_id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Review),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+
+        let plan = create_production_plan(
+            &repository,
+            &project_id,
+            &ProductionPlanInput {
+                name: "Editor workset".into(),
+                plan_type: delivery_brain::ProductionPlanType::EditorWorkset,
+                selection_rules: delivery_brain::SelectionRules::editor_workset(),
+                organization: delivery_brain::OrganizationStrategy::SingleFolder,
+                filename_strategy: delivery_brain::FilenameStrategy::PreserveOriginal,
+            },
+        )
+        .unwrap();
+        let workset = directory.path().join("editor-workset");
+        fs::create_dir_all(&workset).unwrap();
+        update_production_plan_destination(
+            &repository,
+            &project_id,
+            &plan.id,
+            Some(workset.to_str().unwrap()),
+        )
+        .unwrap();
+        let manifest =
+            create_production_export_manifest(&repository, &project_id, &plan.id).unwrap();
+        let export =
+            export_production_manifest(&repository, &project_id, &manifest.id, || false, |_| {})
+                .unwrap();
+        assert_eq!(export.state, "completed");
+
+        let session = create_edit_session(
+            &repository,
+            &project_id,
+            &CreateEditSessionInput {
+                name: "M10 output registration".into(),
+                template: edit_bridge::EditSessionTemplate::Custom,
+                export_manifest_id: manifest.id.clone(),
+                expected_output_policy: edit_bridge::ExpectedOutputPolicy::Required,
+            },
+        )
+        .unwrap();
+
+        // Two returned outputs: one at the frozen handoff path (exact auto-match) and one whose
+        // filename uniquely matches a work item but at a different path/checksum (strong candidate).
+        let page = edit_session_page(&repository, &project_id, &session.id, 0, 50).unwrap();
+        let keep_handoff = page
+            .work_items
+            .iter()
+            .find(|item| item.source_filename == "KEEP.JPG")
+            .unwrap()
+            .handoff_relative_path
+            .clone()
+            .unwrap();
+        let review_handoff = page
+            .work_items
+            .iter()
+            .find(|item| item.source_filename == "REVIEW.JPG")
+            .unwrap()
+            .handoff_relative_path
+            .clone()
+            .unwrap();
+        let review_filename = std::path::Path::new(&review_handoff)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let returned = directory.path().join("returned");
+        fs::create_dir_all(returned.join("sub")).unwrap();
+        fs::write(
+            returned.join(&keep_handoff),
+            b"first photographer-owned source bytes",
+        )
+        .unwrap();
+        fs::write(
+            returned.join("sub").join(&review_filename),
+            b"edited reviewer-owned output bytes differ from source",
+        )
+        .unwrap();
+
+        let summary = register_edit_outputs(
+            &repository,
+            &project_id,
+            &session.id,
+            returned.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            summary.discovered_count, 2,
+            "both returned files are discovered"
+        );
+        assert_eq!(
+            summary.created_count, 2,
+            "both returned files are newly registered"
+        );
+        assert_eq!(
+            summary.matched_count, 1,
+            "only the exact provenance match is reported as matched"
+        );
+        assert_eq!(
+            summary.unmatched_count, 1,
+            "the strong filename candidate is not reported as matched"
+        );
+        assert_eq!(summary.ambiguous_count, 0);
+
+        let after = edit_session_page(&repository, &project_id, &session.id, 0, 50).unwrap();
+        let exact_output = after
+            .outputs
+            .iter()
+            .find(|output| {
+                output.filename
+                    == std::path::Path::new(&keep_handoff)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .as_ref()
+            })
+            .unwrap();
+        assert_eq!(exact_output.match_state, "exact");
+        assert!(
+            exact_output.matched_work_item_id.is_some(),
+            "exact provenance links to a work item"
+        );
+
+        let strong_output = after
+            .outputs
+            .iter()
+            .find(|output| output.filename == review_filename)
+            .unwrap();
+        assert_eq!(strong_output.match_state, "strong");
+        assert!(
+            strong_output.matched_work_item_id.is_none(),
+            "a strong filename candidate is not silently linked"
+        );
+
+        let matched_detail = after
+            .outputs
+            .iter()
+            .filter(|output| output.match_state == "exact")
+            .count();
+        assert_eq!(
+            matched_detail, summary.matched_count as usize,
+            "summary and detail agree on the matched count"
+        );
+    }
+
+    fn m10_edit_session_fixture(
+        name: &str,
+        policy: edit_bridge::ExpectedOutputPolicy,
+    ) -> (
+        SqliteRepository,
+        ProjectId,
+        String,
+        String,
+        tempfile::TempDir,
+    ) {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        write_real_test_jpeg(&source.join("KEEP.JPG"), 4, 4, 1);
+        write_real_test_jpeg(&source.join("REVIEW.JPG"), 4, 4, 2);
+
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let project = create_local_project(&repository, "Edit session fixture").unwrap();
+        let project_id = ProjectId::try_from(project.id.as_str()).unwrap();
+        index_local_folder(&repository, &project_id, source.to_str().unwrap(), |_| {}).unwrap();
+        let indexed =
+            load_project_home(&repository, &project_id, MediaBrowserFilter::All, 0, 20).unwrap();
+        let keep_id = MediaAssetId::try_from(
+            indexed
+                .media
+                .iter()
+                .find(|item| item.filename == "KEEP.JPG")
+                .unwrap()
+                .asset_id
+                .as_str(),
+        )
+        .unwrap();
+        let review_id = MediaAssetId::try_from(
+            indexed
+                .media
+                .iter()
+                .find(|item| item.filename == "REVIEW.JPG")
+                .unwrap()
+                .asset_id
+                .as_str(),
+        )
+        .unwrap();
+        repository
+            .update_culling_decision(
+                &project_id,
+                &keep_id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Keep),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        repository
+            .update_culling_decision(
+                &project_id,
+                &review_id,
+                &CullingDecisionUpdate {
+                    decision: Some(CullingDecisionValue::Review),
+                    clear_decision: false,
+                    rating: None,
+                    starred: None,
+                    note: None,
+                    flags: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+
+        let plan = create_production_plan(
+            &repository,
+            &project_id,
+            &ProductionPlanInput {
+                name: "Editor workset".into(),
+                plan_type: delivery_brain::ProductionPlanType::EditorWorkset,
+                selection_rules: delivery_brain::SelectionRules::editor_workset(),
+                organization: delivery_brain::OrganizationStrategy::SingleFolder,
+                filename_strategy: delivery_brain::FilenameStrategy::PreserveOriginal,
+            },
+        )
+        .unwrap();
+        let workset = directory.path().join("editor-workset");
+        fs::create_dir_all(&workset).unwrap();
+        update_production_plan_destination(
+            &repository,
+            &project_id,
+            &plan.id,
+            Some(workset.to_str().unwrap()),
+        )
+        .unwrap();
+        let manifest =
+            create_production_export_manifest(&repository, &project_id, &plan.id).unwrap();
+        let export =
+            export_production_manifest(&repository, &project_id, &manifest.id, || false, |_| {})
+                .unwrap();
+        assert_eq!(export.state, "completed");
+
+        let session = create_edit_session(
+            &repository,
+            &project_id,
+            &CreateEditSessionInput {
+                name: name.to_string(),
+                template: edit_bridge::EditSessionTemplate::Custom,
+                export_manifest_id: manifest.id.clone(),
+                expected_output_policy: policy,
+            },
+        )
+        .unwrap();
+        (repository, project_id, session.id, manifest.id, directory)
+    }
+
+    fn m10_register_and_approve(
+        repository: &SqliteRepository,
+        project_id: &ProjectId,
+        session_id: &str,
+        source_filename: &str,
+        directory: &tempfile::TempDir,
+    ) {
+        let page = edit_session_page(repository, project_id, session_id, 0, 50).unwrap();
+        let handoff = page
+            .work_items
+            .iter()
+            .find(|item| item.source_filename == source_filename)
+            .unwrap()
+            .handoff_relative_path
+            .clone()
+            .unwrap();
+        let returned = directory.path().join("returned");
+        fs::create_dir_all(&returned).unwrap();
+        let content = fs::read(directory.path().join("source").join(source_filename)).unwrap();
+        fs::write(returned.join(&handoff), content).unwrap();
+        register_edit_outputs(
+            repository,
+            project_id,
+            session_id,
+            returned.to_str().unwrap(),
+        )
+        .unwrap();
+        let after = edit_session_page(repository, project_id, session_id, 0, 50).unwrap();
+        let output = after
+            .outputs
+            .iter()
+            .find(|output| {
+                output.filename
+                    == std::path::Path::new(&handoff)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .as_ref()
+            })
+            .unwrap();
+        let version_id = output.latest_version_id.clone().unwrap();
+        review_edit_version(
+            repository,
+            project_id,
+            &version_id,
+            edit_bridge::EditVersionReviewState::Approved,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn m10_optional_policy_completes_when_one_optional_output_is_approved_and_another_optional_item_has_no_output(
+    ) {
+        let (repository, project_id, session_id, _, directory) = m10_edit_session_fixture(
+            "optional completion",
+            edit_bridge::ExpectedOutputPolicy::Optional,
+        );
+        m10_register_and_approve(
+            &repository,
+            &project_id,
+            &session_id,
+            "KEEP.JPG",
+            &directory,
+        );
+        let page = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        assert_eq!(
+            page.session.state, "completed",
+            "an approved optional output plus an optional item with no output still completes"
+        );
+    }
+
+    #[test]
+    fn m10_optional_policy_does_not_complete_while_an_output_awaits_review() {
+        let (repository, project_id, session_id, _, directory) = m10_edit_session_fixture(
+            "optional completion",
+            edit_bridge::ExpectedOutputPolicy::Optional,
+        );
+        let page = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        let handoff = page
+            .work_items
+            .iter()
+            .find(|item| item.source_filename == "KEEP.JPG")
+            .unwrap()
+            .handoff_relative_path
+            .clone()
+            .unwrap();
+        let returned = directory.path().join("returned");
+        fs::create_dir_all(&returned).unwrap();
+        let content = fs::read(directory.path().join("source").join("KEEP.JPG")).unwrap();
+        fs::write(returned.join(&handoff), content).unwrap();
+        register_edit_outputs(
+            &repository,
+            &project_id,
+            &session_id,
+            returned.to_str().unwrap(),
+        )
+        .unwrap();
+        let after = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        assert_ne!(
+            after.session.state, "completed",
+            "an output awaiting review must not complete the session"
+        );
+        assert_eq!(after.session.state, "review");
+    }
+
+    #[test]
+    fn m10_required_policy_does_not_complete_when_a_required_output_is_missing() {
+        let (repository, project_id, session_id, _, directory) = m10_edit_session_fixture(
+            "required completion",
+            edit_bridge::ExpectedOutputPolicy::Required,
+        );
+        m10_register_and_approve(
+            &repository,
+            &project_id,
+            &session_id,
+            "KEEP.JPG",
+            &directory,
+        );
+        let after = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        assert_ne!(
+            after.session.state, "completed",
+            "a missing required output must block completion"
+        );
+        assert_eq!(after.session.state, "partially_completed");
+    }
+
+    fn m10_register_output(
+        repository: &SqliteRepository,
+        project_id: &ProjectId,
+        session_id: &str,
+        source_filename: &str,
+        directory: &tempfile::TempDir,
+    ) {
+        let page = edit_session_page(repository, project_id, session_id, 0, 50).unwrap();
+        let handoff = page
+            .work_items
+            .iter()
+            .find(|item| item.source_filename == source_filename)
+            .unwrap()
+            .handoff_relative_path
+            .clone()
+            .unwrap();
+        let returned = directory.path().join("returned");
+        fs::create_dir_all(&returned).unwrap();
+        let content = fs::read(directory.path().join("source").join(source_filename)).unwrap();
+        fs::write(returned.join(&handoff), content).unwrap();
+        register_edit_outputs(
+            repository,
+            project_id,
+            session_id,
+            returned.to_str().unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn m10_registered_output_is_available_while_present() {
+        let (repository, project_id, session_id, _, directory) = m10_edit_session_fixture(
+            "availability present",
+            edit_bridge::ExpectedOutputPolicy::Optional,
+        );
+        m10_register_output(
+            &repository,
+            &project_id,
+            &session_id,
+            "KEEP.JPG",
+            &directory,
+        );
+        let page = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        let output = page
+            .outputs
+            .iter()
+            .find(|o| o.filename == "KEEP.JPG")
+            .unwrap();
+        assert_eq!(output.availability, "available");
+    }
+
+    #[test]
+    fn m10_output_becomes_offline_after_file_removed_and_rescanned() {
+        let (repository, project_id, session_id, _, directory) = m10_edit_session_fixture(
+            "availability removed",
+            edit_bridge::ExpectedOutputPolicy::Optional,
+        );
+        m10_register_output(
+            &repository,
+            &project_id,
+            &session_id,
+            "KEEP.JPG",
+            &directory,
+        );
+        let handoff = edit_session_page(&repository, &project_id, &session_id, 0, 50)
+            .unwrap()
+            .work_items
+            .iter()
+            .find(|i| i.source_filename == "KEEP.JPG")
+            .unwrap()
+            .handoff_relative_path
+            .clone()
+            .unwrap();
+        fs::remove_file(directory.path().join("returned").join(&handoff)).unwrap();
+        register_edit_outputs(
+            &repository,
+            &project_id,
+            &session_id,
+            directory.path().join("returned").to_str().unwrap(),
+        )
+        .unwrap();
+        let page = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        let output = page
+            .outputs
+            .iter()
+            .find(|o| o.filename == "KEEP.JPG")
+            .unwrap();
+        assert_eq!(output.availability, "offline");
+    }
+
+    #[test]
+    fn m10_output_returns_available_after_file_reappears_and_rescanned() {
+        let (repository, project_id, session_id, _, directory) = m10_edit_session_fixture(
+            "availability reappear",
+            edit_bridge::ExpectedOutputPolicy::Optional,
+        );
+        m10_register_output(
+            &repository,
+            &project_id,
+            &session_id,
+            "KEEP.JPG",
+            &directory,
+        );
+        let handoff = edit_session_page(&repository, &project_id, &session_id, 0, 50)
+            .unwrap()
+            .work_items
+            .iter()
+            .find(|i| i.source_filename == "KEEP.JPG")
+            .unwrap()
+            .handoff_relative_path
+            .clone()
+            .unwrap();
+        let returned = directory.path().join("returned");
+        fs::remove_file(returned.join(&handoff)).unwrap();
+        register_edit_outputs(
+            &repository,
+            &project_id,
+            &session_id,
+            returned.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            edit_session_page(&repository, &project_id, &session_id, 0, 50)
+                .unwrap()
+                .outputs
+                .iter()
+                .find(|o| o.filename == "KEEP.JPG")
+                .unwrap()
+                .availability,
+            "offline"
+        );
+        let content = fs::read(directory.path().join("source").join("KEEP.JPG")).unwrap();
+        fs::write(returned.join(&handoff), content).unwrap();
+        register_edit_outputs(
+            &repository,
+            &project_id,
+            &session_id,
+            returned.to_str().unwrap(),
+        )
+        .unwrap();
+        let page = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        let output = page
+            .outputs
+            .iter()
+            .find(|o| o.filename == "KEEP.JPG")
+            .unwrap();
+        assert_eq!(output.availability, "available");
+    }
+
+    #[test]
+    fn m10_inaccessible_scan_does_not_mark_existing_outputs_offline() {
+        let (repository, project_id, session_id, _, directory) = m10_edit_session_fixture(
+            "availability inaccessible",
+            edit_bridge::ExpectedOutputPolicy::Optional,
+        );
+        m10_register_output(
+            &repository,
+            &project_id,
+            &session_id,
+            "KEEP.JPG",
+            &directory,
+        );
+        let bad = directory.path().join("does-not-exist-root");
+        let result =
+            register_edit_outputs(&repository, &project_id, &session_id, bad.to_str().unwrap());
+        assert!(result.is_err(), "an inaccessible root must fail the scan");
+        let page = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        let output = page
+            .outputs
+            .iter()
+            .find(|o| o.filename == "KEEP.JPG")
+            .unwrap();
+        assert_eq!(
+            output.availability, "available",
+            "a failed scan must not transition outputs offline"
+        );
+    }
+
+    #[test]
+    fn m10_rescanning_one_session_does_not_affect_another() {
+        let (repository, project_id, session_a, manifest_id, directory) = m10_edit_session_fixture(
+            "availability session A",
+            edit_bridge::ExpectedOutputPolicy::Optional,
+        );
+        m10_register_output(&repository, &project_id, &session_a, "KEEP.JPG", &directory);
+        let session_b = create_edit_session(
+            &repository,
+            &project_id,
+            &CreateEditSessionInput {
+                name: "availability session B".into(),
+                template: edit_bridge::EditSessionTemplate::Custom,
+                export_manifest_id: manifest_id,
+                expected_output_policy: edit_bridge::ExpectedOutputPolicy::Optional,
+            },
+        )
+        .unwrap()
+        .id;
+        m10_register_output(&repository, &project_id, &session_b, "KEEP.JPG", &directory);
+
+        let handoff = edit_session_page(&repository, &project_id, &session_a, 0, 50)
+            .unwrap()
+            .work_items
+            .iter()
+            .find(|i| i.source_filename == "KEEP.JPG")
+            .unwrap()
+            .handoff_relative_path
+            .clone()
+            .unwrap();
+        fs::remove_file(directory.path().join("returned").join(&handoff)).unwrap();
+        register_edit_outputs(
+            &repository,
+            &project_id,
+            &session_a,
+            directory.path().join("returned").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let a_page = edit_session_page(&repository, &project_id, &session_a, 0, 50).unwrap();
+        let a_output = a_page
+            .outputs
+            .iter()
+            .find(|o| o.filename == "KEEP.JPG")
+            .unwrap();
+        assert_eq!(a_output.availability, "offline");
+        let b_page = edit_session_page(&repository, &project_id, &session_b, 0, 50).unwrap();
+        let b_output = b_page
+            .outputs
+            .iter()
+            .find(|o| o.filename == "KEEP.JPG")
+            .unwrap();
+        assert_eq!(
+            b_output.availability, "available",
+            "session B outputs must be unaffected by session A's rescan"
+        );
+    }
+
+    #[test]
+    fn m10_repeated_unchanged_scan_is_idempotent() {
+        let (repository, project_id, session_id, _, directory) = m10_edit_session_fixture(
+            "availability idempotent",
+            edit_bridge::ExpectedOutputPolicy::Optional,
+        );
+        m10_register_output(
+            &repository,
+            &project_id,
+            &session_id,
+            "KEEP.JPG",
+            &directory,
+        );
+        let returned = directory.path().join("returned");
+        register_edit_outputs(
+            &repository,
+            &project_id,
+            &session_id,
+            returned.to_str().unwrap(),
+        )
+        .unwrap();
+        register_edit_outputs(
+            &repository,
+            &project_id,
+            &session_id,
+            returned.to_str().unwrap(),
+        )
+        .unwrap();
+        let page = edit_session_page(&repository, &project_id, &session_id, 0, 50).unwrap();
+        let output = page
+            .outputs
+            .iter()
+            .find(|o| o.filename == "KEEP.JPG")
+            .unwrap();
+        assert_eq!(output.availability, "available");
+        assert_eq!(
+            page.outputs.len(),
+            1,
+            "repeated scans must not duplicate outputs"
         );
     }
 }

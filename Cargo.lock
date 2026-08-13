@@ -304,6 +304,7 @@ dependencies = [
  "capture-intelligence",
  "chrono",
  "delivery-brain",
+ "edit-bridge",
  "ingest",
  "magic-search",
  "media-index",
@@ -365,6 +366,7 @@ version = "0.1.0"
 dependencies = [
  "capture-core",
  "delivery-brain",
+ "edit-bridge",
  "ingest",
  "media-model",
  "media-visual",
@@ -985,6 +987,26 @@ name = "dyn-hash"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15401da73a9ed8c80e3b2d4dc05fe10e7b72d7243b9f614e516a44fa99986e88"
+
+[[package]]
+name = "edit-bridge"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "edit-bridge-bench"
+version = "0.1.0"
+dependencies = [
+ "edit-bridge",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "either"
@@ -2859,6 +2881,7 @@ dependencies = [
  "capture-graph",
  "chrono",
  "delivery-brain",
+ "edit-bridge",
  "media-model",
  "rusqlite",
  "serde",

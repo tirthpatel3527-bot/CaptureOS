@@ -3,23 +3,25 @@
 use capture_core::{
     analyze_capture_intelligence, apply_culling_decision, clear_magic_search_history,
     clear_visual_cache, complete_culling_group,
-    create_coverage_checklist_item as create_coverage_checklist_item_core, create_local_project,
-    create_production_export_manifest, create_production_plan, create_virtual_collection,
-    export_culling_report, export_studio_brain_preference_examples, find_similar,
-    finish_culling_review, index_local_folder, index_semantic_embeddings, ingest_history,
+    create_coverage_checklist_item as create_coverage_checklist_item_core, create_edit_session,
+    create_local_project, create_production_export_manifest, create_production_plan,
+    create_virtual_collection, edit_session_page, edit_workspace, export_culling_report,
+    export_studio_brain_preference_examples, find_similar, finish_culling_review,
+    generate_edit_handoff, index_local_folder, index_semantic_embeddings, ingest_history,
     ingest_report, list_local_projects, load_capture_intelligence_summary, load_culling_progress,
     load_culling_workspace, load_magic_search_history, load_media_asset_detail,
     load_moment_checklists, load_moment_detail, load_moment_timeline, load_moment_timeline_status,
     load_production_workspace, load_project_home, load_project_library, load_semantic_index_status,
     load_similarity_group, load_studio_brain_status, load_visual_media_page,
-    load_visual_preparation_summary, merge_adjacent_moments as merge_adjacent_moments_core,
-    preflight_ingest, preflight_production_export, prepare_visual_media,
-    recover_interrupted_capture_intelligence, recover_interrupted_ingests,
-    recover_interrupted_moment_analysis, recover_interrupted_production_exports,
-    recover_interrupted_semantic_indexing, recover_interrupted_studio_training,
-    recover_interrupted_visual_preparations, refresh_capture_metadata,
-    rename_moment as rename_moment_core, reset_studio_brain_personalization, restart_ingest,
-    retry_failed_visual_media, save_human_intelligence_decision, search_magic, search_moments,
+    load_visual_preparation_summary, manually_match_edit_output,
+    merge_adjacent_moments as merge_adjacent_moments_core, preflight_ingest,
+    preflight_production_export, prepare_visual_media, recover_interrupted_capture_intelligence,
+    recover_interrupted_ingests, recover_interrupted_moment_analysis,
+    recover_interrupted_production_exports, recover_interrupted_semantic_indexing,
+    recover_interrupted_studio_training, recover_interrupted_visual_preparations,
+    refresh_capture_metadata, register_edit_outputs, rename_moment as rename_moment_core,
+    reset_studio_brain_personalization, restart_ingest, retry_failed_visual_media,
+    review_edit_version, save_human_intelligence_decision, search_magic, search_moments,
     set_culling_group_representative,
     set_moment_human_representative as set_moment_human_representative_core,
     set_production_plan_override, set_static_virtual_collection_member,
@@ -29,27 +31,29 @@ use capture_core::{
     update_coverage_confirmation as update_coverage_confirmation_core, update_culling_position,
     update_production_plan_configuration, update_production_plan_destination,
     update_production_plan_destination_reserve, CaptureIntelligenceProgress,
-    CreateCoverageChecklistItemInput, FindSimilarRequest, IngestPreflightView, JobView,
-    MagicSearchHistoryEntry, MagicSearchRequest, MagicSearchResponse, MediaPreparationProgress,
-    MetadataRefreshProgress, MomentAnalysisProgress, MomentChecklistView, MomentDetailView,
-    MomentSearchRequest, MomentSearchResponse, MomentTimelineView, ProductionExportProgress,
-    ProductionPlanPreview, ProjectHome, ProjectLibraryItem, ProjectView, SemanticIndexProgress,
-    SemanticStorageRoots, SiglipProviderCache, StudioBrainProgress,
+    CreateCoverageChecklistItemInput, EditHandoffView, EditOutputRegistrationSummary,
+    EditOutputView, EditSessionPageView, EditSessionView, EditWorkspace, FindSimilarRequest,
+    IngestPreflightView, JobView, MagicSearchHistoryEntry, MagicSearchRequest, MagicSearchResponse,
+    MediaPreparationProgress, MetadataRefreshProgress, MomentAnalysisProgress, MomentChecklistView,
+    MomentDetailView, MomentSearchRequest, MomentSearchResponse, MomentTimelineView,
+    ProductionExportProgress, ProductionPlanPreview, ProjectHome, ProjectLibraryItem, ProjectView,
+    SemanticIndexProgress, SemanticStorageRoots, SiglipProviderCache, StudioBrainProgress,
     UpdateCoverageConfirmationInput,
 };
 use delivery_brain::PlanOverrideKind;
+use edit_bridge::{EditSessionTemplate, EditVersionReviewState, ExpectedOutputPolicy, HandoffMode};
 use ingest::IngestRequest;
 use media_model::{
     AnalysisResourceMode, CullingDecisionValue, HumanDecisionValue, IngestJobId,
     IngestProtectionPolicy, MediaAssetId, ProjectId,
 };
 use persistence::{
-    CatalogRepository, CullingDecisionUpdate, CullingDecisionView, CullingProgress, CullingQuery,
-    CullingWorkspaceView, ExportManifestRecord, IngestJobSummary, IngestReport, MediaAssetDetail,
-    MediaBrowserFilter, PersistenceError, ProductionPlanInput, ProductionPlanRecord,
-    ProductionPreflight, ProductionWorkspaceView, ReviewSessionView, SimilarityGroupView,
-    SqliteRepository, VirtualCollectionInput, VirtualCollectionRecord, VisualMediaFilter,
-    VisualMediaPage, VisualMediaQuery, VisualMediaSort,
+    CatalogRepository, CreateEditSessionInput, CullingDecisionUpdate, CullingDecisionView,
+    CullingProgress, CullingQuery, CullingWorkspaceView, EditHandoffInput, ExportManifestRecord,
+    IngestJobSummary, IngestReport, MediaAssetDetail, MediaBrowserFilter, PersistenceError,
+    ProductionPlanInput, ProductionPlanRecord, ProductionPreflight, ProductionWorkspaceView,
+    ReviewSessionView, SimilarityGroupView, SqliteRepository, VirtualCollectionInput,
+    VirtualCollectionRecord, VisualMediaFilter, VisualMediaPage, VisualMediaQuery, VisualMediaSort,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -83,6 +87,7 @@ struct AppState {
     active_studio_profiles: Arc<Mutex<HashSet<String>>>,
     active_production_manifests: Arc<Mutex<HashSet<String>>>,
     production_cancel_controls: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    active_edit_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Studio Brain training and its settings are profile-scoped, rather than project-scoped. This
@@ -188,6 +193,47 @@ fn begin_production_manifest_mutation(
     })
 }
 
+/// Handoff generation and explicit returned-output discovery both perform local filesystem I/O.
+/// This guard provides immediate same-process duplicate-click feedback while the durable M10
+/// transaction remains authoritative across restarts and separate app processes.
+struct EditSessionMutationGuard {
+    active_sessions: Arc<Mutex<HashSet<String>>>,
+    session_key: String,
+}
+
+impl Drop for EditSessionMutationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active_sessions.lock() {
+            active.remove(&self.session_key);
+        }
+    }
+}
+
+fn begin_edit_session_mutation(
+    active_sessions: &Arc<Mutex<HashSet<String>>>,
+    project_id: &ProjectId,
+    session_id: &str,
+) -> Result<EditSessionMutationGuard, String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("Choose an Edit Session before changing its local handoff or outputs".into());
+    }
+    let session_key = format!("{}:{session_id}", project_id);
+    let mut active = active_sessions
+        .lock()
+        .map_err(|_| "Edit Session lock was poisoned".to_owned())?;
+    if !active.insert(session_key.clone()) {
+        return Err(
+            "This Edit Session is already preparing a local handoff or scanning returned outputs. Wait for it to finish."
+                .into(),
+        );
+    }
+    Ok(EditSessionMutationGuard {
+        active_sessions: Arc::clone(active_sessions),
+        session_key,
+    })
+}
+
 fn moment_persistence_error(error: PersistenceError) -> String {
     if matches!(error, PersistenceError::Database(_)) {
         eprintln!("Moment persistence transaction failed: {error}");
@@ -253,6 +299,64 @@ struct CullingPositionInput {
     group_id: Option<String>,
     mode: String,
     filter_context: Option<String>,
+}
+
+/// The desktop contract intentionally uses product-level template labels rather than exposing
+/// persistence enum spellings. Map them explicitly at this untrusted command boundary.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateEditSessionCommandInput {
+    name: String,
+    template: String,
+    export_manifest_id: String,
+    expected_output_policy: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateEditHandoffCommandInput {
+    mode: String,
+    destination_path: String,
+}
+
+fn normalized_edit_option(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn edit_session_template(value: &str) -> Result<EditSessionTemplate, String> {
+    match normalized_edit_option(value).as_str() {
+        "main_edit" | "wedding_main_edit" => Ok(EditSessionTemplate::WeddingMainEdit),
+        "album_retouch" | "album_select_retouch" => Ok(EditSessionTemplate::AlbumSelectRetouch),
+        "portfolio_retouch" => Ok(EditSessionTemplate::PortfolioRetouch),
+        "client_revision" | "client_revision_round" => Ok(EditSessionTemplate::ClientRevisionRound),
+        "video_rough_cut" => Ok(EditSessionTemplate::VideoRoughCut),
+        "custom" => Ok(EditSessionTemplate::Custom),
+        _ => Err("Choose a supported Edit Session template".into()),
+    }
+}
+
+fn expected_output_policy(value: &str) -> Result<ExpectedOutputPolicy, String> {
+    match normalized_edit_option(value).as_str() {
+        "one_per_work_item" | "required" => Ok(ExpectedOutputPolicy::Required),
+        "optional" => Ok(ExpectedOutputPolicy::Optional),
+        _ => Err("Choose a supported expected-output policy".into()),
+    }
+}
+
+fn edit_handoff_mode(value: &str) -> Result<HandoffMode, String> {
+    match normalized_edit_option(value).as_str() {
+        "reference" => Ok(HandoffMode::Reference),
+        "package" => Ok(HandoffMode::Package),
+        _ => Err("Choose a supported local handoff mode".into()),
+    }
+}
+
+fn edit_version_review_state(value: &str) -> Result<EditVersionReviewState, String> {
+    match normalized_edit_option(value).as_str() {
+        "approved" => Ok(EditVersionReviewState::Approved),
+        "needs_revision" => Ok(EditVersionReviewState::NeedsRevision),
+        _ => Err("Choose Approved or Needs Revision for this edit version".into()),
+    }
 }
 
 /// Tauri broadcasts are global to the webview. Keep the project identity beside each job update
@@ -1634,6 +1738,165 @@ fn cancel_production_export_command(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone 10 — Edit Bridge command boundary
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A compact read-only projection. Opening Edit never scans an external output root, generates
+/// a handoff, or re-evaluates a frozen Production manifest.
+#[tauri::command(rename_all = "camelCase")]
+fn edit_workspace_command(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<EditWorkspace, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    edit_workspace(&*repository, &project_id).map_err(|error| error.to_string())
+}
+
+/// Creates an Edit Session from one already verified, immutable M9 Export Manifest. The core
+/// transaction rejects stale or ineligible sources; this command never recreates a selection.
+#[tauri::command(rename_all = "camelCase")]
+fn create_edit_session_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    input: CreateEditSessionCommandInput,
+) -> Result<EditSessionView, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let input = CreateEditSessionInput {
+        name: input.name,
+        template: edit_session_template(&input.template)?,
+        export_manifest_id: input.export_manifest_id,
+        expected_output_policy: expected_output_policy(&input.expected_output_policy)?,
+    };
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    create_edit_session(&*repository, &project_id, &input).map_err(|error| error.to_string())
+}
+
+/// Loads at most one bounded session page. Source/returned previews remain cache-backed URLs;
+/// this command never returns a source or external-output filesystem path to the webview.
+#[tauri::command(rename_all = "camelCase")]
+fn edit_session_page_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    session_id: String,
+    offset: u64,
+    limit: u32,
+) -> Result<EditSessionPageView, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("Choose an Edit Session before loading its queue".into());
+    }
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    edit_session_page(&*repository, &project_id, session_id, offset, limit)
+        .map_err(|error| error.to_string())
+}
+
+/// Generates only a local coordination bundle. A worker-owned SQLite connection leaves project
+/// browsing responsive while the core applies its path-separation and no-overwrite checks.
+#[tauri::command(rename_all = "camelCase")]
+async fn generate_edit_handoff_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    session_id: String,
+    input: GenerateEditHandoffCommandInput,
+) -> Result<EditHandoffView, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let session_id = session_id.trim().to_owned();
+    let input = EditHandoffInput {
+        mode: edit_handoff_mode(&input.mode)?,
+        destination_path: input.destination_path,
+    };
+    let mutation_guard =
+        begin_edit_session_mutation(&state.active_edit_sessions, &project_id, &session_id)?;
+    let catalog_path = state.catalog_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _edit_session_mutation = mutation_guard;
+        let repository = SqliteRepository::open(catalog_path).map_err(|error| error.to_string())?;
+        generate_edit_handoff(&repository, &project_id, &session_id, &input)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Edit handoff task did not complete: {error}"))?
+}
+
+/// Explicitly scans only the folder selected by the photographer, on a worker connection. The
+/// local session guard rejects duplicate scans/handoff writes while durable transaction checks
+/// retain authority across restarts and another process.
+#[tauri::command(rename_all = "camelCase")]
+async fn register_edit_outputs_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    session_id: String,
+    selected_path: String,
+) -> Result<EditOutputRegistrationSummary, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let session_id = session_id.trim().to_owned();
+    let mutation_guard =
+        begin_edit_session_mutation(&state.active_edit_sessions, &project_id, &session_id)?;
+    let catalog_path = state.catalog_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _edit_session_mutation = mutation_guard;
+        let repository = SqliteRepository::open(catalog_path).map_err(|error| error.to_string())?;
+        register_edit_outputs(&repository, &project_id, &session_id, &selected_path)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("Edit output discovery task did not complete: {error}"))?
+}
+
+/// A manual link is an explicit local provenance action only. It cannot approve an output or
+/// alter culling, Production, originals, source FileInstances, or the returned derivative.
+#[tauri::command(rename_all = "camelCase")]
+fn manually_match_edit_output_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    output_id: String,
+    work_item_id: String,
+) -> Result<EditOutputView, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    manually_match_edit_output(
+        &*repository,
+        &project_id,
+        output_id.trim(),
+        work_item_id.trim(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Approval and revision are intentionally the only accepted review transitions at the desktop
+/// boundary. The core persists history and keeps all human culling decisions independent.
+#[tauri::command(rename_all = "camelCase")]
+fn review_edit_version_command(
+    state: State<'_, AppState>,
+    project_id: String,
+    version_id: String,
+    review_state: String,
+) -> Result<persistence::EditVersionRecord, String> {
+    let project_id = ProjectId::try_from(project_id.as_str()).map_err(|error| error.to_string())?;
+    let review_state = edit_version_review_state(&review_state)?;
+    let repository = state
+        .repository
+        .lock()
+        .map_err(|_| "catalog lock was poisoned".to_owned())?;
+    review_edit_version(&*repository, &project_id, version_id.trim(), review_state)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn update_culling_decision_command(
     state: State<'_, AppState>,
@@ -2262,6 +2525,7 @@ fn main() {
                 active_studio_profiles: Arc::new(Mutex::new(HashSet::new())),
                 active_production_manifests: Arc::new(Mutex::new(HashSet::new())),
                 production_cancel_controls: Arc::new(Mutex::new(HashMap::new())),
+                active_edit_sessions: Arc::new(Mutex::new(HashSet::new())),
             });
             Ok(())
         })
@@ -2321,6 +2585,13 @@ fn main() {
             production_manifest_preflight_command,
             start_production_export_command,
             cancel_production_export_command,
+            edit_workspace_command,
+            create_edit_session_command,
+            edit_session_page_command,
+            generate_edit_handoff_command,
+            register_edit_outputs_command,
+            manually_match_edit_output_command,
+            review_edit_version_command,
             update_culling_decision_command,
             update_culling_position_command,
             set_culling_group_representative_command,
@@ -2403,6 +2674,45 @@ mod tests {
     }
 
     #[test]
+    fn edit_session_guard_rejects_overlapping_handoff_or_output_discovery() {
+        let active_sessions = Arc::new(Mutex::new(HashSet::new()));
+        let project_id = ProjectId::from_uuid(Uuid::from_u128(10));
+        let first =
+            begin_edit_session_mutation(&active_sessions, &project_id, "session-1").unwrap();
+        assert!(begin_edit_session_mutation(&active_sessions, &project_id, "session-1").is_err());
+        assert!(begin_edit_session_mutation(&active_sessions, &project_id, "session-2").is_ok());
+        drop(first);
+        assert!(begin_edit_session_mutation(&active_sessions, &project_id, "session-1").is_ok());
+    }
+
+    #[test]
+    fn edit_command_values_map_only_supported_human_actions() {
+        assert_eq!(
+            edit_session_template("main_edit").unwrap(),
+            EditSessionTemplate::WeddingMainEdit
+        );
+        assert_eq!(
+            edit_session_template("client_revision").unwrap(),
+            EditSessionTemplate::ClientRevisionRound
+        );
+        assert_eq!(
+            expected_output_policy("one_per_work_item").unwrap(),
+            ExpectedOutputPolicy::Required
+        );
+        assert_eq!(
+            edit_handoff_mode("reference").unwrap(),
+            HandoffMode::Reference
+        );
+        assert_eq!(
+            edit_version_review_state("needs_revision").unwrap(),
+            EditVersionReviewState::NeedsRevision
+        );
+        assert!(edit_session_template("invent_a_recipe").is_err());
+        assert!(edit_handoff_mode("proprietary_catalog").is_err());
+        assert!(edit_version_review_state("ready_for_review").is_err());
+    }
+
+    #[test]
     fn preview_bridge_serves_a_registered_ready_artifact_and_rejects_unknown_ids() {
         let directory = tempdir().unwrap();
         let cache_root = directory.path().join("preview-cache");
@@ -2470,6 +2780,7 @@ mod tests {
             active_studio_profiles: Arc::new(Mutex::new(HashSet::new())),
             active_production_manifests: Arc::new(Mutex::new(HashSet::new())),
             production_cancel_controls: Arc::new(Mutex::new(HashMap::new())),
+            active_edit_sessions: Arc::new(Mutex::new(HashSet::new())),
         };
 
         let request = http::Request::builder()
