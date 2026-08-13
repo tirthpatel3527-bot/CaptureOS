@@ -265,12 +265,13 @@ Output roots, paths, fingerprints, metadata, matching evidence, and approval his
 and private. See [Edit Sessions architecture](docs/architecture/edit-sessions.md),
 [the security boundary](docs/security/edit-sessions.md), and ADRs
 [066](docs/adr/066-edit-session-and-production-plan-boundary.md),
-[067](docs/adr/067-derived-output-provenance-versioning-and-approval.md), and
-[068](docs/adr/068-local-editor-adapter-output-matching-and-privacy.md).
+[067](docs/adr/067-derived-output-provenance-versioning-and-approval.md),
+[068](docs/adr/068-local-editor-adapter-output-matching-and-privacy.md), and
+[069](docs/adr/069-edit-history-and-provenance-review-i.md).
 
 ## Milestone 10 boundaries
 
-This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, client preference modeling, editing/style training, automatic culling/deletion, source write-back, color-critical RAW development, full proxy transcoding, proprietary editor-catalog mutation, automated editor control, NLE integration, video/audio intelligence, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or Milestone 11 work. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
+This repository intentionally does **not** perform person identity recognition, cross-project face/person search, People Brain, event/wedding-stage recognition, creative/aesthetic/emotional scoring, client preference modeling, editing/style training, automatic culling/deletion, source write-back, color-critical RAW development, full proxy transcoding, proprietary editor-catalog mutation, automated editor control, NLE integration, video/audio intelligence, authentication, cloud work, automatic eject, card formatting, collaboration, billing, or later-milestone work beyond M11. See [the product vision](docs/product/vision.md), [architecture](docs/architecture/system.md), and the ADRs in [docs/adr](docs/adr).
 
 ## Smart Culling Workspace behavior
 

@@ -141,3 +141,28 @@ CaptureOS is local-first software for professional camera media. Preserve these 
   write-back, automatic import, automatic approval/delivery/culling, deletion, cloud editing,
   accounts, collaboration, billing, proprietary editor integration, or video/audio edit
   intelligence.
+
+## Milestone 11 Edit History and Provenance Review I rules
+
+- M11 is read-only over existing M10 edit-session/version records. Never edit, render, restore,
+  overwrite, write back, or mutate any source, output, version, or history record.
+- Read version history only from already-persisted M10 data (`edit_session_versions` and joined
+  provenance/approval records). Never invent an edit recipe, output version, source link, or
+  availability state.
+- Always scope queries to one `edit_session_id` and the requesting project; a query must never
+  leak records across edit sessions or projects.
+- Order history deterministically by the persisted `version` and `created_at` (tie-break `id`);
+  designate the latest recorded version by stable, repeatable comparison only.
+- Preserve append-only history. When an output file disappears or reappears, update only the
+  current availability projection; never insert, replace, or delete a historical version, and
+  never synthesize a false version on reconnect.
+- History reads must be deterministic and side-effect free. No M0–M10 write path, schema, or
+  behavior may change.
+- Keep absolute paths, output roots, fingerprints, internal IDs, notes, and matching internals
+  redacted/minimized per the M10 privacy policy; do not expose raw paths or fingerprints in
+  normal UI surfaces.
+- Do not add a schema/migration unless planning proves the existing M10 schema cannot support
+  the approved read-only scope; any such change requires separate explicit approval.
+- Keep M11 local-first and offline-capable: no network, cloud, account, telemetry, sync, mobile,
+  teams, billing, client galleries, automatic approval, or delivery.
+- Stop at the requested milestone. Do not begin a later milestone without explicit approval.

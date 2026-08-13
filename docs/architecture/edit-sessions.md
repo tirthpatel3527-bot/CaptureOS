@@ -94,5 +94,18 @@ adapter, direct proprietary-database mutation, automatic import/export, actual r
 editing, source write-back, automatic culling, automatic approval, deletion, or video/audio
 editing intelligence. See [the M10 security boundary](../security/edit-sessions.md) and ADRs
 [066](../adr/066-edit-session-and-production-plan-boundary.md),
-[067](../adr/067-derived-output-provenance-versioning-and-approval.md), and
-[068](../adr/068-local-editor-adapter-output-matching-and-privacy.md).
+[067](../adr/067-derived-output-provenance-versioning-and-approval.md),
+[068](../adr/068-local-editor-adapter-output-matching-and-privacy.md), and the M11 read-only
+history ADR [069](../adr/069-edit-history-and-provenance-review-i.md).
+
+## Edit History and Provenance Review I (M11)
+
+M11 is a read-only, deterministic history experience over the append-only `edit_session_versions`
+records that M10 already persists. A user opens an output in an Edit Session and views a
+chronological version timeline with provenance, source/match state, review/approval state, and
+online/offline availability. M11 never edits, restores, renders, writes back, or mutates any
+source, output, version, or history record; it queries only existing M10 data scoped to one
+edit session and project, preserves append-only history when outputs go offline or reappear, and
+never creates false versions. See ADR
+[069](../adr/069-edit-history-and-provenance-review-i.md) and the M11 rules in
+[AGENTS.md](../../AGENTS.md).
